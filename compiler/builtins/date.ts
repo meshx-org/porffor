@@ -1884,20 +1884,70 @@ export const __Date_prototype_toGMTString = function (this: any) {
 
 // 21.4.4.38 Date.prototype.toLocaleDateString ([ reserved1 [, reserved2 ]])
 // https://tc39.es/ecma262/multipage/numbers-and-dates.html#sec-date.prototype.tolocaledatestring
+// Without Intl the locale forms are implementation-defined. These follow SpiderMonkey's
+// build without Intl (what StarlingMonkey, and so ComponentizeJS, runs): strftime's %x,
+// %c and %X in the C locale, local time, with %x's year widened to four digits.
+
+// MM/DD/YYYY
 export const __Date_prototype_toLocaleDateString = function (this: any, reserved1: any, reserved2: any) {
-  return Porffor.callThis(__Date_prototype_toDateString, this);
+  const tv: number = __Porffor_date_read(this);
+  if (Number.isNaN(tv)) return 'Invalid Date';
+  const t: number = __ecma262_LocalTime(tv);
+
+  const out: bytestring = Porffor.malloc(64);
+  Porffor.IR.storeI32(out, 0, 0);
+  __Porffor_bytestring_appendPadNum(out, __ecma262_MonthFromTime(t) + 1, 2);
+  __Porffor_bytestring_appendChar(out, 47); // '/'
+  __Porffor_bytestring_appendPadNum(out, __ecma262_DateFromTime(t), 2);
+  __Porffor_bytestring_appendChar(out, 47); // '/'
+  __Porffor_bytestring_appendPadNum(out, __ecma262_YearFromTime(t), 4);
+  return out;
 };
 
 // 21.4.4.39 Date.prototype.toLocaleString ([ reserved1 [, reserved2 ]])
 // https://tc39.es/ecma262/multipage/numbers-and-dates.html#sec-date.prototype.tolocalestring
+// %c: Www Mmm dd HH:MM:SS YYYY, the day of the month space-padded
 export const __Date_prototype_toLocaleString = function (this: any, reserved1: any, reserved2: any) {
-  return Porffor.callThis(__Date_prototype_toString, this);
+  const tv: number = __Porffor_date_read(this);
+  if (Number.isNaN(tv)) return 'Invalid Date';
+  const t: number = __ecma262_LocalTime(tv);
+
+  const out: bytestring = Porffor.malloc(64);
+  Porffor.IR.storeI32(out, 0, 0);
+  __Porffor_bytestring_appendStr(out, __ecma262_WeekDayName(t));
+  __Porffor_bytestring_appendChar(out, 32);
+  __Porffor_bytestring_appendStr(out, __ecma262_MonthName(t));
+  __Porffor_bytestring_appendChar(out, 32);
+  const day: number = __ecma262_DateFromTime(t);
+  if (day < 10) __Porffor_bytestring_appendChar(out, 32);
+  __Porffor_bytestring_appendPadNum(out, day, 1);
+  __Porffor_bytestring_appendChar(out, 32);
+  __Porffor_bytestring_appendPadNum(out, __ecma262_HourFromTime(t), 2);
+  __Porffor_bytestring_appendChar(out, 58); // ':'
+  __Porffor_bytestring_appendPadNum(out, __ecma262_MinFromTime(t), 2);
+  __Porffor_bytestring_appendChar(out, 58);
+  __Porffor_bytestring_appendPadNum(out, __ecma262_SecFromTime(t), 2);
+  __Porffor_bytestring_appendChar(out, 32);
+  __Porffor_bytestring_appendPadNum(out, __ecma262_YearFromTime(t), 4);
+  return out;
 };
 
 // 21.4.4.40 Date.prototype.toLocaleTimeString ([ reserved1 [, reserved2 ]])
 // https://tc39.es/ecma262/multipage/numbers-and-dates.html#sec-date.prototype.tolocaletimestring
+// %X: HH:MM:SS
 export const __Date_prototype_toLocaleTimeString = function (this: any, reserved1: any, reserved2: any) {
-  return Porffor.callThis(__Date_prototype_toTimeString, this);
+  const tv: number = __Porffor_date_read(this);
+  if (Number.isNaN(tv)) return 'Invalid Date';
+  const t: number = __ecma262_LocalTime(tv);
+
+  const out: bytestring = Porffor.malloc(64);
+  Porffor.IR.storeI32(out, 0, 0);
+  __Porffor_bytestring_appendPadNum(out, __ecma262_HourFromTime(t), 2);
+  __Porffor_bytestring_appendChar(out, 58); // ':'
+  __Porffor_bytestring_appendPadNum(out, __ecma262_MinFromTime(t), 2);
+  __Porffor_bytestring_appendChar(out, 58);
+  __Porffor_bytestring_appendPadNum(out, __ecma262_SecFromTime(t), 2);
+  return out;
 };
 
 // 21.4.4.44 Date.prototype.valueOf ()
