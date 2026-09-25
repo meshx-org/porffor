@@ -1181,3 +1181,32 @@ export const __Porffor_array_fastPush = (arr: any[], el: any): i32 => {
   arr.length = ++len;
   return len;
 };
+
+// keys/values/entries: array snapshots, the convention Map and Set follow here (not
+// lazy iterators, so spread, for-of and Array.from work but .next() does not). Holes
+// are indices and read as undefined, as the spec's array iterator would give them.
+export const __Array_prototype_keys = function (this: any[]) {
+  const len: i32 = this.length;
+  const out: any[] = Porffor.array.new(len);
+  for (let i: i32 = 0; i < len; i++) Porffor.array.fastPush(out, i);
+  return out;
+};
+
+export const __Array_prototype_values = function (this: any[]) {
+  const len: i32 = this.length;
+  const out: any[] = Porffor.array.new(len);
+  for (let i: i32 = 0; i < len; i++) Porffor.array.fastPush(out, this[i]);
+  return out;
+};
+
+export const __Array_prototype_entries = function (this: any[]) {
+  const len: i32 = this.length;
+  const out: any[] = Porffor.array.new(len);
+  for (let i: i32 = 0; i < len; i++) {
+    const entry: any[] = Porffor.array.new(2);
+    Porffor.array.fastPush(entry, i);
+    Porffor.array.fastPush(entry, this[i]);
+    Porffor.array.fastPush(out, entry);
+  }
+  return out;
+};
