@@ -1,16 +1,37 @@
 import type {} from './porffor.d.ts';
 
+// Output is UTF-8: a byte string is Latin-1 (ASCII runs go out as they are), a string
+// is UTF-16 (surrogate pairs join into one code point).
 export const __Porffor_printString = (arg: bytestring|string): void => {
   let ptr: i32 = Porffor.IR.ptr(arg);
   if (Porffor.type(arg) == Porffor.TYPES.bytestring) {
     const len: i32 = arg.length;
-    Porffor.c`printf("%.*s", len, (char*)(MEM + ptr + 4));`;
+    let ascii: boolean = true;
+    for (let i: i32 = 0; i < len; i++) if (Porffor.IR.loadU8(ptr + i, 4) >= 128) {
+      ascii = false;
+      break;
+    }
+    if (ascii) {
+      Porffor.c`printf("%.*s", len, (char*)(MEM + ptr + 4));`;
+      return;
+    }
+    for (let i: i32 = 0; i < len; i++) {
+      const c: i32 = Porffor.IR.loadU8(ptr + i, 4);
+      Porffor.c`porf_print_utf8((uint32_t)c);`;
+    }
   } else { // regular string
     const end: i32 = ptr + arg.length * 2;
     while (ptr < end) {
-      const c: i32 = Porffor.IR.loadU16(ptr, 4);
-      Porffor.c`printf("%c", c);`;
+      let c: i32 = Porffor.IR.loadU16(ptr, 4);
       ptr += 2;
+      if (c >= 0xD800 && c <= 0xDBFF && ptr < end) {
+        const d: i32 = Porffor.IR.loadU16(ptr, 4);
+        if (d >= 0xDC00 && d <= 0xDFFF) {
+          c = 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+          ptr += 2;
+        }
+      }
+      Porffor.c`porf_print_utf8((uint32_t)c);`;
     }
   }
 };
@@ -399,7 +420,9 @@ export const __console_info = (...args: any[]): void => {
   Porffor.printStatic('\n');
 };
 
+// to stderr, as in Node and SpiderMonkey (stdout flushed first, so the order holds)
 export const __console_warn = (...args: any[]): void => {
+  Porffor.c`fflush(stdout); porf_print_out = stderr;`;
   const argLen: i32 = args.length - 1;
   for (let i: i32 = 0; i <= argLen; i++) {
     __Porffor_consoleIndent();
@@ -409,9 +432,12 @@ export const __console_warn = (...args: any[]): void => {
   }
 
   Porffor.printStatic('\n');
+  Porffor.c`fflush(stderr); porf_print_out = NULL;`;
 };
 
+// to stderr, as in Node and SpiderMonkey (stdout flushed first, so the order holds)
 export const __console_error = (...args: any[]): void => {
+  Porffor.c`fflush(stdout); porf_print_out = stderr;`;
   const argLen: i32 = args.length - 1;
   for (let i: i32 = 0; i <= argLen; i++) {
     __Porffor_consoleIndent();
@@ -421,6 +447,7 @@ export const __console_error = (...args: any[]): void => {
   }
 
   Porffor.printStatic('\n');
+  Porffor.c`fflush(stderr); porf_print_out = NULL;`;
 };
 
 export const __console_assert = (assertion: any, ...args: any[]): void => {

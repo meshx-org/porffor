@@ -3724,9 +3724,25 @@ const RUNTIME_HEAD = (prefs, toStr = null) => {
 #endif
 #include <time.h>
 
+// Printing (console.*) writes to porf_print_out: stdout, or stderr while console.error
+// and console.warn print.
+static FILE* porf_print_out = NULL;
+#define PORF_PRINT_OUT (porf_print_out ? porf_print_out : stdout)
 ${prefs.repl ? `static int porf_repl_output_enabled = 1;
-#define printf(...) (porf_repl_output_enabled ? fprintf(stdout, __VA_ARGS__) : 0)
-` : ''}
+#define printf(...) (porf_repl_output_enabled ? fprintf(PORF_PRINT_OUT, __VA_ARGS__) : 0)
+` : `#define printf(...) fprintf(PORF_PRINT_OUT, __VA_ARGS__)
+`}
+// One code point as UTF-8 (a lone surrogate as U+FFFD).
+static void porf_print_utf8(uint32_t c) {
+  char b[4];
+  int n;
+${prefs.repl ? '  if (!porf_repl_output_enabled) return;\n' : ''}  if (c >= 0xD800 && c <= 0xDFFF) c = 0xFFFD;
+  if (c < 0x80) { b[0] = (char)c; n = 1; }
+  else if (c < 0x800) { b[0] = (char)(0xC0 | (c >> 6)); b[1] = (char)(0x80 | (c & 0x3F)); n = 2; }
+  else if (c < 0x10000) { b[0] = (char)(0xE0 | (c >> 12)); b[1] = (char)(0x80 | ((c >> 6) & 0x3F)); b[2] = (char)(0x80 | (c & 0x3F)); n = 3; }
+  else { b[0] = (char)(0xF0 | (c >> 18)); b[1] = (char)(0x80 | ((c >> 12) & 0x3F)); b[2] = (char)(0x80 | ((c >> 6) & 0x3F)); b[3] = (char)(0x80 | (c & 0x3F)); n = 4; }
+  fwrite(b, 1, (size_t)n, PORF_PRINT_OUT);
+}
 
 typedef uint8_t u8;
 typedef uint16_t u16;
