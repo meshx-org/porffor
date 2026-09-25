@@ -417,63 +417,127 @@ export const __ecma262_ParseMonthName = (ptr: number): number => {
 
 
 // DTSF parser
-export const __ecma262_ParseDTSF = (string: bytestring): number => {
-  // formats we need to support:
-  // > new Date().toISOString()
-  // '2024-05-12T02:44:01.529Z'
+// `count` decimal digits of string at `at`, or -1 if any is not a digit.
+export const __Porffor_date_digits = (string: bytestring, at: i32, count: i32): number => {
+  if (at + count > string.length) return -1;
+  let n: number = 0;
+  for (let i: i32 = 0; i < count; i++) {
+    const chr: i32 = Porffor.IR.loadU8(Porffor.IR.ptr(string) + at + i, 4);
+    if (Porffor.fastOr(chr < 48, chr > 57)) return -1;
+    n = n * 10 + (chr - 48);
+  }
+  return n;
+};
 
-  let y: number = 0;
-  let m: number = 0;
+// the char code of string at `at`, or -1 past its end
+export const __Porffor_date_charAt = (string: bytestring, at: i32): i32 => {
+  if (at >= string.length) return -1;
+  return Porffor.IR.loadU8(Porffor.IR.ptr(string) + at, 4);
+};
+
+// The ECMAScript Date Time String Format, read by position:
+//   YYYY | ±YYYYYY, then -MM, -DD, THH:mm, :ss, .sss (each optional in turn),
+//   then Z | ±HH:mm (or ±HHmm). A zero field is a field (reading digit runs and advancing only on
+//   non-zero values shifted "14:00:40" to 14:40:00 and read "+02:00" as 2ms), and the
+//   offset is subtracted to reach UTC. Anything malformed or out of range is NaN.
+export const __ecma262_ParseDTSF = (string: bytestring): number => {
+  const len: i32 = string.length;
+  let i: i32 = 0;
+
+  let y: number;
+  const first: i32 = __Porffor_date_charAt(string, 0);
+  if (Porffor.fastOr(first == 43, first == 45)) { // + or -: expanded year
+    y = __Porffor_date_digits(string, 1, 6);
+    if (y < 0) return NaN;
+    if (first == 45) {
+      if (y == 0) return NaN; // -000000 is not allowed
+      y = -y;
+    }
+    i = 7;
+  } else {
+    y = __Porffor_date_digits(string, 0, 4);
+    if (y < 0) return NaN;
+    i = 4;
+  }
+
+  let m: number = 1;
   let dt: number = 1;
+  if (__Porffor_date_charAt(string, i) == 45) {
+    m = __Porffor_date_digits(string, i + 1, 2);
+    if (Porffor.fastOr(m < 1, m > 12)) return NaN;
+    i += 3;
+    if (__Porffor_date_charAt(string, i) == 45) {
+      dt = __Porffor_date_digits(string, i + 1, 2);
+      if (Porffor.fastOr(dt < 1, dt > 31)) return NaN;
+      i += 3;
+    }
+  }
+
   let h: number = 0;
   let min: number = 0;
   let s: number = 0;
   let milli: number = 0;
-  let tzHour: number = 0;
-  let tzMin: number = 0;
+  let offset: number = 0; // minutes east of UTC
+  let hasTime: boolean = false;
 
-  let n: number = 0;
-  let nInd: number = 0;
+  const sep: i32 = __Porffor_date_charAt(string, i);
+  if (Porffor.fastOr(sep == 84, sep == 116)) { // T or t
+    hasTime = true;
+    h = __Porffor_date_digits(string, i + 1, 2);
+    if (Porffor.fastOr(h < 0, __Porffor_date_charAt(string, i + 3) != 58)) return NaN;
+    min = __Porffor_date_digits(string, i + 4, 2);
+    if (min < 0) return NaN;
+    i += 6;
 
-  const len: i32 = string.length;
-  const endPtr: i32 = Porffor.IR.ptr(string) + len;
-  let ptr: i32 = Porffor.IR.ptr(string);
+    if (__Porffor_date_charAt(string, i) == 58) { // :ss
+      s = __Porffor_date_digits(string, i + 1, 2);
+      if (s < 0) return NaN;
+      i += 3;
 
-  while (ptr <= endPtr) { // <= to include extra null byte to set last n
-    const chr: i32 = Porffor.IR.loadU8(ptr++, 4);
-    if (Porffor.fastAnd(chr >= 48, chr <= 57)) { // 0-9
-      n *= 10;
-      n += chr - 48;
-      continue;
+      if (__Porffor_date_charAt(string, i) == 46) { // .sss, more digits allowed and ignored
+        i++;
+        let scale: number = 100;
+        let any: boolean = false;
+        while (true) {
+          const chr: i32 = __Porffor_date_charAt(string, i);
+          if (Porffor.fastOr(chr < 48, chr > 57)) break;
+          milli += (chr - 48) * scale;
+          scale /= 10;
+          any = true;
+          i++;
+        }
+        if (!any) return NaN;
+        milli = Math.floor(milli);
+      }
     }
 
-    if (chr == 45) { // -
-      if (Porffor.fastOr(ptr == Porffor.IR.ptr(string), nInd == 7)) n = -n;
-    }
+    if (Porffor.fastOr(min > 59, s > 59)) return NaN;
+    if (h > 24) return NaN;
+    if (h == 24) if (Porffor.fastOr(min != 0, s != 0, milli != 0)) return NaN;
 
-    if (n > 0) {
-      if (nInd == 0) y = n;
-        else if (nInd == 1) m = n - 1;
-        else if (nInd == 2) dt = n;
-        else if (nInd == 3) h = n;
-        else if (nInd == 4) min = n;
-        else if (nInd == 5) s = n;
-        else if (nInd == 6) milli = n;
-        else if (nInd == 7) tzHour = n;
-        else if (nInd == 8) tzMin = n;
-
-      n = 0;
-      nInd++;
+    const tz: i32 = __Porffor_date_charAt(string, i);
+    if (Porffor.fastOr(tz == 90, tz == 122)) { // Z or z
+      i++;
+    } else if (Porffor.fastOr(tz == 43, tz == 45)) { // ±HH:mm
+      const tzHour: number = __Porffor_date_digits(string, i + 1, 2);
+      if (Porffor.fastOr(tzHour < 0, tzHour > 23)) return NaN;
+      const colon: i32 = __Porffor_date_charAt(string, i + 3) == 58 ? 1 : 0; // ±HH:mm, or ±HHmm as V8 accepts
+      const tzMin: number = __Porffor_date_digits(string, i + 3 + colon, 2);
+      if (Porffor.fastOr(tzMin < 0, tzMin > 59)) return NaN;
+      offset = tzHour * 60 + tzMin;
+      if (tz == 45) offset = -offset;
+      i += 5 + colon;
     }
   }
 
-  h += tzHour;
-  min += tzMin;
+  if (i != len) return NaN;
 
-  return __ecma262_TimeClip(__ecma262_MakeDate(
-    __ecma262_MakeDay(y, m, dt),
+  // date-only forms are UTC; a date-time without an offset is local time, which is UTC here
+  const t: number = __ecma262_MakeDate(
+    __ecma262_MakeDay(y, m - 1, dt),
     __ecma262_MakeTime(h, min, s, milli)
-  ));
+  );
+  return __ecma262_TimeClip(hasTime ? t - offset * 60000 : t);
 };
 
 // RFC 7231 or Date.prototype.toString() parser
@@ -579,10 +643,15 @@ export const __Date_parse = (string: bytestring): number => {
   // > new Date().toString()
   // 'Sun May 12 2024 02:44:13 GMT+0000 (UTC)'
 
-  // if first char is numerical, use DTSF parser
+  // if first char is numerical, or a sign starting an expanded year (+002026, -000001),
+  // use DTSF parser
   const chr: i32 = Porffor.IR.loadU8(string, 4);
   if (Porffor.fastAnd(chr >= 48, chr <= 57)) { // 0-9
     return __ecma262_ParseDTSF(string);
+  }
+  if (Porffor.fastOr(chr == 43, chr == 45)) { // + or -
+    const next: i32 = __Porffor_date_charAt(string, 1);
+    if (Porffor.fastAnd(next >= 48, next <= 57)) return __ecma262_ParseDTSF(string);
   }
 
   // else, use RFC 7231 or Date.prototype.toString() parser
@@ -1528,8 +1597,9 @@ export const __ecma262_ToUTCDTSF = (t: number): bytestring => {
     // sign
     __Porffor_bytestring_appendChar(out, year > 0 ? 43 : 45);
 
-    // 6 digit year
-    __Porffor_bytestring_appendPadNum(out, year, 6);
+    // 6 digit year (of the magnitude: the sign is already written, and padding -1
+    // itself gave "-0000-1")
+    __Porffor_bytestring_appendPadNum(out, Math.abs(year), 6);
   } else {
     // 4 digit year
     __Porffor_bytestring_appendPadNum(out, year, 4);
