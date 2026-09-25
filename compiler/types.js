@@ -71,3 +71,6 @@ for (const x of [ '', 'Aggregate', 'Type', 'Reference', 'Syntax', 'Range', 'Eval
   registerInternalType(`${x}Error`);
 
 registerInternalType('Proxy');
+
+registerInternalType('TextEncoder');
+registerInternalType('TextDecoder');

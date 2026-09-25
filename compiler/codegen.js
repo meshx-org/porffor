@@ -2828,7 +2828,7 @@ const isIdentAssignable = (scope, name, op = '=') => {
 };
 
 // todo: generate this array procedurally
-const builtinPrototypeGets = ['size', 'description', 'byteLength', 'byteOffset', 'buffer', 'detached', 'resizable', 'growable', 'maxByteLength', 'name', 'message', 'constructor', 'source', 'flags', 'global', 'ignoreCase', 'multiline', 'dotAll', 'unicode', 'sticky', 'hasIndices', 'unicodeSets', 'lastIndex'];
+const builtinPrototypeGets = ['size', 'description', 'byteLength', 'byteOffset', 'buffer', 'detached', 'resizable', 'growable', 'maxByteLength', 'name', 'message', 'constructor', 'source', 'flags', 'global', 'ignoreCase', 'multiline', 'dotAll', 'unicode', 'sticky', 'hasIndices', 'unicodeSets', 'lastIndex', 'encoding', 'fatal', 'ignoreBOM'];
 
 const ctHash = prop => {
   if (!Prefs.ctHash || !prop ||
@@ -4823,7 +4823,8 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
         } else if ([
           TYPES.number, TYPES.promise, TYPES.symbol, TYPES.function,
           TYPES.set, TYPES.map, TYPES.weakref, TYPES.weakset, TYPES.weakmap,
-          TYPES.arraybuffer, TYPES.sharedarraybuffer, TYPES.dataview
+          TYPES.arraybuffer, TYPES.sharedarraybuffer, TYPES.dataview,
+          TYPES.textencoder, TYPES.textdecoder
         ].includes(t)) {
           const guard = () => internalThrow(func, 'TypeError', `${prettyName} expects 'this' to be a ${TYPE_NAMES[t]}`);
           emitIf(func, Bin('!=', T.i32, JvType(thisRef()), Const(T.i32, t)),
