@@ -866,7 +866,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     cur = partsOf(unitOf(f));
     const ret = CT[f.retType];
     const params = f.params.map(p => `${CT[p.type]} ${sanitize(p.name)}`).join(', ');
-    emit(`${f.ast?._module ? 'PORF_ONCE ' : NEVER_INLINE.has(f.name) ? 'PORF_NOINLINE ' : ''}${ret} ${fnSym(f)}(${params || 'void'}) {\n`);
+    emit(`${needsCoro(f) ? 'PORF_CORO_BODY ' : f.ast?._module ? 'PORF_ONCE ' : NEVER_INLINE.has(f.name) ? 'PORF_NOINLINE ' : ''}${ret} ${fnSym(f)}(${params || 'void'}) {\n`);
     depth = 1;
     activeTryDepth = 0;
     loopStack.length = 0;
@@ -3721,6 +3721,15 @@ ${prefs.nativeFetch ? '' : st}u8* porf_mem;
 #define PORF_ONCE
 #endif
 #define PORF_NORETURN __attribute__((cold, noinline, noreturn))
+// A suspended coroutine's body keeps its live values in its frame, and on wasm an
+// optimised frame holds them in wasm locals the conservative GC cannot scan. Unoptimised,
+// every local lives in the (scannable) shadow stack, so a collection at a safe point
+// cannot free what a suspended coroutine still uses. Native scans registers via setjmp.
+#if defined(__wasm__) && defined(__clang__)
+#define PORF_CORO_BODY __attribute__((optnone, noinline))
+#else
+#define PORF_CORO_BODY
+#endif
 #ifndef MAP_NORESERVE
 #define MAP_NORESERVE 0
 #endif
