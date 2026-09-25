@@ -4139,19 +4139,51 @@ ${st}jsval porf_num_to_str(f64 d) {
   if (d != d) n = snprintf(buf, sizeof buf, "NaN");
     else if (d == INFINITY) n = snprintf(buf, sizeof buf, "Infinity");
     else if (d == -INFINITY) n = snprintf(buf, sizeof buf, "-Infinity");
-    else if (d == trunc(d) && fabs(d) < 18446744073709551616.0) {
+    // exact digits are the shortest round-tripping ones only up to 2^53; above it JS
+    // prints the shortest digits padded with zeros (2^60 is "1152921504606847000")
+    else if (d == trunc(d) && fabs(d) < 9007199254740992.0) {
       char* p = buf + sizeof buf;
       u64 v = (u64)fabs(d);
       do { *--p = (char)('0' + v % 10u); v /= 10u; } while (v);
       if (d < 0) *--p = '-';
       n = (int)(buf + sizeof buf - p);
       memmove(buf, p, (size_t)n);
-    } else if (d == trunc(d) && fabs(d) < 1e21) n = snprintf(buf, sizeof buf, "%.0f", d);
-    else {
+    } else {
+      // shortest round-tripping digits from %e, then laid out by Number::toString's rules
+      // (%g differs: exponent below 1e-4 instead of 1e-6, "e-07" not "e-7", and exponent
+      // form for long non-integers that JS writes out in full up to 1e21)
+      char e[40];
       for (int prec = isnormal(d) ? 15 : 1;; prec++) {
-        n = snprintf(buf, sizeof buf, "%.*g", prec, d);
-        if (strtod(buf, NULL) == d || prec == 17) break;
+        snprintf(e, sizeof e, "%.*e", prec - 1, d);
+        if (strtod(e, NULL) == d || prec == 17) break;
       }
+      char digs[24];
+      int k = 0;
+      const char* q = e;
+      const int neg = *q == '-';
+      if (neg) q++;
+      for (; *q && *q != 'e'; q++) if (*q >= '0' && *q <= '9') digs[k++] = *q;
+      while (k > 1 && digs[k - 1] == '0') k--; // %e pads with trailing zeros
+      const int pt = atoi(q + 1) + 1; // the decimal point's position, n in the spec
+      char* o = buf;
+      if (neg) *o++ = '-';
+      if (k <= pt && pt <= 21) {
+        memcpy(o, digs, (size_t)k); o += k;
+        for (int i = k; i < pt; i++) *o++ = '0';
+      } else if (0 < pt && pt <= 21) {
+        memcpy(o, digs, (size_t)pt); o += pt;
+        *o++ = '.';
+        memcpy(o, digs + pt, (size_t)(k - pt)); o += k - pt;
+      } else if (-6 < pt && pt <= 0) {
+        *o++ = '0'; *o++ = '.';
+        for (int i = 0; i < -pt; i++) *o++ = '0';
+        memcpy(o, digs, (size_t)k); o += k;
+      } else {
+        *o++ = digs[0];
+        if (k > 1) { *o++ = '.'; memcpy(o, digs + 1, (size_t)(k - 1)); o += k - 1; }
+        o += snprintf(o, 8, "e%c%d", pt - 1 >= 0 ? '+' : '-', pt - 1 >= 0 ? pt - 1 : 1 - pt);
+      }
+      n = (int)(o - buf);
     }
   const u32 s = porf_bstr_new((u32)n);
   memcpy(MEM + s + 4, buf, (size_t)n);

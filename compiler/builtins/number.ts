@@ -247,91 +247,108 @@ export const __Number_prototype_toString = function (this: number, radix: number
   return out;
 };
 
+// Number.prototype.toFixed, exactly as the spec defines it: n is the integer for which
+// n / 10^f - x is closest to zero, using x's exact value, and the larger n on a tie.
+// Every finite double is m / 2^e with an integer m, so x * 10^f = m * 10^f / 2^e is
+// computed exactly: m in 24-bit limbs (plain numbers, so every step below is exact),
+// times 10 f times, shifted right e bits, plus one when bit e-1 is set (remainder >=
+// half, so ties round up). Scaling in floating point instead rounds 2.335 to 2.34.
 export const __Number_prototype_toFixed = function (this: number, fractionDigits: number) {
-  let n: number = this;
-  fractionDigits = Math.trunc(fractionDigits);
-  if (fractionDigits < 0 || fractionDigits > 100) {
-    throw new RangeError('toFixed() fractionDigits argument must be between 0 and 100');
+  let x: number = this;
+  let f: number = Math.trunc(fractionDigits);
+  if (Number.isNaN(f)) f = 0;
+  if (f < 0 || f > 100) throw new RangeError('toFixed() fractionDigits argument must be between 0 and 100');
+
+  if (!Number.isFinite(x)) return ecma262.ToString(x);
+
+  let sign: bytestring = '';
+  if (x < 0) {
+    sign = '-';
+    x = -x;
+  }
+  if (x >= 1e21) return sign + ecma262.ToString(x);
+
+  // x = m / 2^e, m an integer (doubling is exact in binary floating point)
+  let m: number = x;
+  let e: i32 = 0;
+  while (m != Math.trunc(m)) {
+    m *= 2;
+    e++;
   }
 
-  if (!Number.isFinite(n)) {
-    if (Number.isNaN(n)) return 'NaN';
-    if (n == Infinity) return 'Infinity';
-    return '-Infinity';
+  const B: number = 16777216; // 2^24
+  const limbs: number[] = Porffor.array.new(4);
+  let len: i32 = 0;
+  while (m > 0) {
+    limbs[len++] = m % B;
+    m = Math.floor(m / B);
   }
 
-  const out: bytestring = Porffor.malloc(512);
-  let outPtr: i32 = Porffor.IR.ptr(out);
-
-  // if negative value
-  if (n < 0) {
-    n = -n; // turn value positive for later use
-    Porffor.IR.storeU8(outPtr++, 4, 45); // prepend -
+  // * 10^f
+  for (let j: i32 = 0; j < f; j++) {
+    let carry: number = 0;
+    for (let i: i32 = 0; i < len; i++) {
+      const v: number = limbs[i] * 10 + carry;
+      limbs[i] = v % B;
+      carry = Math.floor(v / B);
+    }
+    if (carry > 0) limbs[len++] = carry;
   }
 
-  let i: f64 = Math.trunc(n);
+  // / 2^e, rounding half up
+  let roundUp: boolean = false;
+  if (e > 0) {
+    const bit: i32 = e - 1;
+    const at: i32 = Math.floor(bit / 24);
+    if (at < len) roundUp = Math.floor(limbs[at] / Math.pow(2, bit % 24)) % 2 == 1;
 
-  let digits: bytestring = ''; // byte "array"
+    const whole: i32 = Math.floor(e / 24);
+    const part: i32 = e % 24;
+    const low: number = Math.pow(2, part);
+    const high: number = Math.pow(2, 24 - part);
+    let n: i32 = 0;
+    for (let i: i32 = whole; i < len; i++) {
+      let v: number = Math.floor(limbs[i] / low);
+      if (part > 0) if (i + 1 < len) v += (limbs[i + 1] % low) * high;
+      limbs[n++] = v;
+    }
+    len = n;
+  }
+  while (len > 0 && limbs[len - 1] == 0) len--;
 
-  let l: i32 = 0;
-
-  if (i == 0) {
-    Porffor.IR.storeU8(Porffor.IR.ptr(digits), 4, 0);
-    l = 1;
-  } else {
-    for (; i > 0; l++) {
-      Porffor.IR.storeU8(Porffor.IR.ptr(digits) + l, 4, i % 10);
-      i = Math.trunc(i / 10);
+  if (roundUp) {
+    let i: i32 = 0;
+    while (true) {
+      if (i == len) {
+        limbs[len++] = 1;
+        break;
+      }
+      limbs[i] += 1;
+      if (limbs[i] < B) break;
+      limbs[i++] = 0;
     }
   }
 
-  let digitsPtr: i32 = Porffor.IR.ptr(digits) + l;
-  let endPtr: i32 = outPtr + l;
-  while (outPtr < endPtr) {
-    let digit: i32 = Porffor.IR.loadU8(--digitsPtr, 4);
-
-    if (digit < 10) digit += 48; // 0-9
-      else digit += 87; // a-z
-
-    Porffor.IR.storeU8(outPtr++, 4, digit);
+  // n in decimal, most significant digit first
+  let digits: bytestring = '';
+  while (len > 0) {
+    let rem: number = 0;
+    for (let i: i32 = len - 1; i >= 0; i--) {
+      const cur: number = rem * B + limbs[i];
+      limbs[i] = Math.floor(cur / 10);
+      rem = cur % 10;
+    }
+    digits = String.fromCharCode(48 + rem) + digits;
+    while (len > 0 && limbs[len - 1] == 0) len--;
   }
+  if (digits.length == 0) digits = '0';
 
-  let decimal: f64 = n - Math.trunc(n);
-  if (fractionDigits > 0) {
-    Porffor.IR.storeU8(outPtr++, 4, 46); // .
+  if (f == 0) return sign + digits;
 
-    decimal += 1;
-
-    for (let j: i32 = 0; j < fractionDigits; j++) {
-      decimal *= 10;
-    }
-
-    decimal = Math.round(decimal);
-
-    l = 0;
-    while (decimal > 1) {
-      const digit: f64 = decimal % 10;
-      decimal = Math.trunc(decimal / 10);
-
-      Porffor.IR.storeU8(Porffor.IR.ptr(digits) + l, 4, digit);
-      l++;
-    }
-
-    digitsPtr = Porffor.IR.ptr(digits) + l;
-
-    endPtr = outPtr + l;
-    while (outPtr < endPtr) {
-      let digit: i32 = Porffor.IR.loadU8(--digitsPtr, 4);
-
-      if (digit < 10) digit += 48; // 0-9
-        else digit += 87; // a-z
-
-      Porffor.IR.storeU8(outPtr++, 4, digit);
-    }
-  }
-
-  out.length = outPtr - Porffor.IR.ptr(out);
-  return out;
+  // at least one digit before the point
+  while (digits.length <= f) digits = '0' + digits;
+  const point: i32 = digits.length - f;
+  return sign + digits.slice(0, point) + '.' + digits.slice(point);
 };
 
 export const __Number_prototype_toLocaleString = function (this: number) { return Porffor.callThis(__Number_prototype_toString, this, 10); };
