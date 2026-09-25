@@ -305,6 +305,16 @@ export const BuiltinVars = ({ builtinFuncs }) => {
       Object.defineProperty(props, '__proto__', { value: { value: null, configurable: true }, enumerable: true });
     }
 
+    // special case: the native errors' prototypes inherit from Error.prototype, so a
+    // TypeError is instanceof Error (and inherits Error.prototype's members)
+    if ([ 'AggregateError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError' ].some(e => x === `__${e}_prototype`)) {
+      const errorProto = (_scope, { includeBuiltin }) => {
+        includeBuiltin('#get___Error_prototype');
+        return Box(Call('#get___Error_prototype', [], T.ptr), Const(T.i32, TYPES.object));
+      };
+      Object.defineProperty(props, '__proto__', { value: { value: errorProto, configurable: true }, enumerable: true });
+    }
+
     // special case: Function.prototype.length = 0
     // special case: Function.prototype.name = ''
     if (x === '__Function_prototype') {

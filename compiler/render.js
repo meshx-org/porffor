@@ -1319,7 +1319,7 @@ ${st}jsval porf_coro_start(u8 flags, u32 idx, jsval callee, u32 env, jsval thisv
 	`);
     }
     emit(`${st}jsval porf_call_dynamic(jsval fn, jsval thisv, jsval newtv, i32 argc, jsbits* argv) {
-  if (porf_jv_type(fn) != ${TYPES.function}) porf_throw_new(${TYPES.typeerror}, 0);
+  if (porf_jv_type(fn) != ${TYPES.function}) porf_throw_not_callable(fn);
   const u32 rec = (u32)fn.val;
   const u32 idx = *(u32*)(MEM + rec);
   const u32 env = *(u32*)(MEM + rec + 4);
@@ -3996,6 +3996,26 @@ PORF_NORETURN ${st}void porf_throw_new(i32 errType, u32 msgId) {
   const u32 p = porf_alloc(8, (u32)errType);
   *(jsbits*)(MEM + p) = JV_PATTERN | ((u64)${TYPES.bytestring} << 43) | msgId;
   porf_throw(porf_box((f64)p, errType));
+}
+
+// TypeError for calling something that is not a function, naming what it was
+// ("undefined is not a function"): the dynamic call site has no source text for it
+PORF_NORETURN ${st}void porf_throw_not_callable(jsval fn) {
+  const i32 t = porf_jv_type(fn);
+  const char* what = t == ${TYPES.undefined} ? "undefined"
+    : t == ${TYPES.object} && (u32)fn.val == 0 ? "null"
+    : t == ${TYPES.number} ? "a number"
+    : t == ${TYPES.boolean} ? "a boolean"
+    : t == ${TYPES.bytestring} || t == ${TYPES.string} ? "a string"
+    : t == ${TYPES.symbol} ? "a symbol"
+    : t == ${TYPES.bigint} ? "a bigint"
+    : "an object";
+  char text[48];
+  const int n = snprintf(text, sizeof text, "%s is not a function", what);
+  const u32 s = porf_alloc(4 + (u32)n, ${TYPES.bytestring});
+  *(u32*)(MEM + s) = (u32)n;
+  memcpy(MEM + s + 4, text, (size_t)n);
+  porf_throw_new(${TYPES.typeerror}, s);
 }
 
 PORF_NORETURN ${st}void porf_unreachable(const char* msg) {
