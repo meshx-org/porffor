@@ -1953,9 +1953,16 @@ const generateCall = (scope, decl) => {
         });
       }
 
+      // the fallback call reads the object through targetTmp too: regenerating decl as-is
+      // would evaluate the object expression a second time (f().push(x) calling f twice)
+      const member = decl.callee.type === 'ChainExpression' ? decl.callee.expression : decl.callee;
+      const fallbackCallee = name || member.type !== 'MemberExpression' || member.object.type === 'Super' ? decl.callee
+        : decl.callee.type === 'ChainExpression' ? { ...decl.callee, expression: { ...member, object: targetIdent } }
+        : { ...member, object: targetIdent };
+
       protoBC.default = () => Prefs.neverFallbackBuiltinProto && !decl.optional
         ? internalThrow(scope, 'TypeError', `'${protoName}' proto func tried to be called on a type without an impl`)
-        : generate(scope, { ...decl, _protoInternalCall: true });
+        : generate(scope, { ...decl, callee: fallbackCallee, _protoInternalCall: true });
 
       aliasPrimObjsBC(protoBC);
 
