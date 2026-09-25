@@ -4399,14 +4399,38 @@ static void porf_init(int argc, char** argv) {
 };
 
 const CORO_RUNTIME = () => `// ---- coroutines (fiber stacks) ----
-#if defined(__TINYC__) || (!defined(__x86_64__) && !defined(__aarch64__))
+#if defined(__wasip3__)
+// WASI P3: wasm cannot switch C stacks itself, so each coroutine is a component-model
+// cooperative thread (the host switches) with its own shadow stack
+#define PORF_CORO_USE_P3 1
+#define PORF_CORO_USE_UCONTEXT 0
+#elif defined(__TINYC__) || (!defined(__x86_64__) && !defined(__aarch64__))
+#define PORF_CORO_USE_P3 0
 #define PORF_CORO_USE_UCONTEXT 1
 #include <ucontext.h>
 #else
+#define PORF_CORO_USE_P3 0
 #define PORF_CORO_USE_UCONTEXT 0
 #endif
 
+#if PORF_CORO_USE_P3
+__attribute__((__import_module__("$root"), __import_name__("[thread-index]")))
+extern u32 porf_p3_thread_index(void);
+__attribute__((__import_module__("$root"), __import_name__("[thread-new-indirect-v0]")))
+extern u32 porf_p3_thread_new_indirect(void (*start)(void*), void* arg);
+__attribute__((__import_module__("$root"), __import_name__("[thread-suspend-then-resume]")))
+extern u32 porf_p3_thread_suspend_then_resume(u32 thread);
+__attribute__((__import_module__("$root"), __import_name__("[thread-resume-later]")))
+extern void porf_p3_thread_resume_later(u32 thread);
+// the stack pointer is per thread on P3, behind these linker-made accessors; a new
+// thread starts without one
+extern void __wasm_set_stack_pointer(void* sp);
+#endif
+
+#ifndef PORF_CORO_STACK_SIZE
 #define PORF_CORO_STACK_SIZE (256u * 1024u)
+#endif
+#define PORF_CORO_P3_CANARY 0x504f5246434f524full // bottom-of-stack marker (P3: no guard page)
 #define PORF_CORO_MAX 16384
 
 typedef struct porf_coro {
@@ -4423,6 +4447,21 @@ typedef struct porf_coro {
   void (*fn)(void*);
   void* arg;
   i32 ctx_init;
+#elif PORF_CORO_USE_P3
+  u32 tid;                // this coroutine's thread
+  u32 caller_tid;         // the thread that last started or resumed it
+  void (*fn)(void*);
+  void* arg;
+  i32 escaped;            // an exception left the body: rethrown on the caller's thread
+  // each coroutine thread has its own try stack: a jmp_buf only works on its thread, and
+  // a coroutine's entries are restored at fixed indexes, so sharing one stack lets a
+  // coroutine resumed from a deeper try overwrite its resumer's entries
+  jmp_buf* own_try_data;
+  i32 own_try_cap;
+  i32 own_try_depth;
+  jmp_buf* caller_try_data;
+  i32 caller_try_cap;
+  i32 caller_try_depth;
 #else
   jmp_buf resume_pt;      // inside the coroutine, at the await/yield
   jmp_buf caller_pt;      // latest frame that ran/resumed it
@@ -4601,6 +4640,21 @@ static void porf_coro_stack_ensure(porf_coro* c) {
     c->sp = 0;
     return;
   }
+#if PORF_CORO_USE_P3
+  // no mprotect on WASI: a plain allocation, without a guard page
+  char* block = (char*)malloc((size_t)PORF_CORO_STACK_SIZE);
+  if (!block) {
+    fprintf(stderr, "porffor: failed to allocate coroutine stack\\n");
+    abort();
+  }
+  c->stack_map = block;
+  c->stack_map_size = (size_t)PORF_CORO_STACK_SIZE;
+  c->stack_lo = block;
+  c->stack_top = (char*)(((uintptr_t)block + (size_t)PORF_CORO_STACK_SIZE) & ~(uintptr_t)15u);
+  c->sp = 0;
+  *(u64*)block = PORF_CORO_P3_CANARY;
+  return;
+#endif
   const size_t page = porf_coro_page_size();
   const size_t usable = ((size_t)PORF_CORO_STACK_SIZE + page - 1u) & ~(page - 1u);
   const size_t map_size = usable + page;
@@ -4632,7 +4686,11 @@ static void porf_coro_stack_free(porf_coro* c) {
       e.stack_top = c->stack_top;
       porf_coro_stack_pool[porf_coro_stack_pool_len++] = e;
     } else {
+#if PORF_CORO_USE_P3
+      free(c->stack_map);
+#else
       munmap(c->stack_map, c->stack_map_size);
+#endif
     }
     c->stack_map = 0;
     c->stack_map_size = 0;
@@ -4643,6 +4701,12 @@ static void porf_coro_stack_free(porf_coro* c) {
   free(c->try_save);
   c->try_save = 0;
   c->try_save_cap = 0;
+#if PORF_CORO_USE_P3
+  free(c->own_try_data);
+  c->own_try_data = 0;
+  c->own_try_cap = 0;
+  c->own_try_depth = 0;
+#endif
 }
 
 static void porf_coro_live_add(porf_coro* c) {
@@ -4703,6 +4767,8 @@ static void porf_coro_gc_scan_stack(porf_coro* c, char* sp) {
 static void porf_coro_gc_scan_saved_context(porf_coro* c) {
 #if PORF_CORO_USE_UCONTEXT
   porf_coro_gc_scan_mem(&c->ctx, (const char*)&c->ctx + sizeof(c->ctx));
+#elif PORF_CORO_USE_P3
+  (void)c; // the host keeps a suspended thread's state; its shadow stack is scanned by sp
 #else
   porf_coro_gc_scan_mem(&c->resume_pt, (const char*)&c->resume_pt + sizeof(c->resume_pt));
 #endif
@@ -4711,6 +4777,8 @@ static void porf_coro_gc_scan_saved_context(porf_coro* c) {
 static void porf_coro_gc_scan_caller_context(porf_coro* c) {
 #if PORF_CORO_USE_UCONTEXT
   porf_coro_gc_scan_mem(&c->caller_ctx, (const char*)&c->caller_ctx + sizeof(c->caller_ctx));
+#elif PORF_CORO_USE_P3
+  (void)c;
 #else
   porf_coro_gc_scan_mem(&c->caller_pt, (const char*)&c->caller_pt + sizeof(c->caller_pt));
 #endif
@@ -4786,6 +4854,79 @@ static void porf_coro_restore_caller(porf_coro* c) {
   if (c->state == 3) porf_coro_stack_free(c);
 }
 
+#if PORF_CORO_USE_P3
+// runs on the coroutine's thread. An exception leaving the body cannot longjmp to a try
+// on the caller's thread (wasm sjlj unwinds one thread's stack), so it is caught here and
+// rethrown by porf_coro_enter/resume on the caller's side.
+__attribute__((noinline, used))
+void porf_coro_p3_run(porf_coro* c) {
+  const i32 depth = porf_try_depth++;
+  if (_setjmp(porf_try_ensure()[depth]) == 0) {
+    c->fn(c->arg);
+  } else {
+    c->escaped = 1;
+    c->channel = porf_exception;
+  }
+  porf_try_depth = depth;
+  c->state = 3;
+  porf_coro_set_current_stack_top(c->caller_stack_top);
+  porf_p3_thread_resume_later(c->caller_tid); // the thread ends as this returns
+}
+
+// No mprotect on WASI means no guard page: an overflowing coroutine would silently
+// overwrite whatever malloc put below its stack. A canary at the bottom turns that into
+// an error at the next switch back (build with a larger -DPORF_CORO_STACK_SIZE).
+static void porf_coro_p3_check_stack(porf_coro* c) {
+  if (c->stack_lo && *(u64*)c->stack_lo != PORF_CORO_P3_CANARY)
+    porf_unreachable("coroutine stack overflow (raise PORF_CORO_STACK_SIZE)");
+}
+
+// on the caller's thread, around each switch into c: install c's try stack, then the caller's
+static void porf_coro_p3_trys_in(porf_coro* c) {
+  c->caller_try_data = porf_try_data;
+  c->caller_try_cap = porf_try_cap;
+  c->caller_try_depth = porf_try_depth;
+  porf_try_data = c->own_try_data;
+  porf_try_cap = c->own_try_cap;
+  porf_try_depth = c->own_try_depth;
+}
+
+static void porf_coro_p3_trys_out(porf_coro* c) {
+  porf_coro_p3_check_stack(c);
+  c->own_try_data = porf_try_data;
+  c->own_try_cap = porf_try_cap;
+  c->own_try_depth = porf_try_depth;
+  porf_try_data = c->caller_try_data;
+  porf_try_cap = c->caller_try_cap;
+  porf_try_depth = c->caller_try_depth;
+}
+
+// The thread's entry. A new thread has no stack pointer yet (it reads as 0), and any C
+// function may open a shadow-stack frame in its prologue (at -O0 every one does), so the
+// entry is assembly: its argument is the coroutine's stack top, with the coroutine
+// pointer stored in the 16 bytes just below it (porf_coro_enter puts it there).
+//   sp = top - 16; porf_coro_p3_run(*(porf_coro**)(top - 16))
+void porf_coro_p3_start(void* top);
+__asm__(
+  ".functype __wasm_set_stack_pointer (i32) -> ()\\n"
+  ".functype porf_coro_p3_run (i32) -> ()\\n"
+  ".globl porf_coro_p3_start\\n"
+  ".type porf_coro_p3_start,@function\\n"
+  "porf_coro_p3_start:\\n"
+  ".functype porf_coro_p3_start (i32) -> ()\\n"
+  "  local.get 0\\n"
+  "  i32.const 16\\n"
+  "  i32.sub\\n"
+  "  call __wasm_set_stack_pointer\\n"
+  "  local.get 0\\n"
+  "  i32.const 16\\n"
+  "  i32.sub\\n"
+  "  i32.load 0\\n"
+  "  call porf_coro_p3_run\\n"
+  "  end_function\\n"
+);
+#endif
+
 #if PORF_CORO_USE_UCONTEXT
 static porf_coro* porf_coro_starting = 0;
 
@@ -4798,7 +4939,7 @@ static void porf_coro_ucontext_bootstrap(void) {
   setcontext(&c->caller_ctx);
   abort();
 }
-#else
+#elif !PORF_CORO_USE_P3
 __attribute__((noreturn, noinline))
 static void porf_coro_bootstrap(porf_coro* c, void (*fn)(void*), void* arg) {
   fn(arg);
@@ -4854,11 +4995,30 @@ static int porf_coro_enter(porf_coro* c, void (*fn)(void*), void* arg) {
   }
   porf_coro_starting = c;
   if (swapcontext(&c->caller_ctx, &c->ctx) != 0) abort();
+#elif PORF_CORO_USE_P3
+  c->fn = fn;
+  c->arg = arg;
+  c->escaped = 0;
+  c->own_try_data = 0;
+  c->own_try_cap = 0;
+  c->own_try_depth = 0;
+  c->caller_tid = porf_p3_thread_index();
+  *(porf_coro**)(c->stack_top - 16) = c; // read by porf_coro_p3_start
+  c->tid = porf_p3_thread_new_indirect(porf_coro_p3_start, c->stack_top);
+  porf_coro_p3_trys_in(c);
+  porf_p3_thread_suspend_then_resume(c->tid);
+  porf_coro_p3_trys_out(c);
 #else
   if (_setjmp(c->caller_pt) == 0) porf_coro_switch_start(c->stack_top, c, fn, arg);
 #endif
   porf_try_depth = outer_try; // suspension left the coroutine's depth active
   porf_coro_restore_caller(c);
+#if PORF_CORO_USE_P3
+  if (c->escaped) {
+    c->escaped = 0;
+    porf_throw(c->channel);
+  }
+#endif
   return c->state == 3;
 }
 
@@ -4867,13 +5027,19 @@ static jsval porf_coro_suspend(jsval out) {
   porf_coro* c = porf_coro_cur;
   if (!c) porf_unreachable("await outside coroutine");
   c->channel = out;
+#if !PORF_CORO_USE_P3
   porf_coro_save_try_stack(c);
+#endif
   porf_coro_live_add(c);
   c->state = 2;
 #if PORF_CORO_USE_UCONTEXT
   c->sp = porf_coro_read_sp();
   porf_coro_set_current_stack_top(c->caller_stack_top);
   if (swapcontext(&c->ctx, &c->caller_ctx) != 0) abort();
+#elif PORF_CORO_USE_P3
+  c->sp = porf_coro_read_sp();
+  porf_coro_set_current_stack_top(c->caller_stack_top);
+  porf_p3_thread_suspend_then_resume(c->caller_tid);
 #else
   if (_setjmp(c->resume_pt) == 0) {
     c->sp = porf_coro_read_sp();
@@ -4898,15 +5064,28 @@ static int porf_coro_resume_inner(porf_coro* c, jsval in, i32 is_throw) {
   c->throw_pending = is_throw;
   c->state = 1;
   volatile i32 my_try = porf_try_depth;
+#if !PORF_CORO_USE_P3
   porf_coro_restore_try_stack(c);
+#endif
   porf_coro_prepare_run(c);
 #if PORF_CORO_USE_UCONTEXT
   if (swapcontext(&c->caller_ctx, &c->ctx) != 0) abort();
+#elif PORF_CORO_USE_P3
+  c->caller_tid = porf_p3_thread_index();
+  porf_coro_p3_trys_in(c);
+  porf_p3_thread_suspend_then_resume(c->tid);
+  porf_coro_p3_trys_out(c);
 #else
   if (_setjmp(c->caller_pt) == 0) _longjmp(c->resume_pt, 1);
 #endif
   porf_try_depth = my_try; // restore resumer's depth (coroutine's was active)
   porf_coro_restore_caller(c);
+#if PORF_CORO_USE_P3
+  if (c->escaped) {
+    c->escaped = 0;
+    porf_throw(c->channel);
+  }
+#endif
   return c->state == 3;
 }
 static int porf_coro_resume(porf_coro* c, jsval in) { return porf_coro_resume_inner(c, in, 0); }
