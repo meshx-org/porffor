@@ -89,6 +89,7 @@ export const __Reflect_setPrototypeOf = (target: any, proto: any) => {
 
 export const __Reflect_ownKeys = (target: any) => {
   if (!Porffor.object.isObject(target)) throw new TypeError('Target is a non-object');
+  if (Porffor.type(target) == Porffor.TYPES.proxy) return __Porffor_proxy_ownKeys(target);
 
   const out: any[] = Porffor.array.new(4);
   let i: i32 = 0;

@@ -205,6 +205,8 @@ export const __Porffor_underlyingRebuild = (): void => {
 export const __Porffor_object_underlying = (_obj: any): any => {
   const objType: i32 = Porffor.type(_obj);
   if (objType == Porffor.TYPES.object) return _obj;
+  // a path with no proxy hook sees the target (proxy traps run only where hooked)
+  if (objType == Porffor.TYPES.proxy) return __Porffor_object_underlying(__Porffor_proxy_target(_obj));
 
   if (objType > 0x05) {
     if (underlyingStore == 0) {
@@ -541,6 +543,7 @@ export const __Porffor_array_propertyKeyIndex = (key: any): i32 => {
 export const __Porffor_object_get = (_obj: any, key: any): any => {
   let obj: any = _obj;
   const trueType: i32 = Porffor.type(obj);
+  if (trueType == Porffor.TYPES.proxy) return __Porffor_proxy_get(_obj, ecma262.ToPropertyKey(key), _obj);
   if (trueType == Porffor.TYPES.object) {
     if (Porffor.IR.ptr(obj) == 0) throw new TypeError('Cannot get property of null');
   } else {
@@ -648,6 +651,7 @@ export const __Porffor_object_get_icMiss = (_obj: any, key: any, hash: i32, slot
 export const __Porffor_object_get_withHash = (_obj: any, key: any, hash: i32): any => {
   let obj: any = _obj;
   const trueType: i32 = Porffor.type(obj);
+  if (trueType == Porffor.TYPES.proxy) return __Porffor_proxy_get(_obj, key, _obj);
   if (trueType == Porffor.TYPES.object) {
     if (Porffor.IR.ptr(obj) == 0) throw new TypeError('Cannot get property of null');
   } else {
@@ -702,6 +706,7 @@ export const __Porffor_object_get_withHash = (_obj: any, key: any, hash: i32): a
 export const __Porffor_object_set = (_obj: any, key: any, value: any): any => {
   let obj: any = _obj;
   const trueType: i32 = Porffor.type(obj);
+  if (trueType == Porffor.TYPES.proxy) return __Porffor_proxy_set(_obj, ecma262.ToPropertyKey(key), value, _obj, false);
   if (Porffor.type(obj) != Porffor.TYPES.object) {
     obj = __Porffor_object_underlying(obj);
     if (Porffor.type(obj) != Porffor.TYPES.object) return value;
@@ -817,6 +822,7 @@ export const __Porffor_object_set = (_obj: any, key: any, value: any): any => {
 export const __Porffor_object_set_withHash = (_obj: any, key: any, value: any, hash: i32): any => {
   let obj: any = _obj;
   const trueType: i32 = Porffor.type(obj);
+  if (trueType == Porffor.TYPES.proxy) return __Porffor_proxy_set(_obj, key, value, _obj, false);
   if (Porffor.type(obj) != Porffor.TYPES.object) {
     obj = __Porffor_object_underlying(obj);
     if (Porffor.type(obj) != Porffor.TYPES.object) return value;
@@ -905,6 +911,7 @@ export const __Porffor_object_set_withHash = (_obj: any, key: any, value: any, h
 export const __Porffor_object_setStrict = (_obj: any, key: any, value: any): any => {
   let obj: any = _obj;
   const trueType: i32 = Porffor.type(obj);
+  if (trueType == Porffor.TYPES.proxy) return __Porffor_proxy_set(_obj, ecma262.ToPropertyKey(key), value, _obj, true);
   if (Porffor.type(obj) != Porffor.TYPES.object) {
     obj = __Porffor_object_underlying(obj);
     if (Porffor.type(obj) != Porffor.TYPES.object) return value;
@@ -1021,6 +1028,7 @@ export const __Porffor_object_setStrict = (_obj: any, key: any, value: any): any
 export const __Porffor_object_setStrict_withHash = (_obj: any, key: any, value: any, hash: i32): any => {
   let obj: any = _obj;
   const trueType: i32 = Porffor.type(obj);
+  if (trueType == Porffor.TYPES.proxy) return __Porffor_proxy_set(_obj, key, value, _obj, true);
   if (Porffor.type(obj) != Porffor.TYPES.object) {
     obj = __Porffor_object_underlying(obj);
     if (Porffor.type(obj) != Porffor.TYPES.object) return value;
@@ -1204,6 +1212,7 @@ export const __Porffor_object_defineAccessor = (obj: any, key: any, get: any, se
 };
 
 export const __Porffor_object_delete = (obj: any, key: any): boolean => {
+  if (Porffor.type(obj) == Porffor.TYPES.proxy) return __Porffor_proxy_deleteProperty(obj, ecma262.ToPropertyKey(key), false);
   if (Porffor.IR.ptr(obj) == 0) throw new TypeError('Cannot delete property of null');
 
   const trueType: i32 = Porffor.type(obj);
@@ -1246,6 +1255,7 @@ export const __Porffor_object_delete = (obj: any, key: any): boolean => {
 };
 
 export const __Porffor_object_deleteStrict = (obj: any, key: any): boolean => {
+  if (Porffor.type(obj) == Porffor.TYPES.proxy) return __Porffor_proxy_deleteProperty(obj, ecma262.ToPropertyKey(key), true);
   if (Porffor.IR.ptr(obj) == 0) throw new TypeError('Cannot delete property of null');
 
   const trueType: i32 = Porffor.type(obj);

@@ -1,0 +1,186 @@
+import type {} from './porffor.d.ts';
+
+// Proxy: the get, set, has, deleteProperty, ownKeys and getOwnPropertyDescriptor traps.
+// A proxy is its own type holding [target, handler] (16 bytes, both traced by the GC).
+// The object operations in _internal_object.ts / object.ts / reflect.ts hand a proxy to
+// the functions below, and every operation whose trap is missing falls through to the
+// target. Not implemented yet: apply/construct (callable proxies), the prototype and
+// extensibility traps, defineProperty, invariant checks and Proxy.revocable.
+
+// Returns any, not Proxy: a return annotation re-tags the returned value, which would
+// turn the function returned below into a "proxy" pointing at function memory.
+export const Proxy = function (target: any, handler: any): any {
+  if (!new.target) throw new TypeError("Constructor Proxy requires 'new'");
+  // == null first: isObject(null) is true (its null check compares the value to 0)
+  if (target == null) throw new TypeError('Cannot create proxy with a non-object as target');
+  if (handler == null) throw new TypeError('Cannot create proxy with a non-object as handler');
+  if (!Porffor.object.isObject(target)) throw new TypeError('Cannot create proxy with a non-object as target');
+  if (!Porffor.object.isObject(handler)) throw new TypeError('Cannot create proxy with a non-object as handler');
+
+  // No apply/construct traps yet: a proxy of a function is the function itself, as
+  // before, so it stays callable and constructible (its other traps do not run).
+  if (Porffor.type(target) == Porffor.TYPES.function) return target;
+
+  const out: Proxy = Porffor.malloc(16);
+  Porffor.IR.storeJv(out, 0, target);
+  Porffor.IR.storeJv(out, 8, handler);
+  return out;
+};
+
+export const __Porffor_proxy_target = (proxy: any): any => {
+  return Porffor.IR.loadJv(proxy, 0);
+};
+
+// The accessor that target.[[Get]]/[[Set]] would reach for key: walks target's chain the
+// way the spec's OrdinaryGet does, so it can be called with the proxy (or whatever the
+// receiver is) as this. Returns undefined for a data property or no property at all;
+// those need no receiver, so the plain get/set handles them.
+export const __Porffor_proxy_findAccessor = (target: any, key: any): any => {
+  let obj: any = target;
+  while (obj != null) {
+    if (Porffor.type(obj) == Porffor.TYPES.proxy) return undefined;
+    const desc: any = __Object_getOwnPropertyDescriptor(obj, key);
+    if (desc !== undefined) {
+      if (Porffor.fastOr('get' in desc, 'set' in desc)) return desc;
+      return undefined;
+    }
+    obj = __Object_getPrototypeOf(obj);
+  }
+  return undefined;
+};
+
+export const __Porffor_proxy_get = (proxy: any, key: any, receiver: any): any => {
+  const target: any = Porffor.IR.loadJv(proxy, 0);
+  const handler: any = Porffor.IR.loadJv(proxy, 8);
+  const trap: any = handler.get;
+  if (trap == null) {
+    // target.[[Get]](key, receiver)
+    if (Porffor.type(target) == Porffor.TYPES.proxy) return __Porffor_proxy_get(target, key, receiver);
+    const accessor: any = __Porffor_proxy_findAccessor(target, key);
+    if (accessor !== undefined) {
+      const get: any = accessor.get;
+      if (get == null) return undefined;
+      return Porffor.callThis(get, receiver);
+    }
+    return __Porffor_object_get(target, key);
+  }
+
+  return Porffor.callThis(trap, handler, target, key, receiver);
+};
+
+export const __Porffor_proxy_set = (proxy: any, key: any, value: any, receiver: any, strict: boolean): any => {
+  const target: any = Porffor.IR.loadJv(proxy, 0);
+  const handler: any = Porffor.IR.loadJv(proxy, 8);
+  const trap: any = handler.set;
+  if (trap == null) {
+    // target.[[Set]](key, value, receiver): a setter on target's chain runs with receiver
+    if (Porffor.type(target) == Porffor.TYPES.proxy) return __Porffor_proxy_set(target, key, value, receiver, strict);
+    const accessor: any = __Porffor_proxy_findAccessor(target, key);
+    if (accessor !== undefined) {
+      const set: any = accessor.set;
+      if (set == null) {
+        if (strict) throw new TypeError('Cannot set property which has only a getter');
+        return value;
+      }
+      Porffor.callThis(set, receiver, value);
+      return value;
+    }
+    if (strict) __Porffor_object_setStrict(target, key, value);
+      else __Porffor_object_set(target, key, value);
+    return value;
+  }
+
+  const ok: any = Porffor.callThis(trap, handler, target, key, value, receiver);
+  if (strict) if (!ok) throw new TypeError("'set' on proxy: trap returned falsish");
+  return value;
+};
+
+export const __Porffor_proxy_has = (proxy: any, key: any): boolean => {
+  const target: any = Porffor.IR.loadJv(proxy, 0);
+  const handler: any = Porffor.IR.loadJv(proxy, 8);
+  const trap: any = handler.has;
+  if (trap == null) return __Porffor_object_in(target, key);
+
+  return !!Porffor.callThis(trap, handler, target, key);
+};
+
+export const __Porffor_proxy_deleteProperty = (proxy: any, key: any, strict: boolean): boolean => {
+  const target: any = Porffor.IR.loadJv(proxy, 0);
+  const handler: any = Porffor.IR.loadJv(proxy, 8);
+  const trap: any = handler.deleteProperty;
+  if (trap == null) {
+    if (strict) return __Porffor_object_deleteStrict(target, key);
+    return __Porffor_object_delete(target, key);
+  }
+
+  const ok: boolean = !!Porffor.callThis(trap, handler, target, key);
+  if (strict) if (!ok) throw new TypeError("'deleteProperty' on proxy: trap returned falsish");
+  return ok;
+};
+
+// [[OwnPropertyKeys]]: the trap's array-like, checked to hold only strings and symbols.
+export const __Porffor_proxy_ownKeys = (proxy: any): any[] => {
+  const target: any = Porffor.IR.loadJv(proxy, 0);
+  const handler: any = Porffor.IR.loadJv(proxy, 8);
+  const trap: any = handler.ownKeys;
+  if (trap == null) return __Reflect_ownKeys(target);
+
+  const list: any = Porffor.callThis(trap, handler, target);
+  if (!Porffor.object.isObject(list)) throw new TypeError("'ownKeys' on proxy: trap returned a non-object");
+
+  const out: any[] = Porffor.array.new(4);
+  const len: i32 = list.length;
+  for (let i: i32 = 0; i < len; i++) {
+    const key: any = list[i];
+    const t: i32 = Porffor.type(key);
+    if (Porffor.fastAnd((t | 0b10000000) != Porffor.TYPES.bytestring, t != Porffor.TYPES.symbol))
+      throw new TypeError("'ownKeys' on proxy: trap result contains a non-property-key");
+    out[i] = key;
+  }
+  return out;
+};
+
+// [[GetOwnProperty]], normalised to a complete descriptor the way the spec's
+// ToPropertyDescriptor + FromPropertyDescriptor would (extra fields are dropped).
+export const __Porffor_proxy_getOwnPropertyDescriptor = (proxy: any, key: any): any => {
+  const target: any = Porffor.IR.loadJv(proxy, 0);
+  const handler: any = Porffor.IR.loadJv(proxy, 8);
+  const trap: any = handler.getOwnPropertyDescriptor;
+  if (trap == null) return __Object_getOwnPropertyDescriptor(target, key);
+
+  const desc: any = Porffor.callThis(trap, handler, target, key);
+  if (desc === undefined) return undefined;
+  if (!Porffor.object.isObject(desc)) throw new TypeError("'getOwnPropertyDescriptor' on proxy: trap returned neither object nor undefined");
+
+  const out: any = {};
+  if (Porffor.fastOr('get' in desc, 'set' in desc)) {
+    out.get = desc.get;
+    out.set = desc.set;
+  } else {
+    out.value = desc.value;
+    out.writable = !!desc.writable;
+  }
+  out.enumerable = !!desc.enumerable;
+  out.configurable = !!desc.configurable;
+  return out;
+};
+
+// Own keys as Object.keys (enumerable strings), Object.getOwnPropertyNames (all strings)
+// and object spread (enumerable strings and symbols) see them.
+export const __Porffor_proxy_keys = (proxy: any, enumerableOnly: boolean, stringsOnly: boolean): any[] => {
+  const keys: any[] = __Porffor_proxy_ownKeys(proxy);
+  const out: any[] = Porffor.array.new(4);
+  let n: i32 = 0;
+  const len: i32 = keys.length;
+  for (let i: i32 = 0; i < len; i++) {
+    const key: any = keys[i];
+    if (stringsOnly) if (Porffor.type(key) == Porffor.TYPES.symbol) continue;
+    if (enumerableOnly) {
+      const desc: any = __Porffor_proxy_getOwnPropertyDescriptor(proxy, key);
+      if (desc === undefined) continue;
+      if (!desc.enumerable) continue;
+    }
+    out[n++] = key;
+  }
+  return out;
+};

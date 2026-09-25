@@ -69,3 +69,5 @@ registerInternalType('__Porffor_AsyncGenerator');
 
 for (const x of [ '', 'Aggregate', 'Type', 'Reference', 'Syntax', 'Range', 'Eval', 'URI' ])
   registerInternalType(`${x}Error`);
+
+registerInternalType('Proxy');
