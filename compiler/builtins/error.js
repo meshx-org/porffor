@@ -11,6 +11,13 @@ export const ${name} = function (
   if (message === undefined) message = '';
     else message = ecma262.ToString(message);
 
+  // Reached through super() from a subclass: the instance is this (a plain object whose
+  // prototype chain reaches ${name}.prototype), and super() discards the block returned
+  // below, so the message getter would read nothing. Give the instance the own
+  // non-enumerable message property the spec defines instead.
+  if (new.target) if (new.target !== ${name}) if (Porffor.type(this) == Porffor.TYPES.object)
+    __Porffor_object_define(this, 'message', message, 0b1010);
+
   const obj: ${name} = Porffor.malloc(8);
   Porffor.IR.storeJv(obj, 0, message);
 
@@ -36,7 +43,9 @@ export const __${name}_prototype_message$get = function (this: ${name}) {
   return Porffor.IR.loadJv(this, 0);
 };
 
-export const __${name}_prototype_toString = function (this: ${name}) {
+// generic per spec: reads name and message off any this, so a subclass instance's own
+// message and name are seen (typed as ${name}, both would resolve to the ${name} getters)
+export const __${name}_prototype_toString = function (this: any) {
   const name: any = this.name;
   const message: any = this.message;
   if (message.length == 0) {
