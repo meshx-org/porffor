@@ -1,6 +1,8 @@
 import type {} from './porffor.d.ts';
 
 let __Porffor_json_bufLimit: i32 = 0;
+// set when a serialized string held a code unit above 0xff (see __Porffor_json_serialize)
+let __Porffor_json_wide: boolean = false;
 
 export const __Porffor_bytestring_bufferStr = (buffer: i32, str: bytestring): i32 => {
   const len: i32 = str.length;
@@ -110,7 +112,7 @@ export const __Porffor_json_serialize = (_buffer: i32, value: any, depth: i32, s
 
         const h1: i32 = (c & 0xf0) / 0x10;
         const h2: i32 = c & 0x0f;
-        buffer = __Porffor_bytestring_buffer2Char(buffer, h1 < 10 ? h1 + 48 : h1 + 55, h2 < 10 ? h2 + 48 : h2 + 55); // 0-9 or A-F
+        buffer = __Porffor_bytestring_buffer2Char(buffer, h1 < 10 ? h1 + 48 : h1 + 87, h2 < 10 ? h2 + 48 : h2 + 87); // 0-9 or a-f (the spec's UnicodeEscape is lowercase)
         continue;
       }
 
@@ -124,7 +126,30 @@ export const __Porffor_json_serialize = (_buffer: i32, value: any, depth: i32, s
         continue;
       }
 
-      // todo: support non-bytestrings
+      if (c > 0xff) {
+        // a lone surrogate stays escaped (well-formed JSON.stringify)
+        if (c >= 0xd800 && c <= 0xdfff) {
+          const next: i32 = i + 1 < len ? value.charCodeAt(i + 1) : 0;
+          const prev: i32 = i > 0 ? value.charCodeAt(i - 1) : 0;
+          const paired: boolean = c <= 0xdbff ? (next >= 0xdc00 && next <= 0xdfff) : (prev >= 0xd800 && prev <= 0xdbff);
+          if (!paired) {
+            buffer = __Porffor_bytestring_buffer2Char(buffer, 92, 117); // \u
+            for (let shift: i32 = 12; shift >= 0; shift -= 4) {
+              const h: i32 = (c >> shift) & 0xf;
+              buffer = __Porffor_bytestring_bufferChar(buffer, h < 10 ? h + 48 : h + 87);
+            }
+            continue;
+          }
+        }
+        // a code unit the byte buffer cannot hold: the marker byte 0x01 (never raw in
+        // JSON output: control characters are escaped) then its two bytes; stringify
+        // widens the result to a UTF-16 string
+        __Porffor_json_wide = true;
+        buffer = __Porffor_bytestring_bufferChar(buffer, 1);
+        buffer = __Porffor_bytestring_buffer2Char(buffer, c >> 8, c & 0xff);
+        continue;
+      }
+
       buffer = __Porffor_bytestring_bufferChar(buffer, c);
     }
 
@@ -278,6 +303,7 @@ export const __JSON_stringify = (value: any, replacer: any, space: any) => {
   let cap: i32 = 4096;
   let buffer: bytestring = Porffor.malloc(6 + cap);
   __Porffor_json_bufLimit = (buffer as i32) + 4 + cap;
+  __Porffor_json_wide = false;
   let out: i32 = __Porffor_json_serialize(buffer, value, 0, space);
   if (out == -1) return undefined;
 
@@ -290,11 +316,33 @@ export const __JSON_stringify = (value: any, replacer: any, space: any) => {
   }
 
   buffer.length = out - (buffer as i32);
-  return buffer;
+  if (!__Porffor_json_wide) return buffer;
+
+  // widen: every byte is a code unit, except a marker (0x01) and the two bytes of the
+  // unit it stands for
+  const bytes: i32 = buffer.length;
+  let units: i32 = 0;
+  for (let i: i32 = 0; i < bytes; i++) {
+    if (Porffor.IR.loadU8(Porffor.IR.ptr(buffer) + i, 4) == 1) i += 2;
+    units++;
+  }
+  const wide: string = Porffor.malloc(4 + units * 2);
+  wide.length = units;
+  let w: i32 = Porffor.IR.ptr(wide);
+  for (let i: i32 = 0; i < bytes; i++) {
+    const b: i32 = Porffor.IR.loadU8(Porffor.IR.ptr(buffer) + i, 4);
+    if (b == 1) {
+      Porffor.IR.storeU16(w, 4, (Porffor.IR.loadU8(Porffor.IR.ptr(buffer) + i + 1, 4) << 8) | Porffor.IR.loadU8(Porffor.IR.ptr(buffer) + i + 2, 4));
+      i += 2;
+    } else Porffor.IR.storeU16(w, 4, b);
+    w += 2;
+  }
+  return wide;
 };
 
 
-export const __Porffor_json_skipWhitespace = (text: bytestring, pos: i32, len: i32): i32 => {
+// text is a byte string or a UTF-16 string
+export const __Porffor_json_skipWhitespace = (text: any, pos: i32, len: i32): i32 => {
   while (pos < len) {
     const c: i32 = text.charCodeAt(pos);
     if (c > 32) break; // fast path
@@ -306,7 +354,7 @@ export const __Porffor_json_skipWhitespace = (text: bytestring, pos: i32, len: i
   return pos;
 };
 
-export const __Porffor_json_parseValue = (text: bytestring, posPtr: i32, len: i32): any => {
+export const __Porffor_json_parseValue = (text: any, posPtr: i32, len: i32): any => {
   let pos: i32 = __Porffor_json_skipWhitespace(text, Porffor.IR.loadI32(posPtr, 0), len);
   if (pos >= len) throw new SyntaxError('Unexpected end of JSON input');
 
@@ -352,74 +400,63 @@ export const __Porffor_json_parseValue = (text: bytestring, posPtr: i32, len: i3
     pos++;
 
     let strEnd: i32 = pos;
-    let hasEscape: boolean = false;
     while (strEnd < len) {
       const ch: i32 = text.charCodeAt(strEnd);
       if (ch == 34) break;
-      if (ch == 92) {
-        hasEscape = true;
-        strEnd++;
-      }
+      if (ch == 92) strEnd++;
       strEnd++;
     }
     if (strEnd >= len) throw new SyntaxError('Unterminated string');
 
-    const out: bytestring = Porffor.malloc(6 + (strEnd - pos));
-    Porffor.IR.storeI32(out, 0, 0);
-
-    if (!hasEscape) {
-      while (pos < strEnd) {
-        const ch: i32 = text.charCodeAt(pos);
-        if (ch >= 0x00 && ch <= 0x1f) throw new SyntaxError('Unescaped control character');
-        Porffor.bytestring.appendChar(out, ch);
-        pos++;
-      }
-      pos++;
-      Porffor.IR.storeI32(posPtr, 0, pos);
-      return out;
-    }
-
-    while (pos < len) {
-      const ch: i32 = text.charCodeAt(pos);
-      if (ch == 34) { // closing "
-        pos++;
-        Porffor.IR.storeI32(posPtr, 0, pos);
-        return out;
-      }
-      if (ch == 92) { // backslash
-        pos++;
-        if (pos >= len) throw new SyntaxError('Unterminated string');
-
+    // Decoded as UTF-16 (never longer than the source), then narrowed to a byte string
+    // when every code unit fits in one.
+    const tmp: string = Porffor.malloc(4 + (strEnd - pos) * 2);
+    const tmpPtr: i32 = Porffor.IR.ptr(tmp);
+    let n: i32 = 0;
+    let maxUnit: i32 = 0;
+    while (pos < strEnd) {
+      let unit: i32 = text.charCodeAt(pos++);
+      if (unit == 92) { // backslash
         const esc: i32 = text.charCodeAt(pos++);
-        if (esc == 34) Porffor.bytestring.appendChar(out, 34); // \"
-          else if (esc == 92) Porffor.bytestring.appendChar(out, 92); // \\
-          else if (esc == 47) Porffor.bytestring.appendChar(out, 47); // \/
-          else if (esc == 98) Porffor.bytestring.appendChar(out, 8); // \b
-          else if (esc == 102) Porffor.bytestring.appendChar(out, 12); // \f
-          else if (esc == 110) Porffor.bytestring.appendChar(out, 10); // \n
-          else if (esc == 114) Porffor.bytestring.appendChar(out, 13); // \r
-          else if (esc == 116) Porffor.bytestring.appendChar(out, 9); // \t
+        if (esc == 34) unit = 34; // \"
+          else if (esc == 92) unit = 92; // \\
+          else if (esc == 47) unit = 47; // \/
+          else if (esc == 98) unit = 8; // \b
+          else if (esc == 102) unit = 12; // \f
+          else if (esc == 110) unit = 10; // \n
+          else if (esc == 114) unit = 13; // \r
+          else if (esc == 116) unit = 9; // \t
           else if (esc == 117) { // \u
-            if (pos + 4 >= len) throw new SyntaxError('Invalid unicode escape');
-            let unicode: i32 = 0;
+            if (pos + 4 > strEnd) throw new SyntaxError('Invalid unicode escape');
+            unit = 0;
             for (let i: i32 = 0; i < 4; i++) {
               const hex: i32 = text.charCodeAt(pos + i);
-              unicode <<= 4;
-              if (hex >= 48 && hex <= 57) unicode |= hex - 48; // 0-9
-                else if (hex >= 65 && hex <= 70) unicode |= hex - 55; // A-F
-                else if (hex >= 97 && hex <= 102) unicode |= hex - 87; // a-f
+              unit <<= 4;
+              if (hex >= 48 && hex <= 57) unit |= hex - 48; // 0-9
+                else if (hex >= 65 && hex <= 70) unit |= hex - 55; // A-F
+                else if (hex >= 97 && hex <= 102) unit |= hex - 87; // a-f
                 else throw new SyntaxError('Invalid unicode escape');
             }
             pos += 4;
-            Porffor.bytestring.appendChar(out, unicode);
           } else throw new SyntaxError('Invalid escape sequence');
-      } else {
-        if (ch >= 0x00 && ch <= 0x1f) throw new SyntaxError('Unescaped control character');
-        Porffor.bytestring.appendChar(out, ch);
-        pos++;
-      }
+      } else if (unit <= 0x1f) throw new SyntaxError('Unescaped control character');
+
+      Porffor.IR.storeU16(tmpPtr + n * 2, 4, unit);
+      n++;
+      if (unit > maxUnit) maxUnit = unit;
     }
-    throw new SyntaxError('Unterminated string');
+    pos++; // the closing quote
+    Porffor.IR.storeI32(posPtr, 0, pos);
+
+    if (maxUnit > 0xff) {
+      tmp.length = n;
+      return tmp;
+    }
+    const out: bytestring = Porffor.malloc(6 + n);
+    const outPtr: i32 = Porffor.IR.ptr(out);
+    for (let i: i32 = 0; i < n; i++) Porffor.IR.storeU8(outPtr + i, 4, Porffor.IR.loadU16(tmpPtr + i * 2, 4));
+    out.length = n;
+    return out;
   }
 
   if (c == 91) { // '[' - array
@@ -517,10 +554,11 @@ export const __Porffor_json_parseValue = (text: bytestring, posPtr: i32, len: i3
   throw new SyntaxError('Unexpected token');
 };
 
-export const __JSON_parse = (_: bytestring) => {
-  // todo: support non-bytestrings
+// not typed bytestring: that annotation re-tags a UTF-16 string, which then reads as bytes
+export const __JSON_parse = (_: any) => {
+  const text: any = ecma262.ToString(_);
   const posPtr: i32 = Porffor.malloc(4);
   Porffor.IR.storeI32(posPtr, 0, 0);
 
-  return __Porffor_json_parseValue(_, posPtr, _.length);
+  return __Porffor_json_parseValue(text, posPtr, text.length);
 };
