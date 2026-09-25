@@ -247,27 +247,18 @@ export const __Number_prototype_toString = function (this: number, radix: number
   return out;
 };
 
-// Number.prototype.toFixed, exactly as the spec defines it: n is the integer for which
-// n / 10^f - x is closest to zero, using x's exact value, and the larger n on a tie.
-// Every finite double is m / 2^e with an integer m, so x * 10^f = m * 10^f / 2^e is
-// computed exactly: m in 24-bit limbs (plain numbers, so every step below is exact),
-// times 10 f times, shifted right e bits, plus one when bit e-1 is set (remainder >=
-// half, so ties round up). Scaling in floating point instead rounds 2.335 to 2.34.
-export const __Number_prototype_toFixed = function (this: number, fractionDigits: number) {
-  let x: number = this;
-  let f: number = Math.trunc(fractionDigits);
-  if (Number.isNaN(f)) f = 0;
-  if (f < 0 || f > 100) throw new RangeError('toFixed() fractionDigits argument must be between 0 and 100');
-
-  if (!Number.isFinite(x)) return ecma262.ToString(x);
-
-  let sign: bytestring = '';
-  if (x < 0) {
-    sign = '-';
-    x = -x;
-  }
-  if (x >= 1e21) return sign + ecma262.ToString(x);
-
+// round(x * 10^k) for a finite x >= 0 and an integer k, as decimal digits ('0' for zero),
+// from x's exact value, the larger integer on a tie: what toFixed, toPrecision and
+// toExponential all ask for. Every finite double is m / 2^e with an integer m, so
+// x * 10^k = m * 10^k / 2^e is computed exactly: m in 24-bit limbs (plain numbers, so
+// every step below is exact), times 10 k times (or divided by 10 -k times), shifted
+// right e bits. Scaling in floating point instead rounds 2.335 to 2.34.
+//
+// Rounding: with q = floor(m * 10^k / 10^j) and r1 its remainder, the result is
+// floor(q / 2^e), and the dropped remainder is at least half the divisor exactly when
+// bit e-1 of q is set (e > 0), or, with no binary fraction (e = 0), when the last
+// decimal digit divided out is 5 or more.
+export const __Porffor_number_roundScaled = (x: number, k: i32): bytestring => {
   // x = m / 2^e, m an integer (doubling is exact in binary floating point)
   let m: number = x;
   let e: i32 = 0;
@@ -284,8 +275,8 @@ export const __Number_prototype_toFixed = function (this: number, fractionDigits
     m = Math.floor(m / B);
   }
 
-  // * 10^f
-  for (let j: i32 = 0; j < f; j++) {
+  // * 10^k
+  for (let j: i32 = 0; j < k; j++) {
     let carry: number = 0;
     for (let i: i32 = 0; i < len; i++) {
       const v: number = limbs[i] * 10 + carry;
@@ -295,8 +286,21 @@ export const __Number_prototype_toFixed = function (this: number, fractionDigits
     if (carry > 0) limbs[len++] = carry;
   }
 
+  // / 10^-k, keeping the last (most significant) digit divided out
+  let lastOut: number = 0;
+  for (let j: i32 = 0; j < -k; j++) {
+    let rem: number = 0;
+    for (let i: i32 = len - 1; i >= 0; i--) {
+      const cur: number = rem * B + limbs[i];
+      limbs[i] = Math.floor(cur / 10);
+      rem = cur % 10;
+    }
+    lastOut = rem;
+    while (len > 0 && limbs[len - 1] == 0) len--;
+  }
+
   // / 2^e, rounding half up
-  let roundUp: boolean = false;
+  let roundUp: boolean = e == 0 && k < 0 && lastOut >= 5;
   if (e > 0) {
     const bit: i32 = e - 1;
     const at: i32 = Math.floor(bit / 24);
@@ -342,13 +346,104 @@ export const __Number_prototype_toFixed = function (this: number, fractionDigits
     while (len > 0 && limbs[len - 1] == 0) len--;
   }
   if (digits.length == 0) digits = '0';
+  return digits;
+};
 
+// Number.prototype.toFixed, exactly as the spec defines it: n is the integer for which
+// n / 10^f - x is closest to zero, using x's exact value, and the larger n on a tie.
+export const __Number_prototype_toFixed = function (this: number, fractionDigits: number) {
+  let x: number = this;
+  let f: number = Math.trunc(fractionDigits);
+  if (Number.isNaN(f)) f = 0;
+  if (f < 0 || f > 100) throw new RangeError('toFixed() fractionDigits argument must be between 0 and 100');
+
+  if (!Number.isFinite(x)) return ecma262.ToString(x);
+
+  let sign: bytestring = '';
+  if (x < 0) {
+    sign = '-';
+    x = -x;
+  }
+  if (x >= 1e21) return sign + ecma262.ToString(x);
+
+  let digits: bytestring = __Porffor_number_roundScaled(x, f);
   if (f == 0) return sign + digits;
 
   // at least one digit before the point
   while (digits.length <= f) digits = '0' + digits;
   const point: i32 = digits.length - f;
   return sign + digits.slice(0, point) + '.' + digits.slice(point);
+};
+
+// The p significant digits of x >= 0 (x != 0) and the decimal exponent e of the first,
+// per the spec's toPrecision/toExponential: n with p digits for which n * 10^(e-p+1) - x
+// is closest to zero, the larger n on a tie. The log estimate of e is only a start:
+// rounding decides the digit count, and e moves until there are exactly p.
+export const __Porffor_number_precise = (x: number, p: i32): any[] => {
+  let e: i32 = Math.floor(Math.log(x) / Math.LN10);
+  let digits: bytestring = '';
+  while (true) {
+    digits = __Porffor_number_roundScaled(x, p - 1 - e);
+    if (digits.length > p) e++;
+      else if (digits.length < p) e--;
+      else break;
+  }
+  // 10^(p-1) (a 1 then zeros) can also be x just below 10^e rounded up: then the
+  // exponent below still has p digits and is the closer of the two (1e-7 is
+  // 9.99...e-8, so its 17 digits are 99999999999999995, not 10000000000000000)
+  if (digits.charCodeAt(0) == 49) {
+    let rest: boolean = true;
+    for (let j: i32 = 1; j < p; j++) if (digits.charCodeAt(j) != 48) rest = false;
+    if (rest) {
+      const below: bytestring = __Porffor_number_roundScaled(x, p - e);
+      if (below.length == p) {
+        digits = below;
+        e--;
+      }
+    }
+  }
+  const out: any[] = Porffor.array.new(4);
+  out[0] = digits;
+  out[1] = e;
+  return out;
+};
+
+// 21.1.3.5 Number.prototype.toPrecision (precision)
+// https://tc39.es/ecma262/#sec-number.prototype.toprecision
+export const __Number_prototype_toPrecision = function (this: number, precision: any) {
+  let x: number = this;
+  if (precision === undefined) return ecma262.ToString(x);
+  const p: number = ecma262.ToIntegerOrInfinity(precision);
+  if (!Number.isFinite(x)) return ecma262.ToString(x);
+  if (p < 1 || p > 100) throw new RangeError('toPrecision() argument must be between 1 and 100');
+
+  let sign: bytestring = '';
+  if (x < 0) {
+    sign = '-';
+    x = -x;
+  }
+
+  let digits: bytestring = '';
+  let e: i32 = 0;
+  if (x == 0) {
+    for (let j: i32 = 0; j < p; j++) digits += '0';
+  } else {
+    const r: any[] = __Porffor_number_precise(x, p);
+    digits = r[0];
+    e = r[1];
+  }
+
+  if (e < -6 || e >= p) {
+    let m: bytestring = digits.slice(0, 1);
+    if (p != 1) m += '.' + digits.slice(1);
+    if (e >= 0) return sign + m + 'e+' + ecma262.ToString(e);
+    return sign + m + 'e-' + ecma262.ToString(-e);
+  }
+  if (e == p - 1) return sign + digits;
+  if (e >= 0) return sign + digits.slice(0, e + 1) + '.' + digits.slice(e + 1);
+  let zeros: bytestring = '';
+  for (let j: i32 = 0; j < -(e + 1); j++) zeros += '0';
+  return sign + '0.' + zeros + digits;
 };
 
 export const __Number_prototype_toLocaleString = function (this: number) { return Porffor.callThis(__Number_prototype_toString, this, 10); };
@@ -370,6 +465,26 @@ export const __Number_prototype_toExponential = function (this: number, fraction
     if (fractionDigits < 0 || fractionDigits > 100) {
       throw new RangeError('toExponential() fractionDigits argument must be between 0 and 100');
     }
+
+    // a digit count given: exact, as toPrecision (the loop below truncates)
+    let sign: bytestring = '';
+    if (n < 0) {
+      sign = '-';
+      n = -n;
+    }
+    let digits: bytestring = '';
+    let e: i32 = 0;
+    if (n == 0) {
+      for (let j: i32 = 0; j <= fractionDigits; j++) digits += '0';
+    } else {
+      const r: any[] = __Porffor_number_precise(n, fractionDigits + 1);
+      digits = r[0];
+      e = r[1];
+    }
+    let m: bytestring = digits.slice(0, 1);
+    if (fractionDigits > 0) m += '.' + digits.slice(1);
+    if (e >= 0) return sign + m + 'e+' + ecma262.ToString(e);
+    return sign + m + 'e-' + ecma262.ToString(-e);
   }
 
   const out: bytestring = Porffor.malloc(512);
