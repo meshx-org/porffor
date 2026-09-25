@@ -1040,53 +1040,93 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
   cur = partsOf('main');
   for (const f of linkFuncs) cur.protos[f.index] = f;
 
-  // dynamic call: one switch dispatcher, no per-function wrappers. fn values are records
-  // [fnIdx u32][env u32] (payload = offset, nonzero = truthy), each case adapts the
-  // uniform (env,thisv,newtv,argc,argv) ABI to the specialized call inline
+  // dynamic call: fn values are records [fnIdx u32][env u32] (payload = offset, nonzero =
+  // truthy). porf_invoke adapts the uniform (env,thisv,newtv,argc,argv) ABI to each
+  // function's specialized C signature. By default one switch case per function does that
+  // inline; with --invoke-table, functions with the same signature share one case and are
+  // reached through a table of (shape, pointer), so the adapter code is emitted once per
+  // signature rather than once per function (1270 cases -> a few dozen in a large app).
+  const invokeAdapter = f => {
+    const pre = [];
+    const args = [];
+    let j = 0;
+    for (const p of f.params) {
+      if (p.name === '#env') { args.push('env'); continue; }
+      if (p.name === '#this') { args.push('thisv'); continue; }
+      if (p.name === '#newtarget') { args.push('newtv'); continue; }
+      if (p.name === '#callee') { args.push('callee'); continue; }
+      if (p.name === '#allargs') {
+        pre.push('u32 _aa = porf_arr_new(argc, argc > 4 ? argc : 4);');
+        pre.push('for (i32 _k = 0; _k < argc; _k++) porf_arr_set(_aa, (u32)_k, porf_unpack(argv[_k]));');
+        args.push(`porf_box((f64)_aa, ${TYPES.array})`);
+        continue;
+      }
+      if (p.name === '#rest') {
+        // pack remaining argv into an array (twin helpers; die at step 3)
+        pre.push(`u32 _rest = porf_arr_new(0, argc > ${j} ? argc - ${j} : 4);`);
+        pre.push(`for (i32 _k = ${j}; _k < argc; _k++) (void)porf_arr_push(_rest, porf_unpack(argv[_k]));`);
+        args.push(`porf_box((f64)_rest, ${TYPES.array})`);
+        continue;
+      }
+      const src = `porf_unpack(argc > ${j} ? argv[${j}] : JV_UNDEFINED_BITS)`;
+      if (p.type === T.f64) args.push(`(${src}).val`);
+        else if (p.type === T.i64 || p.type === T.u64) args.push(`(i64)(${src}).val`);
+        else if (p.type === T.i32 || p.type === T.u32 || p.type === T.ptr) args.push(`(i32)(${src}).val`);
+        else args.push(src);
+      j++;
+    }
+    const ret = call => f.retType === T.none ? `${call}; return JV_UNDEFINED;`
+      : f.retType === T.f64 ? `return porf_box_num(${call});`
+      : f.retType === T.i64 || f.retType === T.u64 ? `return porf_box_num((f64)${call});`
+      : f.retType === T.i32 || f.retType === T.u32 || f.retType === T.ptr ? `return porf_box_num((f64)${call});`
+      : `return ${call};`;
+    return { pre, args, ret };
+  };
+  const invokable = f => f.indirect || needsCoro(f) || isSyncAsync(f);
+
   emit(`${st}jsval porf_invoke(u32 idx, jsval callee, u32 env, jsval thisv, jsval newtv, i32 argc, jsbits* argv) {\n`);
     emit('  (void)callee; (void)env; (void)thisv; (void)newtv; (void)argc; (void)argv;\n');
-    emit('  switch (idx) {\n');
-    for (let i = 0; i < linkFuncs.length; i++) {
-      const f = linkFuncs[i];
-      if (!f.indirect && !needsCoro(f) && !isSyncAsync(f)) continue;
-      const pre = [];
-      const args = [];
-      let j = 0;
-      for (const p of f.params) {
-        if (p.name === '#env') { args.push('env'); continue; }
-        if (p.name === '#this') { args.push('thisv'); continue; }
-        if (p.name === '#newtarget') { args.push('newtv'); continue; }
-        if (p.name === '#callee') { args.push('callee'); continue; }
-        if (p.name === '#allargs') {
-          pre.push('u32 _aa = porf_arr_new(argc, argc > 4 ? argc : 4);');
-          pre.push('for (i32 _k = 0; _k < argc; _k++) porf_arr_set(_aa, (u32)_k, porf_unpack(argv[_k]));');
-          args.push(`porf_box((f64)_aa, ${TYPES.array})`);
-          continue;
-        }
-        if (p.name === '#rest') {
-          // pack remaining argv into an array (twin helpers; die at step 3)
-          pre.push(`u32 _rest = porf_arr_new(0, argc > ${j} ? argc - ${j} : 4);`);
-          pre.push(`for (i32 _k = ${j}; _k < argc; _k++) (void)porf_arr_push(_rest, porf_unpack(argv[_k]));`);
-          args.push(`porf_box((f64)_rest, ${TYPES.array})`);
-          continue;
-        }
-        const src = `porf_unpack(argc > ${j} ? argv[${j}] : JV_UNDEFINED_BITS)`;
-        if (p.type === T.f64) args.push(`(${src}).val`);
-          else if (p.type === T.i64 || p.type === T.u64) args.push(`(i64)(${src}).val`);
-          else if (p.type === T.i32 || p.type === T.u32 || p.type === T.ptr) args.push(`(i32)(${src}).val`);
-          else args.push(src);
-        j++;
+    if (!prefs.invokeTable) {
+      emit('  switch (idx) {\n');
+      for (let i = 0; i < linkFuncs.length; i++) {
+        const f = linkFuncs[i];
+        if (!invokable(f)) continue;
+        const { pre, args, ret } = invokeAdapter(f);
+        const body = ret(`${fnSym(f)}(${args.join(', ')})`);
+        emit(pre.length ? `    case ${i}: { ${pre.join(' ')} ${body} }\n` : `    case ${i}: ${body}\n`);
       }
-      const call = `${fnSym(f)}(${args.join(', ')})`;
-      let ret;
-      if (f.retType === T.none) ret = `${call}; return JV_UNDEFINED;`;
-        else if (f.retType === T.f64) ret = `return porf_box_num(${call});`;
-        else if (f.retType === T.i64 || f.retType === T.u64) ret = `return porf_box_num((f64)${call});`;
-        else if (f.retType === T.i32 || f.retType === T.u32 || f.retType === T.ptr) ret = `return porf_box_num((f64)${call});`;
-        else ret = `return ${call};`;
-      emit(pre.length ? `    case ${i}: { ${pre.join(' ')} ${ret} }\n` : `    case ${i}: ${ret}\n`);
+      emit('  }\n');
+    } else {
+      // a shape is the exact C signature plus how each parameter is fed; call_indirect
+      // checks the signature, so the pointer type must match the function's own exactly
+      const shapes = new Map();
+      const entries = [];
+      for (let i = 0; i < linkFuncs.length; i++) {
+        const f = linkFuncs[i];
+        if (!invokable(f)) { entries.push(null); continue; }
+        const cSig = `${CT[f.retType]} (*)(${f.params.map(p => CT[p.type]).join(', ') || 'void'})`;
+        const key = JSON.stringify([ cSig, f.retType, f.params.map(p => p.name.startsWith('#') ? p.name : p.type) ]);
+        let shape = shapes.get(key);
+        if (!shape) {
+          shape = { id: shapes.size + 1, f, cSig };
+          shapes.set(key, shape);
+        }
+        entries.push(`{ ${shape.id}u, (void (*)(void))${fnSym(f)} }`);
+      }
+      emit('  static const struct { u16 shape; void (*fn)(void); } porf_invoke_table[] = {\n');
+      for (const e of entries) emit(`    ${e ?? '{ 0u, 0 }'},\n`);
+      emit('  };\n');
+      emit(`  if (idx >= ${entries.length}u) porf_unreachable("uncompiled function");\n`);
+      emit('  void (*const fn)(void) = porf_invoke_table[idx].fn;\n');
+      emit('  switch (porf_invoke_table[idx].shape) {\n');
+      for (const shape of shapes.values()) {
+        const { pre, args, ret } = invokeAdapter(shape.f);
+        const ptr = `((${shape.cSig})fn)`;
+        const body = ret(`${ptr}(${args.join(', ')})`);
+        emit(pre.length ? `    case ${shape.id}: { ${pre.join(' ')} ${body} }\n` : `    case ${shape.id}: ${body}\n`);
+      }
+      emit('  }\n');
     }
-    emit('  }\n');
     emit('  porf_unreachable("uncompiled function");\n  return JV_UNDEFINED;\n}\n');
 
     if (usesCoro || usesSyncAsync) {
