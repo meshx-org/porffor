@@ -2060,9 +2060,11 @@ static inline int porf_gc_static_range(i32 ptr, u64 bytes) {
   return ptr > 0 && (u64)(u32)ptr + bytes <= (u64)porf_heap_base;
 }
 
-// allocation bits are only set on object bases
+// allocation bits are only set on object bases. Bounded by the heap top: the bit
+// tables only cover the arena, which on wasi is small (64MB), so an out-of-range
+// value must not index them
 static inline int porf_gc_is_block_start(i32 body) {
-  return body > 0 && porf_gc_bit(PORF_GC_B_ALLOC, porf_gc_gran(body)) != 0u;
+  return body > 0 && (u32)body < porf_heap_top && porf_gc_bit(PORF_GC_B_ALLOC, porf_gc_gran(body)) != 0u;
 }
 static inline int porf_gc_is_young(i32 body) {
   return porf_gc_bit(PORF_GC_B_YOUNG, porf_gc_gran(body)) != 0u;
@@ -2672,7 +2674,9 @@ static void porf_gc_mark_native_roots(void) {
 static void porf_gc_mark_array_entries(i32 entries, u32 len) {
   for (u32 i = 0; i < len; i++) {
     const jsbits b = *(jsbits*)(MEM + entries + ((u64)i << 3));
-    if (b == 0) continue;
+    // 0: a hole. All ones: a Map/Set key deleted by __Porffor_hashtableTombstone,
+    // which is not a value (it unpacks as type 255 at 0xFFFFFFFF)
+    if (b == 0 || b == 0xffffffffffffffffull) continue;
     const jsval v = porf_unpack(b);
     if (porf_gc_type_can_reference(v.type)) porf_gc_mark_js(v.val, v.type);
   }
