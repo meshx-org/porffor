@@ -5,8 +5,12 @@
 // renderer (render.js) turns each of those into a suspension point; the frame holds the
 // function's params, locals and the temps made here.
 //
-// Not yet (the function stays stackful): an await inside try/catch/finally (a setjmp
-// frame cannot survive a return), generators, raw C, or an await in a loop's update.
+// A try in a step keeps no setjmp of its own: the step's wrapper holds the one setjmp and
+// re-enters the step at the catch the frame names (render.js), so an await may sit inside
+// a try (finally is a catch by then: codegen lowers it). Entering a catch that way loses
+// the step's C locals as a resume does, so it counts as a suspension below.
+//
+// Not yet (the function stays stackful): generators, raw C, or an await in a loop's update.
 
 import { K, T, FX, N_KIND, N_TYPE, N_FX, N_A, N_B, N_C, KNames, Local, Assign, Await, Un, Break } from './ir.js';
 
@@ -30,6 +34,9 @@ const makeHas = k => {
 };
 
 export const hasAwait = makeHas(K.Await);
+export const hasTry = makeHas(K.Try);
+// where a step can be re-entered: at an await's resume, or at a catch
+export const hasSuspend = node => hasAwait(node) || hasTry(node);
 const hasYield = makeHas(K.Yield);
 const hasRawC = makeHas(K.RawC);
 const hasContinue = makeHas(K.Continue);
@@ -40,7 +47,6 @@ const blocked = node => {
   if (!isNode(node)) return node.some(blocked);
   if (!hasAwait(node)) return false;
   const k = node[N_KIND];
-  if (k === K.Try) return true;
   if (k === K.Loop && hasAwait(node[N_B])) return true;
   return blocked(node[N_A]) || blocked(node[N_B]) || blocked(node[N_C]);
 };
@@ -189,6 +195,10 @@ export const planStackless = f => {
         out.push([ K.Block, T.none, s[N_FX], liftStmts(s[N_A]), s[N_B], s[N_C] ]);
         return;
 
+      case K.Try:
+        out.push([ K.Try, T.none, s[N_FX], liftStmts(s[N_A]), s[N_B], liftStmts(s[N_C]) ]);
+        return;
+
       case K.Switch:
       case K.TypeSwitch: {
         const subject = liftExpr(s[N_A], out);
@@ -214,11 +224,11 @@ export const planStackless = f => {
 /**
  * The locals that must live in the frame: those whose value can be needed across a
  * suspension. Conservative, over the structured body in source order: suspension points
- * split it into spans, and a local needs the frame when, in a span after the first it
+ * (awaits, and catches, which the wrapper enters afresh) split it into spans, and a local needs the frame when, in a span after the first it
  * appears in, it can be read before that span has certainly written it. A write is certain
  * when the conditional parts (branches, loop bodies, try blocks, lazy operands) open at it
  * are those open where the span began, or fewer of them: not a part entered since, nor a
- * sibling branch of the one the suspension is in. A loop that holds an await is walked
+ * sibling branch of the one the suspension is in. A loop that holds an await or a try is walked
  * twice, the second pass standing for every later iteration coming back round; one that
  * can `continue` (skipping writes at the end of its body) sends all it uses to the frame. Every other local is dead at each
  * suspension, so starting each step with it afresh loses nothing.
@@ -289,8 +299,8 @@ const frameLocals = body => {
 
       case K.Loop: {
         const [ stmts ] = node[N_C];
-        if (inAwaitLoop || !hasAwait(node) || hasContinue(stmts)) {
-          const loop = inAwaitLoop || hasAwait(node);
+        if (inAwaitLoop || !hasSuspend(node) || hasContinue(stmts)) {
+          const loop = inAwaitLoop || hasSuspend(node);
           cond(node[N_A], loop); cond(node[N_B], loop); cond(stmts, loop);
           return;
         }
@@ -312,6 +322,8 @@ const frameLocals = body => {
 
       case K.Try:
         cond(node[N_A], inAwaitLoop);
+        // the catch is entered afresh from the wrapper, as at a resume
+        suspend();
         write(node[N_B], inAwaitLoop);
         cond(node[N_C], inAwaitLoop);
         return;

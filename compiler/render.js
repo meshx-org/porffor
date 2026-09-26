@@ -7,7 +7,7 @@ import {
 import { TYPES, TYPE_NAMES } from './types.js';
 import { ieee754_binary64 } from './encoding.js';
 import caseTablesC from './case_tables.js';
-import { planStackless, hasAwait } from './stackless.js';
+import { planStackless, hasAwait, hasTry, hasSuspend } from './stackless.js';
 
 // C type per IR value type
 const CT = [];
@@ -679,15 +679,29 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
 
   // a stackless suspension point: the step returns with the awaited promise, and the
   // promise's reaction resumes it at the label with its value or its rejection
-  const emitAwait = (value, dst) => {
+  // a state the step can be re-entered in (a resume or a catch), at the label: the way
+  // back in goes through each enclosing loop's own dispatch, outermost first
+  const slEntry = to => {
     const n = ++sl.resumes;
-    // the way back in: through each enclosing loop's own dispatch, outermost first
     const loops = sl.loopStack;
-    const hop = (from, to) => (from === 0 ? sl.top : sl.routes.get(from)).push([n, to]);
+    const hop = (from, label) => (from === 0 ? sl.top : sl.routes.get(from)).push([n, label]);
     for (let i = 0; i <= loops.length; i++) {
       const from = i === 0 ? 0 : loops[i - 1];
-      hop(from, i === loops.length ? `porf_resume_${n}` : `porf_loop_${loops[i]}`);
+      hop(from, i === loops.length ? to(n) : `porf_loop_${loops[i]}`);
     }
+    return n;
+  };
+
+  // leaving tries for an enclosing depth: pop their setjmp frames, or in a step name the
+  // catch still around the target (a step's tries keep no setjmp: see renderStackless)
+  const unwindTry = target => {
+    if (!(activeTryDepth > target)) return;
+    if (sl !== null) emit(`${ind()}fr->porf_handler = ${target === 0 ? 0 : sl.handlers[target - 1]};\n`);
+    else emit(`${ind()}porf_try_depth -= ${activeTryDepth - target};\n`);
+  };
+
+  const emitAwait = (value, dst) => {
+    const n = slEntry(n => `porf_resume_${n}`);
     emit(`${ind()}call->coro.channel = porf_sl_promise(${jsArg(value)});\n`);
     emit(`${ind()}call->coro.awaiting = 1;\n${ind()}call->coro.state = 2;\n`);
     emit(`${ind()}fr->porf_state = ${n};\n${ind()}return 0;\n`);
@@ -752,7 +766,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
         // when resuming (a goto into its body would make it irreducible, which wasm cannot
         // express: LLVM copies code to repair that): its own dispatch then skips the
         // condition and goes on to the resume point, or to the loop inside holding it
-        const slLoop = sl !== null && hasAwait(stmts) ? ++sl.loops : 0;
+        const slLoop = sl !== null && hasSuspend(stmts) ? ++sl.loops : 0;
         if (slLoop) {
           emit(`${ind()}porf_loop_${slLoop}:;\n`);
           emit(update ? `${ind()}for (;; ${updateC}) {\n` : `${ind()}while (1) {\n`);
@@ -778,8 +792,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
       }
 
       case K.Break: {
-        const target = labelTry.get(node[N_A]);
-        if (activeTryDepth > target) emit(`${ind()}porf_try_depth -= ${activeTryDepth - target};\n`);
+        unwindTry(labelTry.get(node[N_A]));
         if (node[N_A] && node[N_A] !== breakStack[breakStack.length - 1]) {
           usedLabels.add(node[N_A] + '_b');
           emit(`${ind()}goto ${sanitize(node[N_A])}_b;\n`);
@@ -788,8 +801,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
       }
 
       case K.Continue: {
-        const target = labelTry.get(node[N_A]);
-        if (activeTryDepth > target) emit(`${ind()}porf_try_depth -= ${activeTryDepth - target};\n`);
+        unwindTry(labelTry.get(node[N_A]));
         if (node[N_A] && node[N_A] !== loopStack[loopStack.length - 1]) {
           usedLabels.add(node[N_A] + '_c');
           emit(`${ind()}goto ${sanitize(node[N_A])}_c;\n`);
@@ -869,8 +881,8 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
 
       case K.Return:
         if (sl !== null) {
-          // the step ends: the result goes to the call, which settles its promise
-          if (activeTryDepth !== 0) emit(`${ind()}porf_try_depth -= ${activeTryDepth};\n`);
+          // the step ends: the result goes to the call, which settles its promise (its
+          // tries hold no setjmp frames: the wrapper pops its own)
           emit(`${ind()}call->result = ${node[N_A] ? jsArg(node[N_A]) : 'JV_UNDEFINED'};\n`);
           emit(`${ind()}call->coro.state = 3;\n${ind()}return 1;\n`);
           return;
@@ -894,6 +906,27 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
         return;
 
       case K.Try: {
+        if (sl !== null) {
+          // no setjmp here: the frame names this catch while the body runs, and a throw
+          // reaching the step's wrapper re-enters the step at the catch with the exception
+          const outer = activeTryDepth === 0 ? 0 : sl.handlers[activeTryDepth - 1];
+          const n = slEntry(n => `porf_catch_${n}`);
+          emit(`${ind()}fr->porf_handler = ${n};\n`);
+          sl.handlers[activeTryDepth++] = n;
+          renderStmts(node[N_A]);
+          activeTryDepth--;
+          emit(`${ind()}fr->porf_handler = ${outer};\n${ind()}goto porf_try_end_${n};\n`);
+          emit(`${ind()}porf_catch_${n}:;\n${ind()}porf_resuming = 0;\n${ind()}fr->porf_handler = ${outer};\n`);
+          emit(`${ind()}{\n`);
+          depth++;
+          emit(sl.fields.has(node[N_B])
+            ? `${ind()}${varName(node[N_B])} = porf_in;\n`
+            : `${ind()}jsval ${sanitize(node[N_B])} = porf_in;\n`);
+          renderStmts(node[N_C]);
+          depth--;
+          emit(`${ind()}}\n${ind()}porf_try_end_${n}:;\n`);
+          return;
+        }
         emit(`${ind()}{\n`);
         depth++;
         emit(`${ind()}porf_try_depth++;\n`);
@@ -990,7 +1023,9 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     for (const name in plan.temps) place(name, plan.temps[name]);
     for (const name of catchNames(plan.body, new Set())) if (plan.frame.has(name)) place(name, T.jsval);
 
-    emit(`typedef struct ${frame} {\n  i32 porf_state;\n`);
+    // a step with a try runs its body under a wrapper holding the one setjmp (see K.Try)
+    const tries = hasTry(plan.body);
+    emit(`typedef struct ${frame} {\n  i32 porf_state;\n${tries ? '  i32 porf_handler; // the catch a throw now goes to, 0 for none\n' : ''}`);
     for (const [name, t] of fields) emit(`  ${CT[t]} ${sanitize(name)};\n`);
     emit(`} ${frame};\n\n`);
     emit(`static i32 ${sym}_step(porf_coro_call* call, jsval porf_in, i32 porf_in_throw);\n\n`);
@@ -1010,7 +1045,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     emit(ret === 'void' ? '}\n\n' : ret === 'jsval' ? '  return JV_UNDEFINED;\n}\n\n' : '  return 0;\n}\n\n');
 
     // the body first (to know its suspension points), then the dispatch in front of it
-    sl = { fields: new Set(fields.keys()), resumes: 0, loops: 0, loopStack: [], top: [], routes: new Map() };
+    sl = { fields: new Set(fields.keys()), resumes: 0, loops: 0, loopStack: [], top: [], routes: new Map(), handlers: [] };
     const outer = cur;
     cur = { ...outer, out: [], chunks: [] };
     depth = 1;
@@ -1026,7 +1061,10 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     cur = outer;
     sl = null;
 
-    emit(`${body.includes('_setjmp(') ? 'PORF_SL_TRY_STEP ' : ''}static i32 ${sym}_step(porf_coro_call* call, jsval porf_in, i32 porf_in_throw) {\n`);
+    // with tries, the body is its own function under a wrapper holding the setjmp, kept
+    // apart: setjmp in an optimised wasm function makes it 10-15x bigger (sjlj lowering)
+    const bodySym = tries ? `${sym}_body` : `${sym}_step`;
+    emit(`${tries ? 'PORF_NOINLINE ' : ''}static i32 ${bodySym}(porf_coro_call* call, jsval porf_in, i32 porf_in_throw) {\n`);
     emit(`  ${frame}* fr = (${frame}*)call->sl_frame;\n  (void)porf_in; (void)porf_in_throw;\n`);
     for (const [name, t] of stepLocals) emit(`  ${CT[t]} ${sanitize(name)}${t === T.jsval ? ' = JV_UNDEFINED' : ' = 0'};\n`);
     // resuming: to the resume point, or to the loop holding it (see K.Loop)
@@ -1034,6 +1072,20 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     if (top.length > 0) emit(`  if (fr->porf_state != 0) {\n    porf_resuming = 1;\n${cases(top, '    ')}  }\n`);
     emit(body);
     emit(`  call->result = JV_UNDEFINED;\n  call->coro.state = 3;\n  return 1;\n}\n\n`);
+
+    if (tries) {
+      // a throw out of the body: to the catch the frame names, entered as a resume is, or
+      // on to the step's caller when none is around it
+      emit(`static i32 ${sym}_step(porf_coro_call* call, jsval porf_in, i32 porf_in_throw) {\n`);
+      emit(`  ${frame}* fr = (${frame}*)call->sl_frame;\n  for (;;) {\n`);
+      emit(`    const i32 porf_try_idx = porf_try_depth++;\n`);
+      emit(`    if (_setjmp(porf_try_ensure()[porf_try_idx]) == 0) {\n`);
+      emit(`      const i32 porf_done = ${bodySym}(call, porf_in, porf_in_throw);\n`);
+      emit(`      porf_try_depth = porf_try_idx;\n      return porf_done;\n    }\n`);
+      emit(`    porf_try_depth = porf_try_idx;\n`);
+      emit(`    if (fr->porf_handler == 0) porf_throw(porf_exception);\n`);
+      emit(`    fr->porf_state = fr->porf_handler;\n    porf_in = porf_exception;\n    porf_in_throw = 0;\n  }\n}\n\n`);
+    }
   };
 
   const renderFunc = f => {
@@ -4090,14 +4142,6 @@ PORF_NORETURN static void porf_stack_overflow(void) {
 #define PORF_CORO_BODY __attribute__((optnone, noinline))
 #else
 #define PORF_CORO_BODY
-#endif
-// A stackless step holding a try (no await inside it, or the function would be stackful):
-// on wasm the setjmp lowering over optimised code grows such a step 10-15x (a 37 KB step
-// became 590 KB), so it stays unoptimised like a stackful body. Steps without one optimise.
-#if defined(__wasm__) && defined(__clang__) && !defined(PORF_NO_EH)
-#define PORF_SL_TRY_STEP __attribute__((optnone, noinline))
-#else
-#define PORF_SL_TRY_STEP
 #endif
 #if !defined(MAP_NORESERVE) || defined(__wasi__)
 #undef MAP_NORESERVE
