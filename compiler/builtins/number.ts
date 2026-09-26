@@ -9,15 +9,14 @@ export const Number = function (value: any): number|any {
   // todo: handle undefined (NaN) and not present (0) args differently
   if (Porffor.type(value) != Porffor.TYPES.undefined) {
     // a. Let prim be ? ToNumeric(value).
-    n = ecma262.ToNumeric(value);
+    const prim: any = ecma262.ToNumeric(value);
 
     // b. If prim is a BigInt, let n be 𝔽(ℝ(prim)).
-    if (Porffor.comptime.flag`hasType.bigint`) {
-      if (Porffor.type(n) == Porffor.TYPES.bigint)
-        n = Porffor.bigint.toNumber(n);
-    }
-
     // c. Otherwise, let n be prim.
+    n = prim;
+    if (Porffor.comptime.flag`hasType.bigint`) {
+      if (Porffor.type(prim) == Porffor.TYPES.bigint) n = Porffor.bigint.toNumber(prim);
+    }
   }
 
   // 2. Else,
@@ -659,9 +658,14 @@ export const __Number_prototype_toExponential = function (this: number, fraction
 
 // 21.1.3.7 Number.prototype.valueOf ()
 // https://tc39.es/ecma262/#sec-number.prototype.valueof
-export const __Number_prototype_valueOf = function (this: number) {
-  // 1. Return ? ThisNumberValue(this value).
-  return this;
+export const __Number_prototype_valueOf = function (this: any): number {
+  // 1. Return ? ThisNumberValue(this value): the primitive, a Number object's unwrapped
+  if (Porffor.fastOr(Porffor.type(this) == Porffor.TYPES.number, Porffor.type(this) == Porffor.TYPES.numberobject)) {
+    // the payload, retagged (a cast alone keeps the object's tag)
+    const value: f64 = this;
+    return value;
+  }
+  throw new TypeError('Number.prototype.valueOf requires a Number');
 };
 
 

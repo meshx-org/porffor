@@ -145,94 +145,23 @@ export const __ByteString_prototype_charAt = function (this: bytestring, index: 
   return out;
 };
 
+// Full Unicode case mapping (render.js porf_case_convert, tables from gen_case_tables.js):
+// ß -> SS, Σ -> ς at the end of a word, supplementary letters. An ASCII bytestring stays
+// a bytestring; a Latin-1 one may not (ÿ -> Ÿ, µ -> Μ leave Latin-1).
 export const __String_prototype_toUpperCase = function (this: string) {
-  // todo: unicode not just ascii
-  const len: i32 = this.length;
-
-  const out: string = Porffor.malloc(6 + len * 2);
-  Porffor.IR.storeI32(out, 0, len);
-
-  let i: i32 = Porffor.IR.ptr(this),
-      j: i32 = Porffor.IR.ptr(out);
-
-  const endPtr: i32 = i + len * 2;
-  while (i < endPtr) {
-    let chr: i32 = Porffor.IR.loadU16(i, 4);
-    i += 2;
-
-    if (chr >= 97) if (chr <= 122) chr -= 32;
-
-    Porffor.IR.storeU16(j, 4, chr);
-    j += 2;
-  }
-
-  return out;
+  return __Porffor_caseConvert(this, 1);
 };
 
 export const __ByteString_prototype_toUpperCase = function (this: bytestring) {
-  const len: i32 = this.length;
-
-  const out: bytestring = Porffor.malloc(6 + len);
-  Porffor.IR.storeI32(out, 0, len);
-
-  let i: i32 = Porffor.IR.ptr(this),
-      j: i32 = Porffor.IR.ptr(out);
-
-  const endPtr: i32 = i + len;
-  while (i < endPtr) {
-    let chr: i32 = Porffor.IR.loadU8(i++, 4);
-
-    if (chr >= 97) if (chr <= 122) chr -= 32;
-
-    Porffor.IR.storeU8(j++, 4, chr);
-  }
-
-  return out;
+  return __Porffor_caseConvert(this, 1);
 };
 
 export const __String_prototype_toLowerCase = function (this: string) {
-  // todo: unicode not just ascii
-  const len: i32 = this.length;
-
-  const out: string = Porffor.malloc(6 + len * 2);
-  Porffor.IR.storeI32(out, 0, len);
-
-  let i: i32 = Porffor.IR.ptr(this),
-      j: i32 = Porffor.IR.ptr(out);
-
-  const endPtr: i32 = i + len * 2;
-  while (i < endPtr) {
-    let chr: i32 = Porffor.IR.loadU16(i, 4);
-    i += 2;
-
-    if (chr >= 65) if (chr <= 90) chr += 32;
-
-    Porffor.IR.storeU16(j, 4, chr);
-    j += 2;
-  }
-
-  return out;
+  return __Porffor_caseConvert(this, 0);
 };
 
 export const __ByteString_prototype_toLowerCase = function (this: bytestring) {
-  const len: i32 = this.length;
-
-  const out: bytestring = Porffor.malloc(6 + len);
-  Porffor.IR.storeI32(out, 0, len);
-
-  let i: i32 = Porffor.IR.ptr(this),
-      j: i32 = Porffor.IR.ptr(out);
-
-  const endPtr: i32 = i + len;
-  while (i < endPtr) {
-    let chr: i32 = Porffor.IR.loadU8(i++, 4);
-
-    if (chr >= 65) if (chr <= 90) chr += 32;
-
-    Porffor.IR.storeU8(j++, 4, chr);
-  }
-
-  return out;
+  return __Porffor_caseConvert(this, 0);
 };
 
 export const __String_prototype_toLocaleUpperCase = function (this: string) { return Porffor.callThis(__String_prototype_toUpperCase, this); };
@@ -271,8 +200,12 @@ export const __ByteString_prototype_codePointAt = function (this: bytestring, in
   return Porffor.IR.loadU8(Porffor.IR.ptr(this) + index, 4);
 };
 
-export const __String_prototype_startsWith = function (this: string, searchString: string, position: number = 0) {
-  // todo: handle bytestring searchString
+export const __String_prototype_startsWith = function (this: string, searchString: any, position: number = 0) {
+  // as indexOf: the search as a string, widened from a bytestring to compare 16-bit units
+  searchString = ecma262.ToString(searchString);
+  if (Porffor.type(searchString) == Porffor.TYPES.bytestring) {
+    searchString = Porffor.bytestringToString(searchString);
+  }
   // todo/perf: investigate whether for counter vs while ++s are faster
 
   let thisPtr: i32 = Porffor.IR.ptr(this);
@@ -299,10 +232,12 @@ export const __String_prototype_startsWith = function (this: string, searchStrin
   return true;
 };
 
-export const __ByteString_prototype_startsWith = function (this: bytestring, searchString: bytestring, position: number = 0) {
-  // if searching non-bytestring, bytestring will not start with it
-  // todo: change this to just check if = string and ToString others
-  if (Porffor.type(searchString) != Porffor.TYPES.bytestring) return false;
+export const __ByteString_prototype_startsWith = function (this: bytestring, searchString: any, position: number = 0) {
+  // as indexOf: a search that is not a bytestring is compared as a string
+  searchString = ecma262.ToString(searchString);
+  if (Porffor.type(searchString) != Porffor.TYPES.bytestring) {
+    return Porffor.callThis(__String_prototype_startsWith, Porffor.bytestringToString(this), searchString, position);
+  }
 
   // todo/perf: investigate whether for counter vs while ++s are faster
 
@@ -331,8 +266,12 @@ export const __ByteString_prototype_startsWith = function (this: bytestring, sea
 };
 
 
-export const __String_prototype_endsWith = function (this: string, searchString: string, endPosition: any = undefined) {
-  // todo: handle bytestring searchString
+export const __String_prototype_endsWith = function (this: string, searchString: any, endPosition: any = undefined) {
+  // as indexOf: the search as a string, widened from a bytestring to compare 16-bit units
+  searchString = ecma262.ToString(searchString);
+  if (Porffor.type(searchString) == Porffor.TYPES.bytestring) {
+    searchString = Porffor.bytestringToString(searchString);
+  }
 
   let i: i32 = Porffor.IR.ptr(this),
       j: i32 = Porffor.IR.ptr(searchString);
@@ -368,10 +307,12 @@ export const __String_prototype_endsWith = function (this: string, searchString:
   return true;
 };
 
-export const __ByteString_prototype_endsWith = function (this: bytestring, searchString: bytestring, endPosition: any = undefined) {
-  // if searching non-bytestring, bytestring will not start with it
-  // todo: change this to just check if = string and ToString others
-  if (Porffor.type(searchString) != Porffor.TYPES.bytestring) return false;
+export const __ByteString_prototype_endsWith = function (this: bytestring, searchString: any, endPosition: any = undefined) {
+  // as indexOf: a search that is not a bytestring is compared as a string
+  searchString = ecma262.ToString(searchString);
+  if (Porffor.type(searchString) != Porffor.TYPES.bytestring) {
+    return Porffor.callThis(__String_prototype_endsWith, Porffor.bytestringToString(this), searchString, endPosition);
+  }
 
   let i: i32 = Porffor.IR.ptr(this),
       j: i32 = Porffor.IR.ptr(searchString);

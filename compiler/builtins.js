@@ -378,6 +378,8 @@ export const BuiltinVars = ({ builtinFuncs }) => {
   for (const x of [
     'console',
     'performance',
+    'crypto',
+    'Iterator',
   ]) {
     object(x, props({
       writable: true,
@@ -400,7 +402,7 @@ export const BuiltinVars = ({ builtinFuncs }) => {
     });
   }
 
-  const enumerableGlobals = [ 'atob', 'btoa', 'performance', 'navigator' ];
+  const enumerableGlobals = [ 'atob', 'btoa', 'performance', 'navigator', 'crypto' ];
   object('globalThis', {
     // 19.1 Value Properties of the Global Object
     // https://tc39.es/ecma262/#sec-value-properties-of-the-global-object
@@ -584,9 +586,16 @@ return porf_box_num((f64)(i32)((u32)xd * (u32)yd));`, false)
       const result = Local('result', T.u64);
 
       return [
+        // seeded on first use from the platform's random bytes, so every instance draws
+        // its own sequence; an all-zero seed (the one state xorshift cannot leave) falls
+        // back to a constant
         If(Bin('==', T.u64, Bin('|', T.u64, state0, state1), Const(T.u64, 0)), [
-          Assign(state0, Const(T.u64, 0x7b1dcdaf)),
-          Assign(state1, Const(T.u64, 0x21b965f5))
+          Assign(state0, Call('porf_random_u64', [], T.u64)),
+          Assign(state1, Call('porf_random_u64', [], T.u64)),
+          If(Bin('==', T.u64, Bin('|', T.u64, state0, state1), Const(T.u64, 0)), [
+            Assign(state0, Const(T.u64, 0x7b1dcdaf)),
+            Assign(state1, Const(T.u64, 0x21b965f5))
+          ])
         ]),
         Assign(s1, state1),
         Assign(s0, state0),
@@ -662,7 +671,7 @@ return porf_box((f64)dst, ${TYPES.string});`, false) ]
     body: [ RawC(`u64 ux = (u64)x;
 u32 hi = (u32)(ux >> 32);
 u32 lo = (u32)ux;
-if (hi < 0x80000u) return porf_box((f64)ux, ${TYPES.bigint});
+if (hi < 0x200u) return porf_box((f64)ux, ${TYPES.bigint}); // inline below 2^41
 u32 ptr = porf_alloc(16, ${TYPES.bigint});
 *(u8*)(MEM + ptr) = 0;
 *(u16*)(MEM + ptr + 2) = 2;
@@ -679,7 +688,7 @@ return porf_box((f64)ptr + 2251799813685248.0, ${TYPES.bigint});`, false) ]
 u64 ax = (u64)((x ^ signBits) - signBits);
 u32 hi = (u32)(ax >> 32);
 u32 lo = (u32)ax;
-if (hi < 0x80000u) return porf_box((f64)x, ${TYPES.bigint});
+if (hi < 0x200u) return porf_box((f64)x, ${TYPES.bigint}); // inline below 2^41
 u32 ptr = porf_alloc(16, ${TYPES.bigint});
 *(u8*)(MEM + ptr) = x != (i64)ax;
 *(u16*)(MEM + ptr + 2) = 2;
@@ -703,11 +712,78 @@ if (digits > 2) ptr += (digits - 2) * 4;
 return sign * (i64)((((u64)*(u32*)(MEM + ptr + 4)) << 32) + (u64)*(u32*)(MEM + ptr + 8));`, false) ]
   };
 
+  // BigInt: the arithmetic is the C runtime's (render.js, porf_bigint_*); these reach it
+  // from the TypeScript builtins
+  _.__Porffor_bigint_parse = {
+    params: [ { name: 's', type: T.jsval }, { name: 'literal', type: T.i32 } ],
+    retType: T.jsval,
+    returnTypes: [ TYPES.bigint, TYPES.undefined ],
+    body: [ RawC('return porf_bigint_parse(s, literal);', false) ]
+  };
+
+  _.__Porffor_bigint_toRadixString = {
+    params: [ { name: 'x', type: T.jsval }, { name: 'radix', type: T.i32 } ],
+    retType: T.jsval,
+    returnType: TYPES.bytestring,
+    body: [ RawC('return porf_bigint_to_str(x, radix);', false) ]
+  };
+
+  _.__Porffor_bigint_toNumber = {
+    params: [ { name: 'x', type: T.jsval } ],
+    retType: T.f64,
+    returnType: TYPES.number,
+    body: [ RawC('return porf_bigint_to_f64(x);', false) ]
+  };
+
+  _.__Porffor_bigint_fromIntegral = {
+    params: [ { name: 'x', type: T.f64 } ],
+    retType: T.jsval,
+    returnType: TYPES.bigint,
+    body: [ RawC('return porf_bigint_from_f64(x);', false) ]
+  };
+
+  _.__Porffor_bigint_asN = {
+    params: [ { name: 'x', type: T.jsval }, { name: 'bits', type: T.f64 }, { name: 'sign', type: T.i32 } ],
+    retType: T.jsval,
+    returnType: TYPES.bigint,
+    body: [ RawC('return porf_bigint_as_n(x, bits, sign);', false) ]
+  };
+
+  // ++ / -- on a value ToNumeric has given: a Number or a BigInt
+  _.__Porffor_numericStep = {
+    params: [ { name: 'x', type: T.jsval }, { name: 'dec', type: T.i32 } ],
+    retType: T.jsval,
+    returnTypes: [ TYPES.number, TYPES.bigint ],
+    body: [ RawC('return porf_numeric_step(x, dec);', false) ]
+  };
+
+  _.__Porffor_bigint_hash = {
+    params: [ { name: 'x', type: T.jsval } ],
+    retType: T.i32,
+    returnType: TYPES.number,
+    body: [ RawC('return porf_bigint_hash(x);', false) ]
+  };
+
   _.__Porffor_memorySize = {
     params: [],
     retType: T.i32,
     returnType: TYPES.number,
     body: [ RawC('return (i32)porf_heap_committed;', false) ]
+  };
+
+  // s in upper (1) or lower (0) case, by full Unicode mapping (render.js porf_case_convert)
+  _.__Porffor_caseConvert = {
+    params: [ { name: 's', type: T.jsval }, { name: 'upper', type: T.i32 } ],
+    retType: T.jsval,
+    body: [ RawC('return porf_case_convert(s, upper);', false) ]
+  };
+
+  // len random bytes at MEM + ptr (crypto.getRandomValues, crypto.randomUUID)
+  _.__Porffor_randomFill = {
+    params: [ { name: 'ptr', type: T.i32 }, { name: 'len', type: T.i32 } ],
+    retType: T.none,
+    returnType: TYPES.undefined,
+    body: [ RawC('porf_random_fill((u8*)(MEM + (u32)ptr), (u32)len);', false) ]
   };
 
   _.__Porffor_gc = {
@@ -862,6 +938,10 @@ return sign * (i64)((((u64)*(u32*)(MEM + ptr + 4)) << 32) + (u64)*(u32*)(MEM + p
 
   PrecompiledBuiltins.BuiltinFuncs(_);
   _.__Math_hypot.jsLength = 2;
+  // the options argument (for a cause) is not counted
+  for (const name of [ 'Error', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError' ]) _[name].jsLength = 1;
+  _.AggregateError.jsLength = 2;
+  _.__BigInt_prototype_toString.jsLength = 0;
 
   return _;
 };

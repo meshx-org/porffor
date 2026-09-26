@@ -16,6 +16,10 @@ export const __Porffor_hashIdentity = (key: any): i32 => {
 
 export const __Porffor_hashSvz = (key: any): i32 => {
   const t: i32 = Porffor.type(key);
+  // by value: equal BigInts may be different heap blocks
+  if (Porffor.comptime.flag`hasType.bigint`) {
+    if (t == Porffor.TYPES.bigint) return __Porffor_bigint_hash(key);
+  }
   if (Porffor.fastOr(t == Porffor.TYPES.string, t == Porffor.TYPES.bytestring)) {
     return __Porffor_object_hash(key);
   }

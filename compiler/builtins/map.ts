@@ -82,7 +82,7 @@ export const Map = function (iterable: any): Map {
   return out;
 };
 
-export const __Map_prototype_keys = function (this: Map) {
+export const __Porffor_map_keysArray = function (this: Map) {
   const keys: any[] = Porffor.IR.loadI32(this, 0);
   const keysEntries: i32 = Porffor.IR.loadI32(keys, 4);
   const out: any[] = Porffor.array.new(4);
@@ -96,7 +96,7 @@ export const __Map_prototype_keys = function (this: Map) {
   return out;
 };
 
-export const __Map_prototype_values = function (this: Map) {
+export const __Porffor_map_valuesArray = function (this: Map) {
   const keys: any[] = Porffor.IR.loadI32(this, 0);
   const keysEntries: i32 = Porffor.IR.loadI32(keys, 4);
   const vals: any[] = Porffor.IR.loadI32(this, 4);
@@ -111,7 +111,7 @@ export const __Map_prototype_values = function (this: Map) {
   return out;
 };
 
-export const __Map_prototype_entries = function (this: Map) {
+export const __Porffor_map_entriesArray = function (this: Map) {
   const keys: any[] = Porffor.IR.loadI32(this, 0);
   const keysEntries: i32 = Porffor.IR.loadI32(keys, 4);
   const vals: any[] = Porffor.IR.loadI32(this, 4);
@@ -147,4 +147,41 @@ export const __Map_prototype_getOrInsertComputed = function (this: Map, key: any
   }
 
   return Porffor.callThis(__Map_prototype_get, this, key);
+};
+
+// Map.groupBy(items, callbackFn): items grouped into a Map by callbackFn(item, index), keys
+// compared by SameValueZero (-0 groups with +0), groups and their items in first-seen order
+// https://tc39.es/ecma262/#sec-map.groupby
+export const __Map_groupBy = (items: any, callbackFn: any): Map => {
+  if (typeof callbackFn !== 'function') throw new TypeError('Map.groupBy: callback is not a function');
+  const out: Map = new Map();
+
+  let i: i32 = 0;
+  for (const x of items) {
+    let k: any = callbackFn(x, i++);
+    if (k === 0) k = 0; // -0 -> +0
+    let group: any = out.get(k);
+    if (group === undefined) {
+      group = Porffor.array.new(4);
+      out.set(k, group);
+    }
+
+    Porffor.array.fastPush(group, x);
+  }
+
+  return out;
+};
+
+// keys/values/entries/[Symbol.iterator]: iterators over a snapshot of the entries taken
+// when the iterator is made (a Map changed while iterating is not seen live)
+export const __Map_prototype_keys = function (this: Map) {
+  return __Porffor_iter_newValues(Porffor.callThis(__Porffor_map_keysArray, this));
+};
+
+export const __Map_prototype_values = function (this: Map) {
+  return __Porffor_iter_newValues(Porffor.callThis(__Porffor_map_valuesArray, this));
+};
+
+export const __Map_prototype_entries = function (this: Map) {
+  return __Porffor_iter_newValues(Porffor.callThis(__Porffor_map_entriesArray, this));
 };

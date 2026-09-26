@@ -841,7 +841,18 @@ const generateIdent = (scope, decl) => {
 
   if (decl.name in scope.locals) (scope.locals[decl.name].metadata ??= {}).read = true;
   return lookup(scope, decl.name, !(decl.name === 'arguments' && decl._resolvedBinding), decl._markFunctionReferenced !== false)
-    ?? internalThrow(scope, 'ReferenceError', `${unhackName(decl.name)} is not defined`);
+    ?? unresolvedName(scope, unhackName(decl.name));
+};
+
+// a name nothing defines: a ReferenceError where it is read. PORF_LIST_UNDEFINED=1 lists
+// them all at the end of the compile (what globals a program expects that are not there)
+const unresolvedNames = new Set();
+const unresolvedName = (scope, name) => {
+  if (process.env.PORF_LIST_UNDEFINED && !globalThis.precompile && !unresolvedNames.has(name)) {
+    unresolvedNames.add(name);
+    process.once('exit', () => { if (unresolvedNames.size) console.error(`undefined names: ${[ ...unresolvedNames ].sort().join(' ')}`); unresolvedNames.clear(); });
+  }
+  return internalThrow(scope, 'ReferenceError', `${name} is not defined`);
 };
 
 const generateYield = (scope, decl) => {
@@ -1047,6 +1058,11 @@ const numericOp = (scope, op, l, r) => {
   }
 };
 
+// the C runtime's BigInt operators (porf_bigint_arith in render.js)
+const BIGINT_OPS = { '+': 0, '-': 1, '*': 2, '/': 3, '%': 4, '**': 5, '&': 6, '|': 7, '^': 8, '<<': 9, '>>': 10, '>>>': 11 };
+const bigintOp = (op, left, right) => Call('porf_bigint_arith', [ Const(T.i32, BIGINT_OPS[op]), left, right ], T.jsval);
+const isBigint = v => Bin('==', T.i32, JvType(v), Const(T.i32, TYPES.bigint));
+
 const rawIntOp = (op, left, right) => {
   if (rawIntType(left, right) == null) return null;
   const l = rawIntValue(T.u32, left);
@@ -1108,7 +1124,34 @@ const performOp = (scope, op, left, right, leftType, rightType) => {
       const r = reuse(scope, right[N_TYPE] === T.jsval ? right : valNumber(right));
       return Add(l, r);
     }
+    if (knownLeft === TYPES.bigint || knownRight === TYPES.bigint) {
+      const numeric = ty => ty === TYPES.bigint || ty === TYPES.number;
+      // an object may convert to either a string or a BigInt: the runtime's +
+      if (numeric(knownLeft) && numeric(knownRight)) return bigintOp(op, valNumber(left), valNumber(right));
+      return Add(reuse(scope, valNumber(left)), reuse(scope, valNumber(right)));
+    }
     return Box(Bin('+', T.f64, numOperand(left, knownLeft), numOperand(right, knownRight)), Const(T.i32, TYPES.number));
+  }
+
+  // BigInt arithmetic is the C runtime's, which also throws for a BigInt mixed with a
+  // Number. Each side is ToNumeric'd first, left then right (an object's valueOf may give
+  // a BigInt), and then it is BigInt arithmetic if either is one.
+  const kl = isRawNum(left) ? TYPES.number : knownLeft, kr = isRawNum(right) ? TYPES.number : knownRight;
+  if (op in BIGINT_OPS && (kl === TYPES.bigint || kr === TYPES.bigint || (usesBigInt && (kl == null || kr == null)))) {
+    const numericJv = (node, ty) => ty === TYPES.number || ty === TYPES.bigint
+      ? valNumber(node)
+      : builtinCall(scope, '__ecma262_ToNumeric', [ valNumber(node) ]);
+    const l = reuse(scope, numericJv(left, kl)), r = reuse(scope, numericJv(right, kr));
+    // a known BigInt side: BigInt arithmetic, or its TypeError for a Number on the other
+    if (kl === TYPES.bigint || kr === TYPES.bigint) return bigintOp(op, l, r);
+    const number = () => Box(numericOp(scope, op, numValue(l), numValue(r)), Const(T.i32, TYPES.number));
+    const anyBig = Bin('|', T.i32, isBigint(l), isBigint(r));
+    // a known Number side: a Number, or the TypeError a BigInt on the other side throws
+    if (kl === TYPES.number || kr === TYPES.number) {
+      emitIf(scope, anyBig, () => stmt(scope, bigintOp(op, l, r)));
+      return number();
+    }
+    return Select(anyBig, bigintOp(op, l, r), number());
   }
 
   // arithmetic and bitwise: mixing BigInt with non-BigInt throws
@@ -1191,6 +1234,8 @@ const irBuiltinHelpers = (scope, name, def) => ({
   makeString: str => makeString(scope, str),
   usesAnyType,
   hasFunc: name => funcIndex[name] != null,
+  programFlag: name => name === 'usesIterProtocol' ? usesIterProtocol : false,
+  memberDemanded: name => memberDemands.has(name) || calledMembers.has(name),
   onFinalize,
   remapData: id => {
     if (!def.data || !Object.hasOwn(def.data, id)) throw new Error(`${name}: missing precompiled data segment ${id}`);
@@ -1477,7 +1522,7 @@ const getNodeType = (scope, node) => {
     if (['==', '===', '!=', '!==', '>', '>=', '<', '<=', 'instanceof', 'in'].includes(node.operator)) ret = TYPES.boolean;
     else {
       const stack = [ node ];
-      let anyBigint = false, anyKnown = false, anyStringLike = false, anyString = false, allBytes = true;
+      let anyBigint = false, anyNumber = false, anyKnown = false, anyUnknown = false, anyStringLike = false, anyString = false, allBytes = true;
       while (stack.length !== 0) {
         const n = stack.pop();
         if (n.type === 'BinaryExpression' && n.operator === node.operator) {
@@ -1487,13 +1532,19 @@ const getNodeType = (scope, node) => {
 
         const known = getNodeType(scope, n);
         if (known === TYPES.bigint) anyBigint = true;
+        if (known === TYPES.number) anyNumber = true;
         if (known != null) anyKnown = true;
+        else anyUnknown = true;
         if (known === TYPES.string || known === TYPES.bytestring || known === TYPES.stringobject) anyStringLike = true;
         if (known === TYPES.string || known === TYPES.stringobject) anyString = true;
         if (known !== TYPES.bytestring) allBytes = false;
       }
 
-      if (anyBigint) ret = TYPES.bigint;
+      if (anyBigint && node.operator !== '+') ret = TYPES.bigint;
+      else if (anyBigint) ret = anyStringLike || anyUnknown ? null : TYPES.bigint;
+      // an operand of unknown type may be a BigInt, unless a Number is in it too (a BigInt
+      // would throw), or it is >>> (never a BigInt)
+      else if (usesBigInt && anyUnknown && !anyNumber && node.operator !== '>>>') ret = null;
       else if (node.operator !== '+') ret = TYPES.number;
       else if (anyKnown && !anyStringLike) ret = TYPES.number;
       else if (anyString) ret = TYPES.string;
@@ -1506,9 +1557,16 @@ const getNodeType = (scope, node) => {
     else if (node.operator === 'void') ret = TYPES.undefined;
     else if (node.operator === 'delete') ret = TYPES.boolean;
     else if (node.operator === 'typeof') ret = TYPES.bytestring;
-    else ret = getNodeType(scope, node.argument) === TYPES.bigint ? TYPES.bigint : TYPES.number;
+    else if (node.operator === '+') ret = TYPES.number;
+    else {
+      const arg = getNodeType(scope, node.argument);
+      ret = arg === TYPES.bigint ? TYPES.bigint : usesBigInt && arg == null ? null : TYPES.number;
+    }
   }
-  else if (node.type === 'UpdateExpression') ret = TYPES.number;
+  else if (node.type === 'UpdateExpression') {
+    const arg = getNodeType(scope, node.argument);
+    ret = arg === TYPES.bigint ? TYPES.bigint : usesBigInt && arg !== TYPES.number ? null : TYPES.number;
+  }
   else if (node.type === 'MemberExpression') {
     const name = node.property.name;
     if (name === 'length' && (hasFuncWithName(node.object.name) || Prefs.fastLength)) ret = TYPES.number;
@@ -1554,7 +1612,7 @@ const getNodeType = (scope, node) => {
 const generateLiteral = (scope, decl) => {
   if (decl.bigint != null) {
     // todo/opt: parse and inline small BigInt literals instead of constructing them at runtime
-    return builtinCall(scope, '__Porffor_bigint_fromString', [ makeString(scope, decl.bigint) ]);
+    return builtinCall(scope, '__Porffor_bigint_fromLiteral', [ makeString(scope, decl.bigint) ]);
   }
 
   if (decl.value === null) return valNull();
@@ -1844,6 +1902,15 @@ const generateMallocIntrinsic = (scope, args, typeId = 0) => {
 
 const generateCall = (scope, decl) => {
   if (decl.type === 'NewExpression') decl._new = true;
+  // the method names the program calls, for the member.<name> comptime flags (a read of
+  // the property is recorded in generateMember)
+  if (!globalThis.precompile && decl.callee.type === 'MemberExpression') {
+    const callee = decl.callee;
+    const propName = callee.computed
+      ? (callee.property.type === 'Literal' && typeof callee.property.value === 'string' ? callee.property.value : null)
+      : callee.property.name;
+    if (propName) calledMembers.add(propName);
+  }
 
   let name = decl.callee.name;
 
@@ -1859,8 +1926,8 @@ const generateCall = (scope, decl) => {
   }
   if (name === '__Porffor_malloc') return generateMallocIntrinsic(scope, decl.arguments, decl._porfMallocType ?? 0);
 
-  if (name === '__Porffor_coroutine_resume' || name === '__Porffor_coroutine_value')
-    return Call(name, decl.arguments.map(a => generate(scope, a)), name === '__Porffor_coroutine_resume' ? T.i32 : T.jsval);
+  if (name === '__Porffor_coroutine_resume' || name === '__Porffor_coroutine_value' || name === '__Porffor_coroutine_awaiting')
+    return Call(name, decl.arguments.map(a => generate(scope, a)), name === '__Porffor_coroutine_value' ? T.jsval : T.i32);
 
   // eval('known/literal string') -> inline the parsed program
   if (!decl._funcIdx && !decl._new && (name === 'eval' || (decl.callee.type === 'SequenceExpression' && decl.callee.expressions.at(-1)?.name === 'eval'))) {
@@ -2453,8 +2520,25 @@ const setDefaultFuncName = (decl, name) => {
 };
 
 const generatePatternDstr = (scope, tmpPrefix, pattern, init, defaultValue, emit) => {
-  const tmpName = tmpPrefix + uniqId(scope);
+  let tmpName = tmpPrefix + uniqId(scope);
   generateVarDstr(scope, 'const', tmpName, init, defaultValue, false);
+
+  // an array pattern over anything but an array takes its values through the iterator
+  // protocol (after any default): as many as the pattern names, all for a rest, then closes it
+  if (pattern.type === 'ArrayPattern') {
+    const known = knownType(scope, getType(scope, tmpName));
+    const indexable = known === TYPES.array || (known >= TYPES.uint8clampedarray && known <= TYPES.float64array);
+    if (!indexable) {
+      const hasRest = pattern.elements.some(e => e?.type === 'RestElement');
+      const source = tmpName;
+      tmpName = tmpPrefix + uniqId(scope);
+      generateVarDstr(scope, 'const', tmpName, {
+        type: 'CallExpression',
+        callee: identNode('__Porffor_iter_destructure'),
+        arguments: [ identNode(source), { type: 'Literal', value: pattern.elements.length - (hasRest ? 1 : 0) }, { type: 'Literal', value: hasRest } ]
+      }, undefined, false);
+    }
+  }
 
   const tmpRef = Local(tmpName, scope.locals[tmpName]?.type ?? T.jsval);
   if (pattern.type === 'ArrayPattern') {
@@ -3166,6 +3250,14 @@ const generateUnary = (scope, decl) => {
   const toNumeric = () => knownType(scope, getNodeType(scope, decl.argument)) === TYPES.number
     ? generate(scope, decl.argument)
     : generate(scope, { type: 'CallExpression', callee: { type: 'Identifier', name: '__ecma262_ToNumeric' }, arguments: [ decl.argument ] });
+  // - and ~: the C runtime's for a BigInt, `number` for a Number
+  const bigintUnary = (cfunc, number) => {
+    const known = knownType(scope, getNodeType(scope, decl.argument));
+    if (known === TYPES.bigint) return Call(cfunc, [ valNumber(generate(scope, decl.argument)) ], T.jsval);
+    if (!usesBigInt || known === TYPES.number) return number(toNumeric());
+    const v = reuse(scope, valNumber(toNumeric()));
+    return Select(isBigint(v), Call(cfunc, [ v ], T.jsval), number(v));
+  };
 
   switch (decl.operator) {
     case '+':
@@ -3179,12 +3271,10 @@ const generateUnary = (scope, decl) => {
         if (typeof decl.argument.value === 'number')
           return generate(scope, { type: 'Literal', value: -decl.argument.value });
       }
-      // todo: proper bigint support
-      return Box(Un('neg', T.f64, numValue(toNumeric())), Const(T.i32, TYPES.number));
+      return bigintUnary('porf_bigint_neg', v => Box(Un('neg', T.f64, numValue(v)), Const(T.i32, TYPES.number)));
 
     case '~':
-      // todo: proper bigint support
-      return Box(Convert(T.f64, Un('~', T.i32, Convert(T.i32, numValue(toNumeric())))), Const(T.i32, TYPES.number));
+      return bigintUnary('porf_bigint_not', v => Box(Convert(T.f64, Un('~', T.i32, Convert(T.i32, numValue(v)))), Const(T.i32, TYPES.number)));
 
     case '!': {
       const arg = decl.argument;
@@ -3250,6 +3340,17 @@ const generateUpdate = (scope, decl, valueUnused = false) => {
   if (local != null) {
     // fast path: a local/global. todo: not as compliant as the slow path (non-numbers)
     const ref = isGlobal ? Global(name, globals[name]?.type ?? T.jsval) : Local(name, scope.locals[name]?.type ?? T.jsval);
+    // a BigInt steps by 1n: the C runtime's, for a value that may be one
+    if (usesBigInt && ref[N_TYPE] === T.jsval && knownType(scope, getNodeType(scope, decl.argument)) !== TYPES.number) {
+      const dec = Const(T.i32, decl.operator === '--' ? 1 : 0);
+      if (!decl.prefix && !valueUnused) {
+        const old = tmp(scope, T.jsval, ref);
+        assign(scope, ref, Call('porf_numeric_step', [ old, dec ], T.jsval));
+        return old;
+      }
+      assign(scope, ref, Call('porf_numeric_step', [ ref, dec ], T.jsval));
+      return valueUnused ? valUndefined() : ref;
+    }
     const inc = v => Bin(decl.operator === '++' ? '+' : '-', T.f64, numValue(v), Const(T.f64, 1));
     const incForRef = v => ref[N_TYPE] === T.jsval ? valNumber(inc(v))
       : ref[N_TYPE] === T.f64 ? inc(v)
@@ -3271,16 +3372,23 @@ const generateUpdate = (scope, decl, valueUnused = false) => {
     target = bindMemberTarget(scope, target, '#update', true);
   }
 
-  const tmpName = tmp(scope, T.f64)[N_A];
-  addVarMetadata(scope, tmpName, false, { type: TYPES.number });
-
-  setLocalWithType(scope, tmpName, false, { type: 'UnaryExpression', operator: '+', prefix: true, argument: target }, false, TYPES.number);
+  // ToNumeric: a Number, or a BigInt when the program has them (ToNumber would throw)
+  const tmpName = tmp(scope, usesBigInt ? T.jsval : T.f64)[N_A];
+  if (usesBigInt) setLocalWithType(scope, tmpName, false, { type: 'CallExpression', callee: { type: 'Identifier', name: '__ecma262_ToNumeric' }, arguments: [ target ] });
+  else {
+    addVarMetadata(scope, tmpName, false, { type: TYPES.number });
+    setLocalWithType(scope, tmpName, false, { type: 'UnaryExpression', operator: '+', prefix: true, argument: target }, false, TYPES.number);
+  }
 
   const assignNode = {
     type: 'AssignmentExpression',
     operator: '=',
     left: target,
-    right: {
+    right: usesBigInt ? {
+      type: 'CallExpression',
+      callee: { type: 'Identifier', name: '__Porffor_numericStep' },
+      arguments: [ { type: 'Identifier', name: tmpName }, { type: 'Literal', value: decl.operator === '--' ? 1 : 0 } ]
+    } : {
       type: 'BinaryExpression',
       operator: decl.operator[0],
       left: { type: 'Identifier', name: tmpName },
@@ -3462,13 +3570,67 @@ const awaitValue = (scope, value) => {
   return Await(value);
 };
 
+// types for...of iterates without the iterator protocol (its fast paths below)
+const FAST_ITERABLES = new Set([
+  TYPES.array, TYPES.string, TYPES.bytestring, TYPES.set, TYPES.map,
+  TYPES.__porffor_generator, TYPES.__porffor_asyncgenerator,
+  TYPES.uint8array, TYPES.int8array, TYPES.uint8clampedarray, TYPES.uint16array, TYPES.int16array,
+  TYPES.uint32array, TYPES.int32array, TYPES.float32array, TYPES.float64array,
+  TYPES.bigint64array, TYPES.biguint64array
+]);
+
+// for...of: the fast paths for built-in iterables, and the iterator protocol for the rest.
+// A loop that may take the protocol runs inside a try whose finally closes the iterator
+// (IteratorClose), so leaving it early by break, return or a throw calls its return().
 const generateForOf = (scope, decl) => {
+  if (decl._porfCore) return generateForOfCore(scope, decl);
+  const known = knownType(scope, getNodeType(scope, decl.right));
+  if (known != null && FAST_ITERABLES.has(known)) return generateForOfCore(scope, decl);
+
+  // a builtin's loop serves every program: both versions, chosen when it is linked into one
+  if (globalThis.precompile) {
+    const labels = pendingLabels.slice();
+    const full = collect(scope, () => generateForOfProtocol(scope, decl));
+    pendingLabels = labels;
+    const plain = collect(scope, () => generateForOfCore(scope, { ...decl, _porfCore: true, _builtinOnly: true }));
+    stmt(scope, { __porfComptimeFlag: [ 'program', 'usesIterProtocol', full, plain ] });
+    return valUndefined();
+  }
+
+  // a program that cannot make its own iterators: built-in iterables only, no try/finally
+  if (!usesIterProtocol) return generateForOfCore(scope, { ...decl, _porfCore: true, _builtinOnly: true });
+  return generateForOfProtocol(scope, decl);
+};
+
+const generateForOfProtocol = (scope, decl) => {
+  const rec = '#iter_rec' + uniqId(scope);
+  allocVar(scope, rec);
+  assign(scope, Local(rec, T.jsval), valUndefined());
+  const close = {
+    type: 'CallExpression',
+    callee: identNode(decl.await ? '__Porffor_iter_closeAsync' : '__Porffor_iter_close'),
+    arguments: [ identNode(rec) ]
+  };
+  return generateTry(scope, {
+    type: 'TryStatement',
+    block: { type: 'BlockStatement', body: [ { ...decl, _porfCore: true, _iterRec: rec } ] },
+    handler: null,
+    finalizer: {
+      type: 'BlockStatement',
+      body: [ { type: 'ExpressionStatement', expression: decl.await ? { type: 'AwaitExpression', argument: close } : close } ]
+    }
+  });
+};
+
+const generateForOfCore = (scope, decl) => {
   const root = tmp(scope, T.jsval, coerceValue(generate(scope, decl.right), T.jsval));
   const rootKnown = knownType(scope, getNodeType(scope, decl.right));
   const rootTy = reuse(scope, JvType(root));
   const isAwait = decl.await === true;
 
-  emitIf(scope, Un('!', T.i32, isAwait ? Bin('|', T.i32, typeIsIterable(rootTy), typeIsAsyncIterable(rootTy)) : typeIsIterable(rootTy)),
+  const recName = decl._iterRec;
+  // with the protocol, anything else is opened as an iterator (which throws when it is not one)
+  if (recName == null && !decl._builtinOnly) emitIf(scope, Un('!', T.i32, isAwait ? Bin('|', T.i32, typeIsIterable(rootTy), typeIsAsyncIterable(rootTy)) : typeIsIterable(rootTy)),
     () => internalThrow(scope, 'TypeError', isAwait ? 'Tried for await..of on non-iterable type' : 'Tried for..of on non-iterable type'));
 
   if (decl.left.type === 'Identifier' && !isIdentAssignable(scope, decl.left.name))
@@ -3533,12 +3695,20 @@ const generateForOf = (scope, decl) => {
 
       [ TYPES.__porffor_asyncgenerator, () => {
         if (!isAwait) { stmt(scope, Unreachable()); return valUndefined(); }
-        const done = reuse(scope, Call('__Porffor_coroutine_resume', [ root, valUndefined(), Const(T.i32, 0) ], T.i32));
+        // runs the generator through its own awaits to the next yield (or its end)
+        const done = reuse(scope, truthy(scope, awaitValue(scope,
+          builtinCall(scope, '__Porffor_AsyncGenerator_advance', [ root, valUndefined(), Const(T.i32, 0) ]))));
         emitIf(scope, done, () => stmt(scope, Break(L)));
         return Call('__Porffor_coroutine_value', [ root ]);
       } ],
 
-      [ TYPES.string, strNext('u16', 2, TYPES.string) ],
+      // by code point: a surrogate pair is one character
+      [ TYPES.string, () => {
+        emitIf(scope, Bin('==', T.i32, counter, length), () => stmt(scope, Break(L)));
+        const ch = reuse(scope, builtinCall(scope, '__Porffor_string_iterAt', [ root, counter ]));
+        assign(scope, counter, Bin('+', T.i32, counter, LenGet(JvPtr(ch))));
+        return ch;
+      } ],
       [ TYPES.bytestring, strNext('u8', 1, TYPES.bytestring) ],
 
       [ [ TYPES.uint8array, TYPES.uint8clampedarray ], taNext('u8', 1, num) ],
@@ -3576,8 +3746,24 @@ const generateForOf = (scope, decl) => {
         return generate(scope, { type: 'ArrayExpression', elements: [ { type: 'Identifier', name: kName }, { type: 'Identifier', name: vName } ] });
       } ],
 
-      // should be unreachable (the iterable check passed)
-      [ 'default', () => { stmt(scope, Unreachable()); return valUndefined(); } ]
+      // anything else: the iterator protocol (opened on the first step)
+      [ 'default', () => {
+        // built-in iterables only: a built-in iterator object (arr.keys() …), stepped directly
+        if (decl._builtinOnly) {
+          const v = reuse(scope, builtinCall(scope, '__Porffor_iter_stepBuiltinOnly', [ root ]));
+          emitIf(scope, truthy(scope, builtinCall(scope, '__Porffor_iter_builtinDone', [ root ])), () => stmt(scope, Break(L)));
+          return isAwait ? awaitValue(scope, v) : v;
+        }
+        if (recName == null) { stmt(scope, Unreachable()); return valUndefined(); }
+        const rec = Local(recName, T.jsval);
+        emitIf(scope, Bin('==', T.i32, JvType(rec), Const(T.i32, TYPES.undefined)),
+          () => assign(scope, rec, builtinCall(scope, isAwait ? '__Porffor_iter_openAsync' : '__Porffor_iter_open', [ root ])));
+        const v = reuse(scope, isAwait
+          ? awaitValue(scope, builtinCall(scope, '__Porffor_iter_stepAsync', [ rec ]))
+          : builtinCall(scope, '__Porffor_iter_step', [ rec ]));
+        emitIf(scope, truthy(scope, builtinCall(scope, '__Porffor_iter_isDone', [ rec ])), () => stmt(scope, Break(L)));
+        return v;
+      } ]
     ]);
 
     setLocalWithType(scope, valName, false, isAwait ? awaitValue(scope, nextVal) : nextVal);
@@ -4073,6 +4259,11 @@ const generateObject = (scope, decl) => {
 };
 
 let memberDemands;
+let calledMembers;
+// the program can make its own iterators (parse.js): for...of and friends need the protocol
+let usesIterProtocol = true;
+// the program can hold BigInts (parse.js): arithmetic on unknown types checks for them
+let usesBigInt = false;
 
 const demandMemberRead = decl => {
   const propName = decl.computed
@@ -4088,7 +4279,25 @@ const primObjAlias = {
   [TYPES.bytestring]: TYPES.stringobject
 };
 
+// builtins that look a method up by name at runtime: when one is in the program, so is the
+// method (String([1, 2]) needs Array.prototype.toString though the program never names it)
+const RUNTIME_METHOD_LOOKUPS = {
+  __ecma262_ToPrimitive_Number: [ 'valueOf', 'toString' ],
+  __ecma262_ToPrimitive_String: [ 'toString', 'valueOf' ]
+};
+
 const resolveMemberDemands = scope => {
+  // including a method can include a runtime lookup (and so demand more): until nothing new
+  let before;
+  do {
+    before = memberDemands.size;
+    for (const name in RUNTIME_METHOD_LOOKUPS)
+      if (funcIndex[name] != null) for (const method of RUNTIME_METHOD_LOOKUPS[name]) memberDemands.add(method);
+    resolveMemberDemandsOnce(scope);
+  } while (memberDemands.size !== before);
+};
+
+const resolveMemberDemandsOnce = scope => {
   for (const propName of memberDemands) {
     const getterOnly = propName === 'constructor';
     for (const x of getterOnly ? builtinPrototypeObjectGetters.values() : (builtinPrototypeFuncs.get(propName) ?? [])) {
@@ -4539,13 +4748,26 @@ const generateTaggedTemplate = (scope, decl) => {
   if (decl.tag.name in intrinsics) {
     let str = quasis[0].value.raw;
 
+    // ${name} is the C name of a variable, or of a JS function made callable from C:
+    // `jsval <name>(jsval, ...)`, one jsval per declared parameter, whatever types the
+    // function was compiled with. render resolves the markers once C names are known.
+    const cName = name => {
+      if (lookupName(scope, name)[0] != null) return `\u0001${name}\u0001`;
+
+      const func = resolveNamedFunction(scope, name);
+      if (!func) throw new Error(`Porffor.c: ${name} is not a variable or function`);
+      useFunctionValue(func);
+      func.cCallable = true;
+      return `\u0002${func.index}\u0002`;
+    };
+
     for (let i = 0; i < expressions.length; i++) {
       const e = expressions[i];
       if (!e.name) {
         if (e.type === 'BinaryExpression' && e.operator === '+' && e.left.type === 'Identifier' && e.right.type === 'Literal') {
-          str += lookupName(scope, e.left.name)[0].idx + e.right.value;
+          str += cName(e.left.name) + e.right.value;
         }
-      } else str += lookupName(scope, e.name)[0].idx;
+      } else str += cName(e.name);
 
       str += quasis[i + 1].value.raw;
     }
@@ -5149,6 +5371,10 @@ export default (program, opts = {}) => {
   includedBuiltinGlobalInits = new Set();
   irFinalizers = [];
   memberDemands = new Set();
+  calledMembers = new Set();
+  usesIterProtocol = !!program._usesIterProtocol;
+  // builtins are typed: a BigInt reaches their arithmetic only where they say so
+  usesBigInt = !globalThis.precompile && !!program._usesBigInt;
   fullPrototypes.clear();
   topLevelFunc = null;
   onFinalize(() => resolveMemberDemands(topLevelFunc));

@@ -309,7 +309,12 @@ const K_DataRef = ${K.DataRef}, K_Global = ${K.Global}, K_TypeSwitch = ${K.TypeS
 // rare collision (e.g. a 6-long type-id list whose [0] equals a kind number).
 const isNode = v => Array.isArray(v) && v.length === 6 && typeof v[0] === 'number' && typeof v[1] === 'number' && typeof v[2] === 'number';
 const isComptimeFlag = v => v && typeof v === 'object' && !Array.isArray(v) && v.__porfComptimeFlag;
-const resolveComptimeFlag = (h, kind, value) => kind === 'hasFunc' ? h.hasFunc(value) : h.usesAnyType([ value ]);
+// hasFunc.<builtin>, hasType.<type>, program.<flag> (a whole-program fact from parse.js),
+// member.<name> (the program reads a property of that name dynamically)
+const resolveComptimeFlag = (h, kind, value) => kind === 'hasFunc' ? h.hasFunc(value)
+  : kind === 'program' ? h.programFlag(value)
+  : kind === 'member' ? h.memberDemanded(value)
+  : h.usesAnyType([ value ]);
 
 // the dynamic resolution pass walks the reconstructed IR tree, threading the codegen helpers \`h\`:
 //   - live Call to a builtin       -> h.includeBuiltin(name)   (so it gets compiled + emitted)
@@ -354,12 +359,19 @@ const walk = (node, h) => {
     return node;
   }
 
-  if (kind === K_Call && typeof node[3] === 'string' && h.hasBuiltin(node[3])) h.includeBuiltin(node[3]);
+  // a builtin is referred to by name in the precompiled IR, but once included by its index:
+  // a builtin's inner function (the Promise executor's resolve) can share its name with one
+  // of the program's, and render finds functions by name
+  if (kind === K_Call && typeof node[3] === 'string' && h.hasBuiltin(node[3])) node[3] = h.includeBuiltin(node[3]).index;
   // a throwable error type is usable: its accessors/toString must survive type gating
   else if (kind === K_ThrowNew) h.typeUsed(node[3]);
   else if (kind === K_DataRef) node[3] = h.remapData(node[3]);
   else if (kind === K_Alloc && Array.isArray(node[5])) node[5][0] = h.remapAllocSite(node[5][0]);
-  else if (kind === K_FuncIdx || kind === K_FuncRec) h.includeBuiltin(node[3]).indirect = true;
+  else if (kind === K_FuncIdx || kind === K_FuncRec) {
+    const func = h.includeBuiltin(node[3]);
+    func.indirect = true;
+    node[3] = func.index;
+  }
   else if (kind === K_Global && typeof node[3] === 'string') h.global(node[3], node[1]);
 
   walk(node[3], h);

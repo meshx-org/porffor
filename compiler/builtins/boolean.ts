@@ -23,7 +23,12 @@ export const __Boolean_prototype_toString = function (this: boolean) {
 
 // 20.3.3.3 Boolean.prototype.valueOf ()
 // https://tc39.es/ecma262/#sec-boolean.prototype.valueof
-export const __Boolean_prototype_valueOf = function (this: boolean) {
-  // 1. Return ? ThisBooleanValue(this value).
-  return this;
+export const __Boolean_prototype_valueOf = function (this: any): boolean {
+  // 1. Return ? ThisBooleanValue(this value): the primitive, a Boolean object's unwrapped
+  if (Porffor.fastOr(Porffor.type(this) == Porffor.TYPES.boolean, Porffor.type(this) == Porffor.TYPES.booleanobject)) {
+    // the payload, retagged (a cast alone keeps the object's tag)
+    const bit: i32 = this;
+    return bit != 0;
+  }
+  throw new TypeError('Boolean.prototype.valueOf requires a Boolean');
 };

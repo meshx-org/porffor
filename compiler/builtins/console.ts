@@ -282,7 +282,7 @@ export const __Porffor_print = (arg: any, colors: boolean = true, depth: number 
         else Porffor.printStatic('Map');
       Porffor.printStatic('(');
 
-      const map: any[] = Porffor.callThis(__Map_prototype_keys, arg);
+      const map: any[] = Porffor.callThis(__Porffor_map_keysArray, arg);
       const mapLen: i32 = map.length - 1;
       Porffor.c`printf("%d", mapLen + 1);`;
       Porffor.printStatic(') { ');
@@ -304,7 +304,7 @@ export const __Porffor_print = (arg: any, colors: boolean = true, depth: number 
         else Porffor.printStatic('Set');
       Porffor.printStatic('(');
 
-      const set: any[] = Porffor.callThis(__Set_prototype_values, arg);
+      const set: any[] = Porffor.callThis(__Porffor_set_valuesArray, arg);
       const setLen: i32 = set.length - 1;
       Porffor.c`printf("%d", setLen + 1);`;
       Porffor.printStatic(') { ');

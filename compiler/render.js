@@ -6,6 +6,8 @@ import {
 } from './ir.js';
 import { TYPES, TYPE_NAMES } from './types.js';
 import { ieee754_binary64 } from './encoding.js';
+import caseTablesC from './case_tables.js';
+import { planStackless, hasAwait } from './stackless.js';
 
 // C type per IR value type
 const CT = [];
@@ -290,6 +292,35 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     syms[f.index] = sym;
     return sym;
   };
+  // Porffor.c markers (codegen): \u0001name\u0001 is a variable, \u0002index\u0002 a JS
+  // function called from C through its jsval wrapper, `<sym>_c`
+  const cCallables = funcs.filter(f => f?.cCallable);
+  const resolveRawC = str => str
+    .replace(/\u0001([^\u0001]*)\u0001/g, (_, name) => sanitize(name))
+    .replace(/\u0002(\d+)\u0002/g, (_, index) => `${fnSym(funcs[Number(index)])}_c`);
+  const cCallableProto = f => {
+    const n = f.params.filter(p => !p.name.startsWith('#')).length;
+    return `jsval ${fnSym(f)}_c(${Array.from({ length: n }, (_, i) => `jsval a${i}`).join(', ') || 'void'})`;
+  };
+  const cCallableDef = f => {
+    const args = [];
+    let j = 0;
+    for (const p of f.params) {
+      if (p.name === '#this' || p.name === '#newtarget') { args.push('JV_UNDEFINED'); continue; }
+      if (p.name.startsWith('#')) throw new Error(`Porffor.c: ${f.name} cannot be called from C (it has ${p.name})`);
+      const a = `a${j++}`;
+      if (p.type === T.f64) args.push(`${a}.val`);
+      else if (p.type === T.i64 || p.type === T.u64) args.push(`(i64)${a}.val`);
+      else if (p.type === T.i32 || p.type === T.u32 || p.type === T.ptr) args.push(`(i32)${a}.val`);
+      else args.push(a);
+    }
+    const call = `${fnSym(f)}(${args.join(', ')})`;
+    const body = f.retType === T.none ? `${call};\n  return JV_UNDEFINED;`
+      : f.retType === T.jsval ? `return ${call};`
+      : `return porf_box_num((f64)${call});`;
+    return `${cCallableProto(f)} {\n  ${body}\n}\n`;
+  };
+
   const nativeFetchFuncSym = name => {
     const f = funcByName.get(name);
     if (!f) throw new Error(`missing native fetch function ${name}`);
@@ -297,10 +328,21 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
   };
 
   // flags are derived here (only consumer), no stored func.flags. coroFlags = FN_* kind, fnFlags byte:
-  // bits 0-2 coroutine kind, 3 callable (has return type), 4 constructor, 5 generator init suspension
+  // bits 0-2 coroutine kind, 3 callable (has return type), 4 constructor, 5 generator init suspension,
+  // 6 stackless (runs as a step function over a heap frame, see stackless.js)
   const FN_CORO_INIT = 1 << 5;
+  const FN_STACKLESS = 1 << 6;
+  // --stackless: the async functions that can run without a coroutine stack, and their
+  // bodies with every await lifted to a statement
+  const stackless = new Map();
+  if (prefs.stackless) {
+    for (const f of funcs) {
+      const plan = planStackless(f);
+      if (plan) stackless.set(f, plan);
+    }
+  }
   const coroKind = f => f?.async && f?.generator ? FN_ASYNC_GENERATOR : (f?.async ? FN_ASYNC : 0) | (f?.generator ? FN_GENERATOR : 0);
-  const coroFlags = f => coroKind(f) | (f?.coroInit ? FN_CORO_INIT : 0);
+  const coroFlags = f => coroKind(f) | (f?.coroInit ? FN_CORO_INIT : 0) | (stackless.has(f) ? FN_STACKLESS : 0);
   const isCoro = f => !!(f && (f.async || f.generator));
   const needsCoro = f => !!(f && (f.generator || (f.async && f.hasAwait)));
   const isSyncAsync = f => !!(f && f.async && !f.generator && !needsCoro(f));
@@ -374,6 +416,11 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
   let depth = 1;
   const ind = () => '\t'.repeat(depth);
 
+  // while rendering a stackless function's step: the names that live in its frame (fr->x)
+  // and the suspension points emitted so far
+  let sl = null;
+  const varName = name => sl !== null && sl.fields.has(name) ? `fr->${sanitize(name)}` : sanitize(name);
+
   // break/continue lower to plain C when targeting the innermost breakable, else goto,
   // labels are only emitted when goto'd
   const loopStack = [];
@@ -445,7 +492,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
       case K.Global:
         cur.globals[node[N_A]] = true;
       case K.Local:
-        return [sanitize(node[N_A]), P_PRIM];
+        return sl !== null && sl.fields.has(node[N_A]) ? [varName(node[N_A]), P_POSTFIX] : [sanitize(node[N_A]), P_PRIM];
 
       case K.Bin: {
         const op = node[N_A], t = node[N_B][N_TYPE] === T.none ? node[N_TYPE] : node[N_B][N_TYPE];
@@ -561,7 +608,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
       }
 
       case K.Call: {
-        if (node[N_A] === '__Porffor_coroutine_resume' || node[N_A] === '__Porffor_coroutine_value') usesCoro = true;
+        if (node[N_A] === '__Porffor_coroutine_resume' || node[N_A] === '__Porffor_coroutine_value' || node[N_A] === '__Porffor_coroutine_awaiting') usesCoro = true;
         const f = funcOf(node[N_A]);
         if (f) cur.protos[f.index] = f;
         // direct call to a coroutine starts it instead of running the body: split args into the invocation shape
@@ -599,6 +646,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
       }
 
       case K.Await:
+        if (sl !== null) throw new Error('stackless: an await was left inside an expression');
         usesCoro = true;
         return [`porf_await(${rx(node[N_A], P_COMMA)})`, P_POSTFIX];
       case K.Yield:
@@ -629,12 +677,35 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     }
   };
 
+  // a stackless suspension point: the step returns with the awaited promise, and the
+  // promise's reaction resumes it at the label with its value or its rejection
+  const emitAwait = (value, dst) => {
+    const n = ++sl.resumes;
+    // the way back in: through each enclosing loop's own dispatch, outermost first
+    const loops = sl.loopStack;
+    const hop = (from, to) => (from === 0 ? sl.top : sl.routes.get(from)).push([n, to]);
+    for (let i = 0; i <= loops.length; i++) {
+      const from = i === 0 ? 0 : loops[i - 1];
+      hop(from, i === loops.length ? `porf_resume_${n}` : `porf_loop_${loops[i]}`);
+    }
+    emit(`${ind()}call->coro.channel = porf_sl_promise(${jsArg(value)});\n`);
+    emit(`${ind()}call->coro.awaiting = 1;\n${ind()}call->coro.state = 2;\n`);
+    emit(`${ind()}fr->porf_state = ${n};\n${ind()}return 0;\n`);
+    emit(`${ind()}porf_resume_${n}:;\n${ind()}porf_resuming = 0;\n`);
+    emit(`${ind()}if (porf_in_throw) porf_throw(porf_in);\n`);
+    if (dst) emit(`${ind()}${dst} = porf_in;\n`);
+  };
+
   const renderStmt = node => {
     if (node == null) return;
     switch (node[N_KIND]) {
       case K.Assign:
         if (node[N_A][N_KIND] === K.Global) cur.globals[node[N_A][N_A]] = true;
-        emit(`${ind()}${sanitize(node[N_A][N_A])} = ${rx(node[N_B], P_COMMA)};\n`);
+        if (sl !== null && node[N_B][N_KIND] === K.Await) {
+          emitAwait(node[N_B][N_A], varName(node[N_A][N_A]));
+          return;
+        }
+        emit(`${ind()}${varName(node[N_A][N_A])} = ${rx(node[N_B], P_COMMA)};\n`);
         return;
 
       case K.Store: {
@@ -675,9 +746,20 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
         const [stmts, label] = node[N_C];
         const updateC = update == null ? null
           : update[N_KIND] === K.Assign
-            ? `${sanitize(update[N_A][N_A])} = ${rx(update[N_B], P_COMMA)}`
+            ? `${varName(update[N_A][N_A])} = ${rx(update[N_B], P_COMMA)}`
             : rx(update, P_COMMA);
-        if (update) emit(`${ind()}for (; ${cond ? rx(cond, P_COMMA) : ''}; ${updateC}) {\n`);
+        // a stackless loop with a suspension point in it is entered only at its top, also
+        // when resuming (a goto into its body would make it irreducible, which wasm cannot
+        // express: LLVM copies code to repair that): its own dispatch then skips the
+        // condition and goes on to the resume point, or to the loop inside holding it
+        const slLoop = sl !== null && hasAwait(stmts) ? ++sl.loops : 0;
+        if (slLoop) {
+          emit(`${ind()}porf_loop_${slLoop}:;\n`);
+          emit(update ? `${ind()}for (;; ${updateC}) {\n` : `${ind()}while (1) {\n`);
+          emit(`${ind()}\tif (porf_resuming) {\n\u0003${slLoop}\u0003${ind()}\t}${cond ? ` else if (!(${rx(cond, P_COMMA)})) break;` : ''}\n`);
+          sl.loopStack.push(slLoop);
+          sl.routes.set(slLoop, []);
+        } else if (update) emit(`${ind()}for (; ${cond ? rx(cond, P_COMMA) : ''}; ${updateC}) {\n`);
           else if (cond) emit(`${ind()}while (${rx(cond, P_COMMA)}) {\n`);
         else emit(`${ind()}while (1) {\n`);
         loopStack.push(label);
@@ -689,6 +771,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
         depth--;
         breakStack.pop();
         loopStack.pop();
+        if (slLoop) sl.loopStack.pop();
         emit(`${ind()}}\n`);
         if (label && usedLabels.has(label + '_b')) emit(`${ind()}${sanitize(label)}_b:;\n`);
         return;
@@ -785,6 +868,13 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
       }
 
       case K.Return:
+        if (sl !== null) {
+          // the step ends: the result goes to the call, which settles its promise
+          if (activeTryDepth !== 0) emit(`${ind()}porf_try_depth -= ${activeTryDepth};\n`);
+          emit(`${ind()}call->result = ${node[N_A] ? jsArg(node[N_A]) : 'JV_UNDEFINED'};\n`);
+          emit(`${ind()}call->coro.state = 3;\n${ind()}return 1;\n`);
+          return;
+        }
         if (activeTryDepth !== 0 && node[N_A]) {
           emit(`${ind()}{\n`);
           depth++;
@@ -816,7 +906,9 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
         emit(`${ind()}} else {\n`);
         depth++;
         emit(`${ind()}porf_try_depth--;\n`);
-        emit(`${ind()}jsval ${sanitize(node[N_B])} = porf_exception;\n`);
+        emit(sl !== null && sl.fields.has(node[N_B])
+          ? `${ind()}${varName(node[N_B])} = porf_exception;\n`
+          : `${ind()}jsval ${sanitize(node[N_B])} = porf_exception;\n`);
         renderStmts(node[N_C]);
         depth--;
         emit(`${ind()}}\n`);
@@ -850,20 +942,107 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
         return;
 
       case K.RawC:
-        emit(`${ind()}${node[N_A]}${node[N_B] ? ';' : ''}\n`);
+        emit(`${ind()}${resolveRawC(node[N_A])}${node[N_B] ? ';' : ''}\n`);
         return;
+
+      case K.Await:
+        if (sl !== null) {
+          emitAwait(node[N_A], null);
+          return;
+        }
+        // falls through: a stackful await, as any other expression statement
 
       default: {
         if ((node[N_FX] & (FX.call | FX.writeMem | FX.writeLocal)) !== 0) {
-          emit(`${ind()}${node[N_TYPE] !== T.none ? '(void)' : ''}${rx(node, P_COMMA)};\n`);
+          // the cast binds tighter than any binary operator or ?: in the expression
+          emit(`${ind()}${node[N_TYPE] !== T.none ? `(void)${rx(node, P_CAST)}` : rx(node, P_COMMA)};\n`);
         }
         return;
       }
     }
   };
 
+  // catch parameters in a body: C locals of their catch blocks, frame fields when stackless
+  const catchNames = (node, out) => {
+    if (!Array.isArray(node)) return out;
+    if (isNode(node)) {
+      if (node[N_KIND] === K.Try) out.add(node[N_B]);
+      catchNames(node[N_A], out); catchNames(node[N_B], out); catchNames(node[N_C], out);
+    } else for (const x of node) catchNames(x, out);
+    return out;
+  };
+
+  // a stackless async function: its frame, the starter porf_invoke calls (params into a
+  // new frame, then the first step), and the step each resumption calls
+  const renderStackless = (f, plan) => {
+    const sym = fnSym(f);
+    const frame = `porf_slf_${sym}`;
+    // the params and whatever is live across a suspension go in the frame; every other
+    // local is a plain C local of the step, dead at each suspension (stackless.js)
+    const fields = new Map();
+    const stepLocals = new Map();
+    for (const p of f.params) fields.set(p.name, p.type);
+    const place = (name, type) => {
+      if (fields.has(name) || stepLocals.has(name)) return;
+      (plan.frame.has(name) ? fields : stepLocals).set(name, type);
+    };
+    for (const name in f.locals) place(name, f.locals[name].type);
+    for (const name in plan.temps) place(name, plan.temps[name]);
+    for (const name of catchNames(plan.body, new Set())) if (plan.frame.has(name)) place(name, T.jsval);
+
+    emit(`typedef struct ${frame} {\n  i32 porf_state;\n`);
+    for (const [name, t] of fields) emit(`  ${CT[t]} ${sanitize(name)};\n`);
+    emit(`} ${frame};\n\n`);
+    emit(`static i32 ${sym}_step(porf_coro_call* call, jsval porf_in, i32 porf_in_throw);\n\n`);
+
+    const ret = CT[f.retType];
+    const params = f.params.map(p => `${CT[p.type]} ${sanitize(p.name)}`).join(', ');
+    emit(`PORF_NOINLINE ${ret} ${sym}(${params || 'void'}) {\n`);
+    emit(`  porf_coro_call* call = porf_sl_starting;\n  porf_sl_starting = 0;\n`);
+    emit(`  if (!call) porf_unreachable("stackless async function called outside porf_coro_start");\n`);
+    emit(`  ${frame}* fr = (${frame}*)calloc(1, sizeof(${frame}));\n  if (!fr) abort();\n`);
+    for (const [name, t] of fields) {
+      if (f.params.some(p => p.name === name)) emit(`  fr->${sanitize(name)} = ${sanitize(name)};\n`);
+      else if (t === T.jsval) emit(`  fr->${sanitize(name)} = JV_UNDEFINED;\n`);
+    }
+    emit(`  call->sl_frame = fr;\n  call->sl_frame_size = (u32)sizeof(${frame});\n  call->sl_step = ${sym}_step;\n`);
+    emit(`  (void)${sym}_step(call, JV_UNDEFINED, 0);\n`);
+    emit(ret === 'void' ? '}\n\n' : ret === 'jsval' ? '  return JV_UNDEFINED;\n}\n\n' : '  return 0;\n}\n\n');
+
+    // the body first (to know its suspension points), then the dispatch in front of it
+    sl = { fields: new Set(fields.keys()), resumes: 0, loops: 0, loopStack: [], top: [], routes: new Map() };
+    const outer = cur;
+    cur = { ...outer, out: [], chunks: [] };
+    depth = 1;
+    activeTryDepth = 0;
+    loopStack.length = 0;
+    usedLabels = new Set();
+    renderStmts(plan.body);
+    const cases = (routes, pad) => `${pad}switch (fr->porf_state) {\n` +
+      routes.map(([n, to]) => `${pad}  case ${n}: goto ${to};\n`).join('') + `${pad}  default: break;\n${pad}}\n`;
+    const routes = sl.routes;
+    const body = (cur.chunks.join('') + cur.out.join('')).replace(/\u0003(\d+)\u0003/g, (_, id) => cases(routes.get(+id), '\t\t'));
+    const top = sl.top;
+    cur = outer;
+    sl = null;
+
+    emit(`${body.includes('_setjmp(') ? 'PORF_SL_TRY_STEP ' : ''}static i32 ${sym}_step(porf_coro_call* call, jsval porf_in, i32 porf_in_throw) {\n`);
+    emit(`  ${frame}* fr = (${frame}*)call->sl_frame;\n  (void)porf_in; (void)porf_in_throw;\n`);
+    for (const [name, t] of stepLocals) emit(`  ${CT[t]} ${sanitize(name)}${t === T.jsval ? ' = JV_UNDEFINED' : ' = 0'};\n`);
+    // resuming: to the resume point, or to the loop holding it (see K.Loop)
+    emit(`  i32 porf_resuming = 0;\n  PORF_STACK_CHECK();\n`);
+    if (top.length > 0) emit(`  if (fr->porf_state != 0) {\n    porf_resuming = 1;\n${cases(top, '    ')}  }\n`);
+    emit(body);
+    emit(`  call->result = JV_UNDEFINED;\n  call->coro.state = 3;\n  return 1;\n}\n\n`);
+  };
+
   const renderFunc = f => {
     cur = partsOf(unitOf(f));
+    const plan = stackless.get(f);
+    if (plan) {
+      renderStackless(f, plan);
+      return;
+    }
     const ret = CT[f.retType];
     const params = f.params.map(p => `${CT[p.type]} ${sanitize(p.name)}`).join(', ');
     emit(`${needsCoro(f) ? 'PORF_CORO_BODY ' : f.ast?._module ? 'PORF_ONCE ' : NEVER_INLINE.has(f.name) ? 'PORF_NOINLINE ' : ''}${ret} ${fnSym(f)}(${params || 'void'}) {\n`);
@@ -878,6 +1057,8 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
       const t = f.locals[name].type;
       emit(`  ${CT[t]} ${sanitize(name)}${t === T.jsval ? ' = JV_UNDEFINED' : ' = 0'};\n`);
     }
+    // a no-op unless the program runs coroutines on wasm (see PORF_STACK_CHECK)
+    emit(`  PORF_STACK_CHECK();\n`);
     renderStmts(f.body);
     emit(`}\n\n`);
   };
@@ -890,7 +1071,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
   const toStr = funcs.find(x => x && x.name === '__ecma262_ToString' && x.body);
   if (toStr) runtimeRefs.push(toStr);
   if (promiseResolveFunc) runtimeRefs.push(promiseResolveFunc);
-  prelude.push(RUNTIME_HEAD(prefs, toStr ? fnSym(toStr) : null));
+  prelude.push(RUNTIME_HEAD(prefs, usesCoro, toStr ? fnSym(toStr) : null, !usedTypes || usedTypes.has(TYPES.bigint)));
   if (usesCoro) prelude.push(CORO_RUNTIME());
 
   // link unit head: static data image, globals, gc roots, per-function tables
@@ -986,6 +1167,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     linkProtos.push(`${st}jsval porf_coro_start(u8 flags, u32 idx, jsval callee, u32 env, jsval thisv, jsval newtv, i32 argc, jsbits* argv);\n`);
     linkProtos.push(`${st}i32 __Porffor_coroutine_resume(jsval gen, jsval value, i32 mode);\n`);
     linkProtos.push(`${st}jsval __Porffor_coroutine_value(jsval gen);\n`);
+    linkProtos.push(`${st}i32 __Porffor_coroutine_awaiting(jsval gen);\n`);
   }
   if (!split) {
     for (const f of linkFuncs) link.push(proto(f));
@@ -1019,7 +1201,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     link.push(`${st}void porf_gc_mark_global_roots(void) {\n${markGlobalRootLines.join('\n') || '  (void)0;'}\n}\n\n`);
     link.push(`${st}void porf_gc_mark_global_raw_roots(void) {\n${markGlobalRawLines.join('\n') || '  (void)0;'}\n}\n\n`);
     link.push(usesCoro
-      ? `${st}void porf_gc_mark_coro_roots(void) {\n  for (i32 i = 0; i < porf_coro_live_len; i++) {\n    porf_coro* c = porf_coro_live[i];\n    if (c) porf_coro_gc_mark_suspended(c, 0);\n  }\n  for (porf_coro* c = porf_coro_cur; c; c = c->parent) porf_coro_gc_mark_active(c);\n}\n\n${st}void porf_gc_mark_coro_handle(uintptr_t raw) {\n  porf_coro_gc_mark_handle((porf_coro_call*)raw);\n}\n\n${st}void porf_gc_finalize_body(i32 body, i32 type) {\n  if (type == ${TYPES.__porffor_generator} || type == ${TYPES.__porffor_asyncgenerator}) {\n    uintptr_t raw = *(uintptr_t*)(MEM + body);\n    *(uintptr_t*)(MEM + body) = 0;\n    porf_coro_call_free((porf_coro_call*)raw);\n  }\n}\n\n`
+      ? `${st}void porf_gc_mark_coro_roots(void) {\n  for (i32 i = 0; i < porf_coro_live_len; i++) {\n    porf_coro* c = porf_coro_live[i];\n    if (c) porf_coro_gc_mark_suspended(c, 0);\n  }\n  // each coroutine once per collection: under P3, switches on concurrent threads can leave\n  // the parent links in a cycle, which this walk would otherwise follow forever\n  const u32 walk = ++porf_coro_gc_walk_epoch;\n  for (porf_coro* c = porf_coro_cur; c && c->gc_walk != walk; c = c->parent) {\n    c->gc_walk = walk;\n    porf_coro_gc_mark_active(c);\n  }\n}\n\n${st}void porf_gc_mark_coro_handle(uintptr_t raw) {\n  porf_coro_gc_mark_handle((porf_coro_call*)raw);\n}\n\n${st}void porf_gc_finalize_body(i32 body, i32 type) {\n  if (type == ${TYPES.__porffor_generator} || type == ${TYPES.__porffor_asyncgenerator}) {\n    uintptr_t raw = *(uintptr_t*)(MEM + body);\n    *(uintptr_t*)(MEM + body) = 0;\n    porf_coro_call_free((porf_coro_call*)raw);\n  }\n}\n\n`
       : `${st}void porf_gc_mark_coro_roots(void) {}\n${st}void porf_gc_mark_coro_handle(uintptr_t raw) { (void)raw; }\n${st}void porf_gc_finalize_body(i32 body, i32 type) { (void)body; (void)type; }\n\n`);
   }
 
@@ -1202,6 +1384,16 @@ static porf_coro_call* porf_coro_call_new(u32 idx, jsval callee, u32 env, jsval 
 }
 
 static i32 porf_coro_call_step(porf_coro_call* call, jsval value, i32 is_throw) {
+  if (call->sl) {
+    // on the caller's stack, like any call: porf_coro_cur and the stack top stay as they are
+    call->coro.state = 1;
+    if (call->started) return call->sl_step(call, value, is_throw);
+    call->started = 1;
+    porf_coro_live_add(&call->coro);
+    porf_sl_starting = call;
+    (void)porf_invoke(call->idx, call->callee, call->env, call->thisv, call->newtv, call->argc, call->argv);
+    return call->coro.state == 3;
+  }
   if (!call->started) {
     call->started = 1;
     return porf_coro_enter(&call->coro, porf_coro_call_thunk, call);
@@ -1234,8 +1426,10 @@ static void porf_promise_run_coro_reaction_coro(u32 reaction) {
   }
 
   porf_try_depth = try_idx;
-  porf_coro_set_current_stack_top(call->coro.caller_stack_top);
-  porf_coro_cur = call->coro.parent;
+  if (!call->sl) {
+    porf_coro_set_current_stack_top(call->coro.caller_stack_top);
+    porf_coro_cur = call->coro.parent;
+  }
   call->coro.state = 3;
   porf_coro_call_free(call);
   porf_promise_settle_direct(out_promise, porf_exception, 2);
@@ -1294,8 +1488,10 @@ static porf_coro_call* porf_coro_unbox(jsval gen) {
   }
 
   porf_try_depth = try_idx;
-  porf_coro_set_current_stack_top(call->coro.caller_stack_top);
-  porf_coro_cur = call->coro.parent;
+  if (!call->sl) {
+    porf_coro_set_current_stack_top(call->coro.caller_stack_top);
+    porf_coro_cur = call->coro.parent;
+  }
   porf_coro_live_remove(&call->coro);
   porf_coro_stack_free(&call->coro);
   call->coro.state = 3;
@@ -1310,9 +1506,17 @@ ${st}jsval __Porffor_coroutine_value(jsval gen) {
   return call->coro.state == 3 ? call->result : call->coro.channel;
 }
 
+// whether it is suspended at an await (its value is the pending promise) rather than a
+// yield: an async generator's driver waits those out instead of handing them to the consumer
+${st}i32 __Porffor_coroutine_awaiting(jsval gen) {
+  porf_coro_call* call = porf_coro_unbox(gen);
+  return call->coro.state == 2 && call->coro.awaiting;
+}
+
 ${st}jsval porf_coro_start(u8 flags, u32 idx, jsval callee, u32 env, jsval thisv, jsval newtv, i32 argc, jsbits* argv) {
 	  porf_promise_run_coro_reaction_impl = porf_promise_run_coro_reaction_coro;
 	  porf_coro_call* call = porf_coro_call_new(idx, callee, env, thisv, newtv, argc, argv);
+	  call->sl = (flags & ${FN_STACKLESS}u) != 0;
 	  const u8 kind = flags & 7u;
 
 	  if (kind == ${FN_GENERATOR} || kind == ${FN_ASYNC_GENERATOR}) {
@@ -1323,8 +1527,10 @@ ${st}jsval porf_coro_start(u8 flags, u32 idx, jsval callee, u32 env, jsval thisv
 	        porf_try_depth = try_idx;
 	      } else {
 	        porf_try_depth = try_idx;
-	        porf_coro_set_current_stack_top(call->coro.caller_stack_top);
-	        porf_coro_cur = call->coro.parent;
+	        if (!call->sl) {
+	          porf_coro_set_current_stack_top(call->coro.caller_stack_top);
+	          porf_coro_cur = call->coro.parent;
+	        }
 	        call->coro.state = 3;
 	        porf_coro_call_free(call);
 	        porf_throw(porf_exception);
@@ -1349,8 +1555,10 @@ ${st}jsval porf_coro_start(u8 flags, u32 idx, jsval callee, u32 env, jsval thisv
 	  }
 
 	  porf_try_depth = try_idx;
-	  porf_coro_set_current_stack_top(call->coro.caller_stack_top);
-	  porf_coro_cur = call->coro.parent;
+	  if (!call->sl) {
+	    porf_coro_set_current_stack_top(call->coro.caller_stack_top);
+	    porf_coro_cur = call->coro.parent;
+	  }
 	  call->coro.state = 3;
 	  porf_coro_call_free(call);
 	  porf_promise_settle_direct(out_promise, porf_exception, 2);
@@ -1364,7 +1572,7 @@ ${st}jsval porf_coro_start(u8 flags, u32 idx, jsval callee, u32 env, jsval thisv
   const u32 idx = *(u32*)(MEM + rec);
   const u32 env = *(u32*)(MEM + rec + 4);
   if (idx >= ${linkFuncs.length}u) porf_unreachable("bad function index");
-  const u8 flags = porf_fnflags[idx] & (7u | ${FN_CORO_INIT}u);
+  const u8 flags = porf_fnflags[idx] & (7u | ${FN_CORO_INIT}u | ${FN_STACKLESS}u);
   const u8 kind = flags & 7u;
   if (!porf_jv_eq(newtv, JV_UNDEFINED) && kind != 0) porf_throw_new(${TYPES.typeerror}, 0);
   ${usesCoro || usesSyncAsync ? `if (kind != 0) {
@@ -1668,12 +1876,26 @@ int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_
 `);
   }
 
+  cur = partsOf('main');
+  for (const f of cCallables) {
+    cur.protos[f.index] = f;
+    emit(cCallableDef(f));
+  }
+
   if (entry && !prefs.nativeFetch) {
-    emit(`int main(int argc, char** argv) {\n  porf_init(argc, argv);\n  porf_data_init();\n  ${gcEnabled ? 'volatile int porf_stack_anchor = 0;\n  porf_c_stack_top = (void*)&porf_stack_anchor;\n  ' : ''}${fnSym(funcByName.get(entry))}();\n  return 0;\n}\n`);
+    // porf_start runs the program's top level; main is porf_start then exit. An embedder
+    // defines PORF_NO_MAIN, calls porf_start once, then calls into the program (Porffor.c
+    // functions) and drains its job queue with porf_run_jobs.
+    const runJobs = funcByName.get('__Porffor_promise_runJobs');
+    if (runJobs) cur.protos[runJobs.index] = runJobs;
+    emit(`${st}void porf_run_jobs(void) {\n  ${runJobs ? `(void)${fnSym(runJobs)}();` : '// no job queue'}\n}\n\n`);
+    emit(`${st}void porf_start(int argc, char** argv) {\n  porf_init(argc, argv);\n  porf_data_init();\n  ${gcEnabled ? 'volatile int porf_stack_anchor = 0;\n  porf_c_stack_top = (void*)&porf_stack_anchor;\n  ' : ''}${fnSym(funcByName.get(entry))}();\n}\n\n`);
+    emit(`#ifndef PORF_NO_MAIN\nint main(int argc, char** argv) {\n  porf_start(argc, argv);\n  return 0;\n}\n#endif\n`);
   }
 
   if (usesMath) prelude.splice(1, 0, '#include <math.h>\n');
-  if (prefs.rawHead) prelude.push(prefs.rawHead + '\n');
+  for (const f of cCallables) prelude.push(`${cCallableProto(f)};\n`);
+  if (prefs.rawHead) prelude.push(resolveRawC(prefs.rawHead) + '\n');
 
   const globalTypes = Object.create(null);
   for (const g of globals) globalTypes[g.name] = g.type;
@@ -1702,7 +1924,8 @@ int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_
   const rt = splitRuntime(prelude.join(''));
   const header = rt.header +
     `extern const u8 porf_fnflags[];\n${usesSyncAsync ? 'extern const u8 porf_fnneeds_coro[];\n' : ''}extern const u16 porf_fnlen[];\nextern const u32 porf_fnname[];\nextern const u32 porf_fnrecs;\n` +
-    linkProtos.join('');
+    linkProtos.join('') +
+    (entry && !prefs.nativeFetch ? 'void porf_start(int argc, char** argv);\nvoid porf_run_jobs(void);\n' : '');
   const unitName = u => {
     const name = units?.find(x => x.id === u)?.name;
     return name ? name.replace(/^[/]/, '').replace(/[^\w.-]/g, '_') + '.' + u + '.c' : `porf_${sanitize(u)}.c`;
@@ -1770,7 +1993,10 @@ const splitRuntime = text => {
     const isProto = !isType && parenAt !== -1 && braceAt === -1 && eqAt === -1 && !/\(\*\w+\)/.test(chunk);
     const unstatic = str => str.replace(/\bstatic\s+/, '');
 
-    if (isType || /^extern\b/.test(chunk) || (isFunc && /\binline\b/.test(spec)) || /^static\s+const\b/.test(chunk)) header.push(chunk);
+    // top-level assembly defines its symbols: once, in the implementation (as a prototype
+    // in the header it would be defined again in every unit)
+    if (/^__asm__\s*\(/.test(chunk)) impl.push(chunk);
+    else if (isType || /^extern\b/.test(chunk) || (isFunc && /\binline\b/.test(spec)) || /^static\s+const\b/.test(chunk)) header.push(chunk);
     else if (isFunc) {
       header.push(unstatic(chunk.slice(0, braceAt - start)).trim() + ';');
       impl.push(unstatic(chunk));
@@ -1888,7 +2114,9 @@ static u64 porf_heap_committed = 0;
 #define PORF_GC_NPAGES (1u << 19)
 #define PORF_GC_NCLASSES ${classes.length}
 #define PORF_GC_MAX_SMALL 8192u
+#ifndef PORF_GC_NURSERY_BYTES
 #define PORF_GC_NURSERY_BYTES ${Math.min(((parseInt(prefs.gcNursery) || 32) * 1024 * 1024), 256 * 1024 * 1024)}u
+#endif
 
 static const u16 porf_gc_cls_size[PORF_GC_NCLASSES] = { ${classes.join(', ')} };
 static const u8 porf_gc_cls_pages[PORF_GC_NCLASSES] = { ${chunkPages.join(', ')} };
@@ -2224,8 +2452,12 @@ static u32 porf_gc_claim_pages(u32 npg) {
   u32 lo = porf_gc_pool_run(npg);
   if (lo == 0) {
     if (porf_gc_full_due((i64)npg * (i64)PORF_GC_SPAGE)) {
+#ifdef PORF_GC_DEFER
+      porf_gc_pending = 2;
+#else
       porf_gc_collect(0);
       lo = porf_gc_pool_run(npg);
+#endif
     }
     if (lo == 0) {
       if ((u64)porf_heap_top + (u64)npg * PORF_GC_SPAGE >= PORF_ARENA_RESERVE) {
@@ -2345,7 +2577,11 @@ ${st}u32 porf_alloc_slow(u32 bytes, u32 typeId) {
 ${minorsEnabled ? `  if (porf_gc_window_bytes >= (i64)PORF_GC_NURSERY_BYTES || porf_gc_span_bytes >= 8388608ll) {
     porf_gc_window_bytes = 0;
     porf_gc_span_bytes = 0;
+#ifdef PORF_GC_DEFER
+    if (!porf_gc_pending) porf_gc_pending = 1;
+#else
     porf_gc_minor();
+#endif
   }
 ` : ''}\
   if (bytes > PORF_GC_MAX_SMALL) return porf_gc_span_alloc(bytes, typeId);
@@ -3281,6 +3517,10 @@ static void porf_gc_cons_mark_block(i32 body) {
     if (d > 0.0 && d < 4294967296.0) {
       const i64 iv = (i64)d;
       if ((f64)iv == d) porf_gc_cons_candidate((u32)(u64)iv);
+    } else if (d >= 2251799813685248.0 && d < 2251804108652544.0) {
+      // a heap BigInt: payload = pointer + 2^51
+      const i64 iv = (i64)(d - 2251799813685248.0);
+      if ((f64)iv == d - 2251799813685248.0) porf_gc_cons_candidate((u32)(u64)iv);
     }
   }
 }
@@ -3311,12 +3551,19 @@ static void porf_gc_cons_scan_range(const u64* lo, const u64* hi) {
     if (d > 0.0 && d < 4294967296.0) {
       const i64 iv = (i64)d;
       if ((f64)iv == d) porf_gc_cons_candidate((u32)(u64)iv);
+    } else if (d >= 2251799813685248.0 && d < 2251804108652544.0) {
+      // a heap BigInt: payload = pointer + 2^51
+      const i64 iv = (i64)(d - 2251799813685248.0);
+      if ((f64)iv == d - 2251799813685248.0) porf_gc_cons_candidate((u32)(u64)iv);
     }
   }
 }
 
 static void porf_gc_mark_cons_roots(void) {
   jmp_buf regs;
+#ifdef PORF_NO_EH
+  memset(&regs, 0, sizeof(regs));
+#endif
   if (_setjmp(regs) == 0) {
     porf_gc_cons_scan_range((const u64*)&regs, (const u64*)((const char*)&regs + sizeof(regs)));
   }
@@ -3602,6 +3849,14 @@ static void porf_gc_minor(void) {
   porf_gc_collect(1);
   if (porf_gc_full_due(0)) porf_gc_collect(0);
 }
+#ifdef PORF_GC_DEFER
+${st}void porf_gc_run_pending(void) {
+  if (!porf_gc_pending) return;
+  const int full = porf_gc_pending == 2;
+  porf_gc_pending = 0;
+  if (full) porf_gc_collect(0); else porf_gc_minor();
+}
+#endif
 ${prefs.nativeFetch ? `
 // full under the debt policy, otherwise minor after enough page claims
 ${st}int porf_gc_idle_minor_due(void) {
@@ -3703,7 +3958,8 @@ ${st}void porf_gc_collect(int minor) {
 // jsval encoding: f64 numbers are themselves, else 0xFFF8 (sign + quiet-NaN) << 48 |
 // type:8 << 43 | payload:32. hardware qNaN is 0x7FF8 (sign clear) so never collides,
 // sign-set NaNs from raw bytes are canonicalized at Float64Array/DataView reads (porf_canon)
-const RUNTIME_HEAD = (prefs, toStr = null) => {
+// bigintUsed: the program can hold a BigInt, which packs specially (porf_pack)
+const RUNTIME_HEAD = (prefs, usesCoro = false, toStr = null, bigintUsed = true) => {
   const st = 'static ';
   const sti = 'static inline ';
   return `// generated by porffor ${globalThis.version}
@@ -3711,7 +3967,16 @@ const RUNTIME_HEAD = (prefs, toStr = null) => {
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef PORF_NO_EH
+// PORF_NO_EH: no setjmp/longjmp (wasm without the exceptions proposal). A throw with no
+// enclosing try still reports and exits; a throw inside a try aborts instead of catching.
+typedef unsigned long long jmp_buf[1];
+#define _setjmp(b) ((void)(b), 0)
+#define setjmp(b) ((void)(b), 0)
+#define _longjmp(b, v) (fputs("porffor: exception thrown inside try; built with PORF_NO_EH\\n", stderr), abort())
+#else
 #include <setjmp.h>
+#endif
 #include <math.h>
 
 #include <signal.h>
@@ -3722,6 +3987,7 @@ const RUNTIME_HEAD = (prefs, toStr = null) => {
 #ifndef __wasi__
 #include <sys/wait.h>
 #endif
+#include <sys/random.h>
 #include <time.h>
 
 // Printing (console.*) writes to porf_print_out: stdout, or stderr while console.error
@@ -3781,6 +4047,41 @@ ${prefs.nativeFetch ? '' : st}u8* porf_mem;
 #define PORF_ONCE
 #endif
 #define PORF_NORETURN __attribute__((cold, noinline, noreturn))
+${usesCoro ? `#if defined(__wasm__) && !defined(PORF_NO_STACK_CHECK)
+// A coroutine's stack is a block of linear memory with no guard page, so every function
+// checks the stack pointer (after its frame is taken) against the running coroutine's
+// stack: below its limit and inside the guard region reserved under it is an overflow,
+// which traps where it happens instead of overwriting the memory below. Only that region
+// counts, so another thread running meanwhile (its stack is elsewhere) is never mistaken
+// for one. Both are 0 (unchecked) outside coroutines; the switches set them.
+static u32 porf_stack_limit = 0;
+static u32 porf_stack_floor = 0; // one per declaration: split output declares each in porf.h
+#ifdef __wasm_libcall_thread_context__
+// cooperative threads (P3): the stack pointer is thread context, read through the linker's
+u32 __wasm_get_stack_pointer(void);
+static inline __attribute__((always_inline)) u32 porf_stack_pointer(void) {
+  return __wasm_get_stack_pointer();
+}
+#else
+static inline __attribute__((always_inline)) u32 porf_stack_pointer(void) {
+  u32 sp;
+  __asm__ volatile(".globaltype __stack_pointer, i32\\n\\tglobal.get __stack_pointer\\n\\tlocal.set %0" : "=r"(sp));
+  return sp;
+}
+#endif
+PORF_NORETURN static void porf_stack_overflow(void) {
+  fputs("porffor: stack overflow in a coroutine (build with a larger -DPORF_CORO_STACK_SIZE)\\n", stderr);
+  __builtin_trap();
+}
+#define PORF_STACK_CHECK() do { \\
+  const u32 porf_sp_ = porf_stack_pointer(); \\
+  if (__builtin_expect(porf_sp_ < porf_stack_limit && porf_sp_ >= porf_stack_floor, 0)) porf_stack_overflow(); \\
+} while (0)
+#else
+#define PORF_STACK_CHECK() ((void)0)
+#endif
+` : `#define PORF_STACK_CHECK() ((void)0)
+`}\
 // A suspended coroutine's body keeps its live values in its frame, and on wasm an
 // optimised frame holds them in wasm locals the conservative GC cannot scan. Unoptimised,
 // every local lives in the (scannable) shadow stack, so a collection at a safe point
@@ -3790,8 +4091,17 @@ ${prefs.nativeFetch ? '' : st}u8* porf_mem;
 #else
 #define PORF_CORO_BODY
 #endif
-#ifndef MAP_NORESERVE
-#define MAP_NORESERVE 0
+// A stackless step holding a try (no await inside it, or the function would be stackful):
+// on wasm the setjmp lowering over optimised code grows such a step 10-15x (a 37 KB step
+// became 590 KB), so it stays unoptimised like a stackful body. Steps without one optimise.
+#if defined(__wasm__) && defined(__clang__) && !defined(PORF_NO_EH)
+#define PORF_SL_TRY_STEP __attribute__((optnone, noinline))
+#else
+#define PORF_SL_TRY_STEP
+#endif
+#if !defined(MAP_NORESERVE) || defined(__wasi__)
+#undef MAP_NORESERVE
+#define MAP_NORESERVE 0 // wasi-libc's emulated mmap rejects it
 #endif
 #ifdef __wasi__
 // wasi's malloc-backed mmap ignores fixed hints and cannot change protections
@@ -3808,6 +4118,12 @@ ${prefs.nativeFetch ? '' : st}u8* porf_mem;
 #endif
 extern const u32 porf_static_end;
 #define PORF_GC_ENABLED ${prefs.gc === false ? 0 : 1}
+#ifdef PORF_GC_DEFER
+// PORF_GC_DEFER: a collection due during an allocation is only requested, and runs at
+// the next porf_gc_run_pending(). For an embedder whose C frames may hold values the
+// conservative scan cannot see (wasm locals), which calls it where none are live.
+static int porf_gc_pending = 0; // 1 = minor requested, 2 = full requested
+#endif
 
 #define JV_PATTERN 0xFFF8000000000000ull
 #define JV_TYPE_MASK 0x07F8000000000000ull
@@ -3856,6 +4172,12 @@ static inline jsbits porf_pack(jsval v) {
     // negative quiet NaNs collide with the boxed encoding: canonicalize
     return (b & JV_PATTERN) == JV_PATTERN ? 0x7FF8000000000000ull : b;
   }
+${bigintUsed ? `  // a BigInt: inline, its value as 42-bit two's complement; heap, bit 42 and its pointer
+  if (v.type == ${TYPES.bigint})
+    return JV_PATTERN | ((u64)${TYPES.bigint} << 43) | (v.val >= 2251799813685248.0
+      ? (1ull << 42) | (u64)(u32)(v.val - 2251799813685248.0)
+      : (u64)(i64)v.val & 0x3FFFFFFFFFFull);
+` : ''}\
   return JV_PATTERN | ((u64)(v.type & 0xFF) << 43) | (u64)(u32)v.val;
 }
 ${sti}jsbits porf_arr_pack(jsval v) {
@@ -3864,6 +4186,9 @@ ${sti}jsbits porf_arr_pack(jsval v) {
 }
 static inline jsval porf_unpack(jsbits b) {
   if ((b & JV_PATTERN) != JV_PATTERN) return porf_box_num(porf_bits_to_f64(b));
+${bigintUsed ? `  if (((b >> 43) & 0xFF) == ${TYPES.bigint})
+    return (jsval){(b >> 42) & 1 ? (f64)(u32)b + 2251799813685248.0 : (f64)((i64)(b << 22) >> 22), ${TYPES.bigint}};
+` : ''}\
   return (jsval){(f64)(u32)b, (i32)((b >> 43) & 0xFF)};
 }
 static inline f64 porf_canon(f64 d) { return d == d ? d : porf_bits_to_f64(0x7FF8000000000000ull); }
@@ -3997,6 +4322,174 @@ ${sti}f64 porf_performance_time_origin(void) {
   return porf_performance_time_origin_value;
 }
 
+// Random bytes from the platform's CSPRNG: getentropy (on WASI, wasi:random/random's
+// get-random-bytes). crypto.getRandomValues and randomUUID fill from it, and it seeds
+// Math.random's generator.
+${sti}void porf_random_fill(u8* p, u32 n) {
+  while (n > 0) {
+    const u32 k = n < 256u ? n : 256u;  // getentropy's limit per call
+    if (getentropy(p, k) != 0) {
+      fputs("porffor: no random bytes from the platform (getentropy)\\n", stderr);
+      abort();
+    }
+    p += k;
+    n -= k;
+  }
+}
+
+${sti}u64 porf_random_u64(void) {
+  u64 v;
+  porf_random_fill((u8*)&v, 8u);
+  return v;
+}
+
+// ---- String.prototype.toUpperCase / toLowerCase: full Unicode case mapping ----
+// Tables from compiler/gen_case_tables.js (Node's ICU data). The linker drops them from
+// programs that never convert case.
+${caseTablesC}
+
+// the delta for cp in a table of runs, or 0
+static i32 porf_case_delta(const porf_case_run* runs, i32 n, u32 cp) {
+  i32 lo = 0, hi = n - 1, at = -1;
+  while (lo <= hi) {
+    const i32 mid = (lo + hi) >> 1;
+    if (runs[mid].start <= cp) { at = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  if (at < 0) return 0;
+  const porf_case_run r = runs[at];
+  const u32 off = cp - r.start;
+  if (off % r.stride != 0 || off / r.stride >= r.count) return 0;
+  return r.delta;
+}
+
+// the mapping of cp to several code points, or NULL
+static const u32* porf_case_special(const u32 (*table)[4], i32 n, u32 cp) {
+  i32 lo = 0, hi = n - 1;
+  while (lo <= hi) {
+    const i32 mid = (lo + hi) >> 1;
+    if (table[mid][0] == cp) return table[mid] + 1;
+    if (table[mid][0] < cp) lo = mid + 1; else hi = mid - 1;
+  }
+  return NULL;
+}
+
+static int porf_case_in(const u32 (*ranges)[2], i32 n, u32 cp) {
+  i32 lo = 0, hi = n - 1;
+  while (lo <= hi) {
+    const i32 mid = (lo + hi) >> 1;
+    if (cp < ranges[mid][0]) hi = mid - 1;
+    else if (cp > ranges[mid][1]) lo = mid + 1;
+    else return 1;
+  }
+  return 0;
+}
+#define PORF_CASE_N(t) ((i32)(sizeof(t) / sizeof((t)[0])))
+
+// the code point at unit i of a string (u16 units, or u8 for a bytestring); *w: its units
+static u32 porf_case_cp(u32 chars, i32 wide, u32 len, u32 i, u32* w) {
+  *w = 1;
+  if (!wide) return *(u8*)(MEM + chars + i);
+  const u32 u = *(u16*)(MEM + chars + i * 2);
+  if (u >= 0xd800 && u <= 0xdbff && i + 1 < len) {
+    const u32 v = *(u16*)(MEM + chars + i * 2 + 2);
+    if (v >= 0xdc00 && v <= 0xdfff) { *w = 2; return 0x10000 + ((u - 0xd800) << 10) + (v - 0xdc00); }
+  }
+  return u;
+}
+
+// Final_Sigma: Σ at unit i lowercases to ς when a cased letter comes before it (past any
+// case-ignorable ones) and none comes after it (likewise)
+static int porf_case_final_sigma(u32 chars, i32 wide, u32 len, u32 i) {
+  int before = 0;
+  for (u32 j = i; j > 0;) {
+    j--;
+    if (wide && j > 0) {
+      const u32 u = *(u16*)(MEM + chars + j * 2);
+      if (u >= 0xdc00 && u <= 0xdfff) {
+        const u32 h = *(u16*)(MEM + chars + j * 2 - 2);
+        if (h >= 0xd800 && h <= 0xdbff) j--;
+      }
+    }
+    u32 w;
+    const u32 cp = porf_case_cp(chars, wide, len, j, &w);
+    if (porf_case_in(porf_case_ignorable_ranges, PORF_CASE_N(porf_case_ignorable_ranges), cp)) continue;
+    before = porf_case_in(porf_cased_ranges, PORF_CASE_N(porf_cased_ranges), cp);
+    break;
+  }
+  if (!before) return 0;
+  for (u32 j = i + 1; j < len;) {
+    u32 w;
+    const u32 cp = porf_case_cp(chars, wide, len, j, &w);
+    j += w;
+    if (porf_case_in(porf_case_ignorable_ranges, PORF_CASE_N(porf_case_ignorable_ranges), cp)) continue;
+    return !porf_case_in(porf_cased_ranges, PORF_CASE_N(porf_cased_ranges), cp);
+  }
+  return 1;
+}
+
+${sti}u32 porf_alloc(u32 bytes, u32 typeId);
+
+// s (a string or bytestring) in upper or lower case. An ASCII bytestring stays a
+// bytestring; anything else becomes a string (a Latin-1 letter's case can leave Latin-1).
+static jsval porf_case_convert(jsval s, i32 upper) {
+  const i32 wide = porf_jv_type(s) == ${TYPES.string};
+  const u32 src = (u32)s.val;
+  const u32 len = *(u32*)(MEM + src);
+  const u32 chars = src + 4;
+
+  if (!wide) {
+    u32 i = 0;
+    while (i < len && *(u8*)(MEM + chars + i) < 0x80) i++;
+    if (i == len) {
+      const u32 dst = porf_alloc(4 + len, ${TYPES.bytestring});
+      *(u32*)(MEM + dst) = len;
+      for (u32 k = 0; k < len; k++) {
+        u8 c = *(u8*)(MEM + chars + k);
+        if (upper ? (c >= 'a' && c <= 'z') : (c >= 'A' && c <= 'Z')) c ^= 0x20;
+        *(u8*)(MEM + dst + 4 + k) = c;
+      }
+      return porf_box((f64)dst, ${TYPES.bytestring});
+    }
+  }
+
+  // at most 3 units out per unit in (the longest special mapping: 3 BMP code points)
+  const u32 dst = porf_alloc(4 + len * 6, ${TYPES.string});
+  u32 n = 0;
+  for (u32 i = 0; i < len;) {
+    u32 w;
+    const u32 cp = porf_case_cp(chars, wide, len, i, &w);
+    u32 outs[3] = { cp, 0, 0 };
+    u32 count = 1;
+    const u32* special = upper
+      ? porf_case_special(porf_upper_special, PORF_CASE_N(porf_upper_special), cp)
+      : porf_case_special(porf_lower_special, PORF_CASE_N(porf_lower_special), cp);
+    if (special) {
+      count = special[2] ? 3 : special[1] ? 2 : 1;
+      outs[0] = special[0]; outs[1] = special[1]; outs[2] = special[2];
+    } else if (!upper && cp == 0x3a3) {
+      outs[0] = porf_case_final_sigma(chars, wide, len, i) ? 0x3c2 : 0x3c3;
+    } else {
+      outs[0] = (u32)((i32)cp + (upper
+        ? porf_case_delta(porf_upper_runs, PORF_CASE_N(porf_upper_runs), cp)
+        : porf_case_delta(porf_lower_runs, PORF_CASE_N(porf_lower_runs), cp)));
+    }
+    for (u32 k = 0; k < count; k++) {
+      const u32 o = outs[k];
+      if (o >= 0x10000) {
+        *(u16*)(MEM + dst + 4 + n * 2) = (u16)(0xd800 + ((o - 0x10000) >> 10));
+        *(u16*)(MEM + dst + 4 + n * 2 + 2) = (u16)(0xdc00 + ((o - 0x10000) & 0x3ff));
+        n += 2;
+      } else {
+        *(u16*)(MEM + dst + 4 + n * 2) = (u16)o;
+        n++;
+      }
+    }
+    i += w;
+  }
+  *(u32*)(MEM + dst) = n;
+  return porf_box((f64)dst, ${TYPES.string});
+}
+
 // unaligned access (DataView, object entry values): memcpy folds to plain loads on x86/arm
 // tcc: plain derefs instead - it emits real memcpy calls, and it never optimizes on alignment UB
 #ifdef __TINYC__
@@ -4036,6 +4529,19 @@ ${toStr ? `jsval ${toStr}(jsval);
 ` : ''}\
 PORF_NORETURN ${st}void porf_throw(jsval v) {
   porf_exception = v;
+#ifdef PORF_TRACE_THROW
+  // debugging: every throw, caught or not, with an Error's message
+  {
+    const i32 t = porf_jv_type(v);
+    const char* text = "";
+    i32 len = 0;
+    if (t >= ${TYPES.error} && t <= ${TYPES.urierror} && (u32)v.val) {
+      const jsval m = porf_unpack(*(jsbits*)(MEM + (u32)v.val));
+      if (porf_jv_type(m) == ${TYPES.bytestring} && (u32)m.val) { len = (i32)*(u32*)(MEM + (u32)m.val); text = (const char*)(MEM + (u32)m.val + 4); }
+    }
+    fprintf(stderr, "porffor: throw (type %d, try depth %d) %.*s\\n", t, porf_try_depth, len, text);
+  }
+#endif
   if (porf_try_depth > 0) _longjmp(porf_try_data[porf_try_depth - 1], 1);
 ${toStr ? `
   static i32 _uncaught_busy = 0;
@@ -4070,6 +4576,10 @@ PORF_NORETURN ${st}void porf_throw_new(i32 errType, u32 msgId) {
 // TypeError for calling something that is not a function, naming what it was
 // ("undefined is not a function"): the dynamic call site has no source text for it
 PORF_NORETURN ${st}void porf_throw_not_callable(jsval fn) {
+#ifdef PORF_TRAP_NOT_CALLABLE
+  // debugging: stop here, so the host shows where (a backtrace), instead of throwing
+  __builtin_trap();
+#endif
   const i32 t = porf_jv_type(fn);
   const char* what = t == ${TYPES.undefined} ? "undefined"
     : t == ${TYPES.object} && (u32)fn.val == 0 ? "null"
@@ -4282,10 +4792,14 @@ ${st}jsval porf_num_to_str(f64 d) {
 // ToString for + and template literals
 ${st}jsval porf_to_str(jsval v);
 ${st}jsval porf_str_concat(jsval a, jsval b);
+${bigintUsed ? `${st}jsval porf_bigint_to_str(jsval v, i32 radix);
+` : ''}\
 ${st}jsval porf_to_str(jsval v) {
   if (porf_jv_is_num(v)) return porf_num_to_str(v.val);
   const i32 t = v.type;
   if (t == ${TYPES.bytestring} || t == ${TYPES.string}) return v;
+${bigintUsed ? `  if (t == ${TYPES.bigint}) return porf_bigint_to_str(v, 10);
+` : ''}\
   if (t == ${TYPES.array}) {
     // join(',')
     const u32 a = (u32)v.val;
@@ -4373,6 +4887,614 @@ static i32 porf_bigint_cmp(jsval a, jsval b) {
   return an ? -c : c;
 }
 
+// ---- BigInt arithmetic ----
+// A BigInt is inline (|n| < 2^41: the f64 payload is the value, and it packs into a
+// 42-bit field, see porf_pack) or on the heap (payload = ptr + 2^51): [u8 negative][u8 0]
+// [u16 digit count][u32 digits, most significant first].
+// Every operation reads its operands into little-endian u32 limbs in scratch memory (libc,
+// never the GC heap), computes there, and allocates once, for the result, which is
+// canonical: inline whenever it fits, so equal values have equal inline payloads.
+#define PORF_BN_HEAP 2251799813685248.0
+#define PORF_BN_SMALL 2199023255552.0
+#define PORF_BN_MAX_DIGITS 16383u
+
+PORF_NORETURN static void porf_bn_throw(i32 type, const char* msg) {
+  const u32 len = (u32)strlen(msg);
+  const u32 s = porf_bstr_new(len);
+  memcpy(MEM + s + 4, msg, len);
+  porf_throw_new(type, s);
+}
+
+static u32* porf_bn_scratch(u32 n) {
+  u32* p = (u32*)calloc(n ? n : 1u, 4);
+  if (!p) {
+    fputs("porffor: out of memory (BigInt)", stderr);
+    exit(1);
+  }
+  return p;
+}
+
+// how many limbs porf_bn_load writes for v
+static u32 porf_bn_cap(jsval v) {
+  return porf_bigint_is_heap(v) ? (u32)*(u16*)(MEM + porf_bigint_ptr(v) + 2) : 2u;
+}
+
+// v's magnitude into out (little-endian, porf_bn_cap(v) limbs) and its sign; the length
+// without leading zero limbs
+static u32 porf_bn_load(jsval v, u32* out, int* neg) {
+  if (!porf_bigint_is_heap(v)) {
+    const f64 d = v.val;
+    const u64 m = (u64)(d < 0 ? -d : d);
+    *neg = d < 0;
+    out[0] = (u32)m;
+    out[1] = (u32)(m >> 32);
+    return out[1] ? 2u : out[0] ? 1u : 0u;
+  }
+  const u32 p = porf_bigint_ptr(v);
+  const u32 len = *(u16*)(MEM + p + 2);
+  *neg = *(u8*)(MEM + p) != 0;
+  for (u32 i = 0; i < len; i++) out[i] = *(u32*)(MEM + p + 4 + ((len - 1 - i) << 2));
+  u32 n = len;
+  while (n > 0 && out[n - 1] == 0) n--;
+  return n;
+}
+
+// the BigInt with this sign and magnitude
+static jsval porf_bn_make(int neg, const u32* d, u32 n) {
+  while (n > 0 && d[n - 1] == 0) n--;
+  if (n == 0) return porf_box(0.0, ${TYPES.bigint});
+  if (n <= 2) {
+    const u64 m = (u64)d[0] | (n == 2 ? (u64)d[1] << 32 : 0ull);
+    if (m < 2199023255552ull) return porf_box(neg ? -(f64)m : (f64)m, ${TYPES.bigint});
+  }
+  if (n > PORF_BN_MAX_DIGITS) porf_bn_throw(${TYPES.rangeerror}, "Maximum BigInt size exceeded");
+  const u32 p = porf_alloc(4 + (n << 2), ${TYPES.bigint});
+  *(u8*)(MEM + p) = neg ? 1 : 0;
+  *(u8*)(MEM + p + 1) = 0;
+  *(u16*)(MEM + p + 2) = (u16)n;
+  for (u32 i = 0; i < n; i++) *(u32*)(MEM + p + 4 + (i << 2)) = d[n - 1 - i];
+  return porf_box((f64)p + PORF_BN_HEAP, ${TYPES.bigint});
+}
+
+static int porf_bn_cmp_mag(const u32* a, u32 an, const u32* b, u32 bn) {
+  if (an != bn) return an < bn ? -1 : 1;
+  for (u32 i = an; i-- > 0;)
+    if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
+  return 0;
+}
+
+// r = a + b; r has room for max(an, bn) + 1 limbs
+static u32 porf_bn_add_mag(u32* r, const u32* a, u32 an, const u32* b, u32 bn) {
+  if (an < bn) {
+    const u32* t = a; a = b; b = t;
+    const u32 tn = an; an = bn; bn = tn;
+  }
+  u64 c = 0;
+  for (u32 i = 0; i < an; i++) {
+    c += (u64)a[i] + (i < bn ? b[i] : 0u);
+    r[i] = (u32)c;
+    c >>= 32;
+  }
+  r[an] = (u32)c;
+  return an + 1;
+}
+
+// r = a - b, for a >= b; r has room for an limbs
+static u32 porf_bn_sub_mag(u32* r, const u32* a, u32 an, const u32* b, u32 bn) {
+  u64 borrow = 0;
+  for (u32 i = 0; i < an; i++) {
+    const u64 x = (u64)a[i] - (i < bn ? b[i] : 0u) - borrow;
+    r[i] = (u32)x;
+    borrow = (x >> 63) & 1u;
+  }
+  return an;
+}
+
+// r = a * b; r is zeroed and has room for an + bn limbs
+static u32 porf_bn_mul_mag(u32* r, const u32* a, u32 an, const u32* b, u32 bn) {
+  for (u32 i = 0; i < an; i++) {
+    u64 c = 0;
+    for (u32 j = 0; j < bn; j++) {
+      c += (u64)a[i] * b[j] + r[i + j];
+      r[i + j] = (u32)c;
+      c >>= 32;
+    }
+    r[i + bn] = (u32)c;
+  }
+  return an + bn;
+}
+
+// q = u / v and r = u % v (Knuth's algorithm D, after Hacker's Delight divmnu). v has
+// vn >= 1 limbs with v[vn - 1] != 0, and un >= vn; q has room for un - vn + 1 limbs and
+// r for vn.
+static void porf_bn_divmod_mag(u32* q, u32* r, const u32* u, u32 un, const u32* v, u32 vn) {
+  if (vn == 1) {
+    u64 rem = 0;
+    for (u32 i = un; i-- > 0;) {
+      const u64 cur = (rem << 32) | u[i];
+      q[i] = (u32)(cur / v[0]);
+      rem = cur % v[0];
+    }
+    r[0] = (u32)rem;
+    return;
+  }
+  const int s = __builtin_clz(v[vn - 1]);
+  u32* vs = porf_bn_scratch(vn);
+  u32* us = porf_bn_scratch(un + 1);
+  for (u32 i = vn - 1; i > 0; i--) vs[i] = (v[i] << s) | (s ? v[i - 1] >> (32 - s) : 0u);
+  vs[0] = v[0] << s;
+  us[un] = s ? u[un - 1] >> (32 - s) : 0u;
+  for (u32 i = un - 1; i > 0; i--) us[i] = (u[i] << s) | (s ? u[i - 1] >> (32 - s) : 0u);
+  us[0] = u[0] << s;
+
+  for (i64 j = (i64)un - (i64)vn; j >= 0; j--) {
+    const u64 num = ((u64)us[j + vn] << 32) | us[j + vn - 1];
+    u64 qhat = num / vs[vn - 1];
+    u64 rhat = num % vs[vn - 1];
+    while (qhat >= 4294967296ull || qhat * vs[vn - 2] > ((rhat << 32) | us[j + vn - 2])) {
+      qhat--;
+      rhat += vs[vn - 1];
+      if (rhat >= 4294967296ull) break;
+    }
+    i64 k = 0, t;
+    for (u32 i = 0; i < vn; i++) {
+      const u64 p = qhat * vs[i];
+      t = (i64)us[i + j] - k - (i64)(p & 0xFFFFFFFFull);
+      us[i + j] = (u32)t;
+      k = (i64)(p >> 32) - (t >> 32);
+    }
+    t = (i64)us[j + vn] - k;
+    us[j + vn] = (u32)t;
+    q[j] = (u32)qhat;
+    if (t < 0) {
+      q[j]--;
+      k = 0;
+      for (u32 i = 0; i < vn; i++) {
+        t = (i64)us[i + j] + vs[i] + k;
+        us[i + j] = (u32)t;
+        k = t >> 32;
+      }
+      us[j + vn] += (u32)k;
+    }
+  }
+  for (u32 i = 0; i < vn - 1; i++) r[i] = (us[i] >> s) | (s ? (u32)((u64)us[i + 1] << (32 - s)) : 0u);
+  r[vn - 1] = us[vn - 1] >> s;
+  free(vs);
+  free(us);
+}
+
+// r = a << bits; r is zeroed and has room for an + bits / 32 + 1 limbs
+static u32 porf_bn_shl_mag(u32* r, const u32* a, u32 an, u32 bits) {
+  const u32 limbs = bits >> 5, s = bits & 31;
+  for (u32 i = 0; i < an; i++) {
+    r[i + limbs] |= a[i] << s;
+    if (s) r[i + limbs + 1] = a[i] >> (32 - s);
+  }
+  return an + limbs + 1;
+}
+
+// r = a >> bits (truncating); *lost is whether any 1 bits were shifted out
+static u32 porf_bn_shr_mag(u32* r, const u32* a, u32 an, u64 bits, int* lost) {
+  const u64 limbs = bits >> 5;
+  const u32 s = (u32)(bits & 31);
+  *lost = 0;
+  for (u64 i = 0; i < limbs && i < an; i++)
+    if (a[i]) *lost = 1;
+  if (limbs >= an) return 0;
+  if (s && (a[limbs] << (32 - s))) *lost = 1;
+  const u32 n = an - (u32)limbs;
+  for (u32 i = 0; i < n; i++) {
+    const u32 lo = a[i + limbs] >> s;
+    const u32 hi = s && i + 1 < n ? a[i + limbs + 1] << (32 - s) : 0u;
+    r[i] = lo | hi;
+  }
+  return n;
+}
+
+// the value as n limbs of two's complement
+static void porf_bn_to_twos(u32* out, u32 n, const u32* mag, u32 mn, int neg) {
+  if (!neg) {
+    for (u32 i = 0; i < n; i++) out[i] = i < mn ? mag[i] : 0u;
+    return;
+  }
+  u64 borrow = 1;
+  for (u32 i = 0; i < n; i++) {
+    const u64 x = (u64)(i < mn ? mag[i] : 0u) - borrow;
+    borrow = (x >> 63) & 1u;
+    out[i] = ~(u32)x;
+  }
+}
+
+// the BigInt n limbs of two's complement hold (t is overwritten)
+static jsval porf_bn_from_twos(u32* t, u32 n) {
+  if (n == 0 || !(t[n - 1] >> 31)) return porf_bn_make(0, t, n);
+  u64 c = 1;
+  for (u32 i = 0; i < n; i++) {
+    c += (u64)(u32)~t[i];
+    t[i] = (u32)c;
+    c >>= 32;
+  }
+  return porf_bn_make(1, t, n);
+}
+
+static u32 porf_bn_bitlen(const u32* a, u32 an) {
+  return an == 0 ? 0u : (an - 1) * 32u + (32u - (u32)__builtin_clz(a[an - 1]));
+}
+
+// the value of a finite, integral f64 as a BigInt
+${st}jsval porf_bigint_from_f64(f64 d) {
+  if ((d < 0 ? -d : d) < PORF_BN_SMALL) return porf_box(d == 0 ? 0.0 : d, ${TYPES.bigint});
+  u64 bits;
+  memcpy(&bits, &d, 8);
+  const int neg = (int)(bits >> 63);
+  const i32 exp = (i32)((bits >> 52) & 0x7ff) - 1075;
+  const u64 mant = (bits & 0xFFFFFFFFFFFFFull) | 0x10000000000000ull;
+  const u32 m[2] = { (u32)mant, (u32)(mant >> 32) };
+  if (exp <= 0) {
+    const u64 v = mant >> (u32)-exp;
+    const u32 w[2] = { (u32)v, (u32)(v >> 32) };
+    return porf_bn_make(neg, w, 2);
+  }
+  const u32 cap = 2 + ((u32)exp >> 5) + 1;
+  u32* r = porf_bn_scratch(cap);
+  porf_bn_shl_mag(r, m, 2, (u32)exp);
+  const jsval out = porf_bn_make(neg, r, cap);
+  free(r);
+  return out;
+}
+
+static f64 porf_bn_pow2(i32 k) {
+  f64 r = 1.0;
+  while (k > 0) {
+    const i32 step = k > 1000 ? 1000 : k;
+    const u64 b = (u64)(1023 + step) << 52;
+    f64 f;
+    memcpy(&f, &b, 8);
+    r *= f;
+    k -= step;
+  }
+  return r;
+}
+
+// Number(v): the nearest f64, ties to even
+${st}f64 porf_bigint_to_f64(jsval v) {
+  if (!porf_bigint_is_heap(v)) return v.val;
+  const u32 cap = porf_bn_cap(v);
+  u32* a = porf_bn_scratch(cap);
+  int neg;
+  const u32 an = porf_bn_load(v, a, &neg);
+  const u32 bitlen = porf_bn_bitlen(a, an);
+  f64 out;
+  if (bitlen <= 64) out = (f64)((u64)a[0] | (an > 1 ? (u64)a[1] << 32 : 0ull));
+  else {
+    // the top 64 bits, the rest folded into the lowest as a sticky bit, then scaled
+    const u32 shift = bitlen - 64;
+    int lost;
+    u32* t = porf_bn_scratch(an);
+    porf_bn_shr_mag(t, a, an, shift, &lost);
+    const u64 top = ((u64)t[0] | (u64)t[1] << 32) | (u64)(lost != 0);
+    free(t);
+    out = (f64)top * porf_bn_pow2((i32)shift);
+  }
+  free(a);
+  return neg ? -out : out;
+}
+
+// a op b for two BigInts; op: 0 + 1 - 2 * 3 / 4 % 5 ** 6 & 7 | 8 ^ 9 << 10 >> 11 >>>
+${st}jsval porf_bigint_arith(i32 op, jsval a, jsval b) {
+  if (porf_jv_type(a) != ${TYPES.bigint} || porf_jv_type(b) != ${TYPES.bigint})
+    porf_bn_throw(${TYPES.typeerror}, "Cannot mix BigInt and other types, use explicit conversions");
+  if (op == 11) porf_bn_throw(${TYPES.typeerror}, "BigInts have no unsigned right shift, use >> instead");
+
+  // both inline and the result exact: no limbs
+  if (!porf_bigint_is_heap(a) && !porf_bigint_is_heap(b) && op <= 2) {
+    const f64 r = op == 0 ? a.val + b.val : op == 1 ? a.val - b.val : a.val * b.val;
+    if ((r < 0 ? -r : r) < PORF_BN_SMALL) return porf_box(r == 0 ? 0.0 : r, ${TYPES.bigint});
+  }
+
+  const u32 acap = porf_bn_cap(a), bcap = porf_bn_cap(b);
+  u32* x = porf_bn_scratch(acap);
+  u32* y = porf_bn_scratch(bcap);
+  int xneg, yneg;
+  const u32 xn = porf_bn_load(a, x, &xneg);
+  const u32 yn = porf_bn_load(b, y, &yneg);
+  jsval out = porf_box(0.0, ${TYPES.bigint});
+
+  if (op == 0 || op == 1) {
+    // a - b is a + (-b)
+    if (op == 1) yneg = !yneg;
+    const u32 cap = (xn > yn ? xn : yn) + 1;
+    u32* r = porf_bn_scratch(cap);
+    if (xneg == yneg) out = porf_bn_make(xneg, r, porf_bn_add_mag(r, x, xn, y, yn));
+    else if (porf_bn_cmp_mag(x, xn, y, yn) >= 0) out = porf_bn_make(xneg, r, porf_bn_sub_mag(r, x, xn, y, yn));
+    else out = porf_bn_make(yneg, r, porf_bn_sub_mag(r, y, yn, x, xn));
+    free(r);
+  } else if (op == 2) {
+    u32* r = porf_bn_scratch(xn + yn);
+    out = porf_bn_make(xneg != yneg, r, porf_bn_mul_mag(r, x, xn, y, yn));
+    free(r);
+  } else if (op == 3 || op == 4) {
+    if (yn == 0) porf_bn_throw(${TYPES.rangeerror}, "Division by zero");
+    if (porf_bn_cmp_mag(x, xn, y, yn) < 0) out = op == 3 ? porf_box(0.0, ${TYPES.bigint}) : a;
+    else {
+      u32* q = porf_bn_scratch(xn - yn + 1);
+      u32* r = porf_bn_scratch(yn);
+      porf_bn_divmod_mag(q, r, x, xn, y, yn);
+      // truncating: the quotient's sign is the signs' xor, the remainder's the dividend's
+      out = op == 3 ? porf_bn_make(xneg != yneg, q, xn - yn + 1) : porf_bn_make(xneg, r, yn);
+      free(q);
+      free(r);
+    }
+  } else if (op == 5) {
+    if (yneg) porf_bn_throw(${TYPES.rangeerror}, "Exponent must be non-negative");
+    if (yn == 0) out = porf_box(1.0, ${TYPES.bigint});
+    else if (xn == 0) out = porf_box(0.0, ${TYPES.bigint});
+    else if (xn == 1 && x[0] == 1) out = porf_box(xneg && (y[0] & 1) ? -1.0 : 1.0, ${TYPES.bigint});
+    else {
+      if (yn > 1 || (u64)porf_bn_bitlen(x, xn) * y[0] > (u64)PORF_BN_MAX_DIGITS * 32u)
+        porf_bn_throw(${TYPES.rangeerror}, "Maximum BigInt size exceeded");
+      // square and multiply; no intermediate is longer than twice the result
+      const u32 cap = (u32)(((u64)porf_bn_bitlen(x, xn) * y[0]) >> 5) * 2 + 4;
+      u32* acc = porf_bn_scratch(cap);
+      u32* base = porf_bn_scratch(cap);
+      u32* tmp = porf_bn_scratch(cap);
+      u32 accn = 1, basen = xn;
+      acc[0] = 1;
+      memcpy(base, x, xn * 4);
+      for (u32 e = y[0];;) {
+        if (e & 1) {
+          memset(tmp, 0, (accn + basen) * 4);
+          accn = porf_bn_mul_mag(tmp, acc, accn, base, basen);
+          while (accn > 0 && tmp[accn - 1] == 0) accn--;
+          memcpy(acc, tmp, accn * 4);
+        }
+        e >>= 1;
+        if (!e) break;
+        memset(tmp, 0, basen * 2 * 4);
+        basen = porf_bn_mul_mag(tmp, base, basen, base, basen);
+        while (basen > 0 && tmp[basen - 1] == 0) basen--;
+        memcpy(base, tmp, basen * 4);
+      }
+      out = porf_bn_make(xneg && (y[0] & 1), acc, accn);
+      free(acc);
+      free(base);
+      free(tmp);
+    }
+  } else if (op >= 6 && op <= 8) {
+    const u32 n = (xn > yn ? xn : yn) + 1;
+    u32* s = porf_bn_scratch(n);
+    u32* t = porf_bn_scratch(n);
+    porf_bn_to_twos(s, n, x, xn, xneg);
+    porf_bn_to_twos(t, n, y, yn, yneg);
+    for (u32 i = 0; i < n; i++) s[i] = op == 6 ? s[i] & t[i] : op == 7 ? s[i] | t[i] : s[i] ^ t[i];
+    out = porf_bn_from_twos(s, n);
+    free(s);
+    free(t);
+  } else if (op == 9 || op == 10) {
+    // a negative count shifts the other way
+    const int left = (op == 9) != (yneg != 0);
+    if (xn == 0) out = porf_box(0.0, ${TYPES.bigint});
+    else if (left) {
+      if (yn > 1 || y[0] > PORF_BN_MAX_DIGITS * 32u) porf_bn_throw(${TYPES.rangeerror}, "Maximum BigInt size exceeded");
+      const u32 cap = xn + (y[0] >> 5) + 1;
+      u32* r = porf_bn_scratch(cap);
+      out = porf_bn_make(xneg, r, porf_bn_shl_mag(r, x, xn, y[0]));
+      free(r);
+    } else {
+      // rounds toward -infinity: a negative value that lost bits is one further from zero
+      const u64 count = yn > 2 ? ~0ull : (u64)y[0] | (yn > 1 ? (u64)y[1] << 32 : 0ull);
+      u32* r = porf_bn_scratch(xn + 1);
+      int lost;
+      u32 n = porf_bn_shr_mag(r, x, xn, count, &lost);
+      if (xneg && lost) {
+        const u32 one = 1;
+        u32* s = porf_bn_scratch(n + 1);
+        n = porf_bn_add_mag(s, r, n, &one, 1);
+        free(r);
+        r = s;
+      }
+      out = porf_bn_make(xneg, r, n);
+      free(r);
+    }
+  }
+  free(x);
+  free(y);
+  return out;
+}
+
+${st}jsval porf_bigint_neg(jsval a) {
+  if (!porf_bigint_is_heap(a)) return porf_box(a.val == 0 ? 0.0 : -a.val, ${TYPES.bigint});
+  const u32 cap = porf_bn_cap(a);
+  u32* x = porf_bn_scratch(cap);
+  int neg;
+  const u32 n = porf_bn_load(a, x, &neg);
+  const jsval out = porf_bn_make(!neg, x, n);
+  free(x);
+  return out;
+}
+
+// ~a is -a - 1
+${st}jsval porf_bigint_not(jsval a) {
+  return porf_bigint_arith(1, porf_bigint_neg(a), porf_box(1.0, ${TYPES.bigint}));
+}
+
+// BigInt.asIntN (sign) / asUintN (!sign): v modulo 2^bits
+${st}jsval porf_bigint_as_n(jsval v, f64 bitsf, i32 sign) {
+  if (bitsf == 0) return porf_box(0.0, ${TYPES.bigint});
+  const u32 cap = porf_bn_cap(v);
+  u32* x = porf_bn_scratch(cap);
+  int neg;
+  const u32 xn = porf_bn_load(v, x, &neg);
+  const u32 bitlen = porf_bn_bitlen(x, xn);
+  // already in range: unchanged
+  if ((sign && bitsf > (f64)bitlen) || (!sign && !neg && bitsf >= (f64)bitlen)) {
+    free(x);
+    return v;
+  }
+  if (bitsf > (f64)PORF_BN_MAX_DIGITS * 32.0) porf_bn_throw(${TYPES.rangeerror}, "Maximum BigInt size exceeded");
+  const u32 bits = (u32)bitsf;
+  const u32 k = (bits + 31) >> 5;
+  const u32 n = (xn > k ? xn : k) + 1;
+  u32* t = porf_bn_scratch(n);
+  porf_bn_to_twos(t, n, x, xn, neg);
+  // keep the low bits
+  const u32 top = bits & 31;
+  if (top) t[k - 1] &= (1u << top) - 1u;
+  jsval out;
+  if (sign && ((t[k - 1] >> ((bits - 1) & 31)) & 1u)) {
+    // the top kept bit is set: negative, sign-extended over the limb
+    if (top) t[k - 1] |= ~((1u << top) - 1u);
+    out = porf_bn_from_twos(t, k);
+  } else out = porf_bn_make(0, t, k);
+  free(t);
+  free(x);
+  return out;
+}
+
+static int porf_bn_is_space(u32 c) {
+  return c == 9 || c == 10 || c == 11 || c == 12 || c == 13 || c == 32 || c == 0xA0 || c == 0x1680 ||
+    (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F ||
+    c == 0x3000 || c == 0xFEFF;
+}
+
+// StringToBigInt (literal = 0), or a source literal's digits (literal = 1: a sign may come
+// before a radix prefix, nothing is trimmed): the BigInt, or undefined when s is not one
+${st}jsval porf_bigint_parse(jsval s, i32 literal) {
+  const u32 p = (u32)s.val;
+  const u32 len = *(u32*)(MEM + p);
+  const int wide = porf_jv_type(s) == ${TYPES.string};
+#define PORF_BN_CH(i) (wide ? (u32)*(u16*)(MEM + p + 4 + ((i) << 1)) : (u32)*(u8*)(MEM + p + 4 + (i)))
+  u32 i = 0, end = len;
+  if (!literal) {
+    while (i < end && porf_bn_is_space(PORF_BN_CH(i))) i++;
+    while (end > i && porf_bn_is_space(PORF_BN_CH(end - 1))) end--;
+    if (i == end) return porf_box(0.0, ${TYPES.bigint});
+  }
+  int neg = 0, signed_ = 0;
+  if (i < end && (PORF_BN_CH(i) == '-' || PORF_BN_CH(i) == '+')) {
+    neg = PORF_BN_CH(i) == '-';
+    signed_ = 1;
+    i++;
+  }
+  u32 radix = 10;
+  if (end - i >= 2 && PORF_BN_CH(i) == '0') {
+    const u32 c = PORF_BN_CH(i + 1) | 0x20;
+    radix = c == 'x' ? 16 : c == 'o' ? 8 : c == 'b' ? 2 : 10;
+    if (radix != 10) {
+      // StringToBigInt takes no sign before a radix prefix
+      if (signed_ && !literal) return JV_UNDEFINED;
+      i += 2;
+    }
+  }
+  if (i == end) return JV_UNDEFINED;
+  u32* r = porf_bn_scratch(end - i + 1);
+  u32 n = 0;
+  for (; i < end; i++) {
+    const u32 c = PORF_BN_CH(i);
+    u32 digit = c >= '0' && c <= '9' ? c - '0' : (c | 0x20) >= 'a' && (c | 0x20) <= 'z' ? (c | 0x20) - 'a' + 10 : 99;
+    if (digit >= radix) {
+      free(r);
+      return JV_UNDEFINED;
+    }
+    u64 carry = digit;
+    for (u32 j = 0; j < n; j++) {
+      carry += (u64)r[j] * radix;
+      r[j] = (u32)carry;
+      carry >>= 32;
+    }
+    if (carry) r[n++] = (u32)carry;
+  }
+#undef PORF_BN_CH
+  const jsval out = porf_bn_make(neg, r, n);
+  free(r);
+  return out;
+}
+
+// v in radix 2..36, as a bytestring
+${st}jsval porf_bigint_to_str(jsval v, i32 radix) {
+  const u32 cap = porf_bn_cap(v);
+  u32* x = porf_bn_scratch(cap);
+  int neg;
+  u32 n = porf_bn_load(v, x, &neg);
+  // the most digits of radix whose power fits in 2^21, so rem * 2^32 + limb stays exact in u64
+  u32 chunk = radix, per = 1;
+  while ((u64)chunk * radix < 2097152ull) {
+    chunk *= radix;
+    per++;
+  }
+  const u32 max = n * 32 + 2;
+  char* out = (char*)malloc(max);
+  u32 len = 0;
+  static const char digits[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+  if (n == 0) out[len++] = '0';
+  while (n > 0) {
+    u64 rem = 0;
+    for (u32 i = n; i-- > 0;) {
+      const u64 cur = (rem << 32) | x[i];
+      x[i] = (u32)(cur / chunk);
+      rem = cur % chunk;
+    }
+    while (n > 0 && x[n - 1] == 0) n--;
+    // this chunk's digits, least significant first; zero-padded unless it is the last
+    for (u32 d = 0; d < per && (n > 0 || rem > 0); d++) {
+      out[len++] = digits[rem % radix];
+      rem /= radix;
+    }
+  }
+  if (neg) out[len++] = '-';
+  const u32 s = porf_bstr_new(len);
+  for (u32 i = 0; i < len; i++) *(u8*)(MEM + s + 4 + i) = (u8)out[len - 1 - i];
+  free(out);
+  free(x);
+  return porf_box((f64)s, ${TYPES.bytestring});
+}
+
+// a hash of v's value (equal BigInts hash equal, whichever representation)
+${st}i32 porf_bigint_hash(jsval v) {
+  const u32 cap = porf_bn_cap(v);
+  u32* x = porf_bn_scratch(cap);
+  int neg;
+  const u32 n = porf_bn_load(v, x, &neg);
+  u32 h = neg ? 0x9e3779b9u : 0x85ebca6bu;
+  for (u32 i = 0; i < n; i++) {
+    h ^= x[i];
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+  }
+  free(x);
+  return (i32)h;
+}
+
+// BigInt a against Number y: -1/0/1, 2 when y is NaN
+static i32 porf_bigint_cmp_num(jsval a, f64 y) {
+  if (y != y) return 2;
+  if (!porf_bigint_is_heap(a)) return a.val < y ? -1 : a.val > y ? 1 : 0;
+  if (y - y != 0) return y > 0 ? -1 : 1; // infinite
+  // y's integral part: from 2^52 up every f64 is integral
+  const f64 whole = (y < 0 ? -y : y) >= 4503599627370496.0 ? y : (f64)(i64)y;
+  const i32 c = porf_bigint_cmp(a, porf_bigint_from_f64(whole));
+  if (c != 0) return c;
+  return y > whole ? -1 : y < whole ? 1 : 0;
+}
+
+// a BigInt and something else compared by value (a relational or ==): -1/0/1, 2 unordered
+static i32 porf_bigint_cmp_any(jsval big, jsval other) {
+  const i32 t = porf_jv_type(other);
+  if (t == ${TYPES.bigint}) return porf_bigint_cmp(big, other);
+  if (t == ${TYPES.bytestring} || t == ${TYPES.string}) {
+    const jsval parsed = porf_bigint_parse(other, 0);
+    if (porf_jv_type(parsed) != ${TYPES.bigint}) return 2;
+    return porf_bigint_cmp(big, parsed);
+  }
+  return porf_bigint_cmp_num(big, porf_to_num(other));
+}
+
+// ++ / -- on a numeric value (a Number or a BigInt)
+${st}jsval porf_numeric_step(jsval v, i32 dec) {
+  if (porf_jv_type(v) == ${TYPES.bigint}) return porf_bigint_arith(dec ? 1 : 0, v, porf_box(1.0, ${TYPES.bigint}));
+  return porf_box_num(v.val + (dec ? -1.0 : 1.0));
+}
+
 ${sti}int porf_is_strlike(jsval v) {
   if (porf_jv_is_num(v)) return 0;
   const i32 t = v.type;
@@ -4391,6 +5513,8 @@ ${sti}jsval porf_add(jsval a, jsval b) {
     (void)keep_sa;
     return porf_str_concat(sa, sb);
   }
+${bigintUsed ? `  if (a.type == ${TYPES.bigint} || b.type == ${TYPES.bigint}) return porf_bigint_arith(0, a, b);
+` : ''}\
   return porf_box_num(porf_to_num(a) + porf_to_num(b));
 }
 
@@ -4414,7 +5538,12 @@ ${sti}jsval porf_div(jsval a, jsval b) {
 // twin helper: dies when string.ts/coercion builtins port (step 3).
 ${sti}i32 porf_cmp(jsval a, jsval b) {
   const i32 ta = porf_jv_type(a), tb = porf_jv_type(b);
-  if (ta == ${TYPES.bigint} && tb == ${TYPES.bigint}) return porf_bigint_cmp(a, b);
+${bigintUsed ? `  if (ta == ${TYPES.bigint}) return porf_bigint_cmp_any(a, b);
+  if (tb == ${TYPES.bigint}) {
+    const i32 c = porf_bigint_cmp_any(b, a);
+    return c == 2 ? 2 : -c;
+  }
+` : ''}\
   if ((ta == ${TYPES.bytestring} || ta == ${TYPES.string}) && (tb == ${TYPES.bytestring} || tb == ${TYPES.string})) {
     const u32 pa = (u32)a.val, pb = (u32)b.val;
     const u32 la = *(u32*)(MEM + pa), lb = *(u32*)(MEM + pb);
@@ -4436,6 +5565,14 @@ ${sti}i32 porf_loose_eq(jsval a, jsval b) {
   const int an = ta == ${TYPES.undefined} || (ta == ${TYPES.object} && (u32)a.val == 0);
   const int bn = tb == ${TYPES.undefined} || (tb == ${TYPES.object} && (u32)b.val == 0);
   if (an || bn) return an && bn;
+${bigintUsed ? `  if (ta == ${TYPES.bigint} || tb == ${TYPES.bigint}) {
+    // by value against a BigInt, Number, Boolean or String; an object never equals one here
+    const jsval big = ta == ${TYPES.bigint} ? a : b, other = ta == ${TYPES.bigint} ? b : a;
+    const i32 to = porf_jv_type(other);
+    if (to != ${TYPES.bigint} && to != ${TYPES.number} && to != ${TYPES.boolean} && to != ${TYPES.bytestring} && to != ${TYPES.string}) return 0;
+    return porf_bigint_cmp_any(big, other) == 0;
+  }
+` : ''}\
   if ((ta == ${TYPES.bytestring} || ta == ${TYPES.string}) && (tb == ${TYPES.bytestring} || tb == ${TYPES.string}))
     return porf_str_eq(a, b);
   if ((ta == ${TYPES.bytestring} || ta == ${TYPES.string}) && tb == ${TYPES.number})
@@ -4453,6 +5590,8 @@ ${sti}i32 porf_strict_eq(jsval a, jsval b) {
   const i32 ta = porf_jv_type(a), tb = porf_jv_type(b);
   if ((ta == ${TYPES.bytestring} || ta == ${TYPES.string}) && (tb == ${TYPES.bytestring} || tb == ${TYPES.string})) return porf_str_eq(a, b);
   if (ta != tb) return 0;
+${bigintUsed ? `  if (ta == ${TYPES.bigint}) return porf_bigint_cmp(a, b) == 0;
+` : ''}\
   return (u32)a.val == (u32)b.val;
 }
 
@@ -4473,6 +5612,22 @@ const CORO_RUNTIME = () => `// ---- coroutines (fiber stacks) ----
 // cooperative thread (the host switches) with its own shadow stack
 #define PORF_CORO_USE_P3 1
 #define PORF_CORO_USE_UCONTEXT 0
+#elif defined(__wasi__)
+// WASI before P3: wasm cannot switch C stacks and there are no threads to switch to. The
+// ucontext path compiles against these stand-ins, so a program whose coroutines never run
+// (the iterator helpers reference them) builds; starting one aborts with this message.
+#define PORF_CORO_USE_P3 0
+#define PORF_CORO_USE_UCONTEXT 1
+typedef struct { void* ss_sp; size_t ss_size; } porf_no_stack_t;
+typedef struct porf_no_ucontext { porf_no_stack_t uc_stack; struct porf_no_ucontext* uc_link; } ucontext_t;
+static void porf_no_coroutines(void) {
+  fputs("porffor: generators and awaits need coroutines, which on wasm need WASI P3 (target wasm32-wasip3)\\n", stderr);
+  abort();
+}
+static int getcontext(ucontext_t* c) { (void)c; porf_no_coroutines(); return -1; }
+static void makecontext(ucontext_t* c, void (*fn)(void), int argc, ...) { (void)c; (void)fn; (void)argc; porf_no_coroutines(); }
+static int swapcontext(ucontext_t* a, const ucontext_t* b) { (void)a; (void)b; porf_no_coroutines(); return -1; }
+static int setcontext(const ucontext_t* c) { (void)c; porf_no_coroutines(); return -1; }
 #elif defined(__TINYC__) || (!defined(__x86_64__) && !defined(__aarch64__))
 #define PORF_CORO_USE_P3 0
 #define PORF_CORO_USE_UCONTEXT 1
@@ -4494,12 +5649,35 @@ extern void porf_p3_thread_resume_later(u32 thread);
 // the stack pointer is per thread on P3, behind these linker-made accessors; a new
 // thread starts without one
 extern void __wasm_set_stack_pointer(void* sp);
+// so is the TLS base (wasi-libc's errno, stdio's stream state, ...). Coroutines are
+// cooperative, never running at once, so they share their creator's TLS as native
+// coroutines share their thread's; a thread left without one reads TLS from address 0
+extern void __wasm_set_tls_base(void* base);
+extern void* __wasm_get_tls_base(void);
+static void* porf_coro_p3_tls = NULL;
+#ifdef PORF_CORO_TRACE
+#define PORF_CT(what, c, t) fprintf(stderr, "[coro] %s c=%p tid=%u caller=%u on=%u\\n", what, (void*)(c), (unsigned)(c)->tid, (unsigned)(t), (unsigned)porf_p3_thread_index())
+#else
+#define PORF_CT(what, c, t) ((void)0)
+#endif
 #endif
 
 #ifndef PORF_CORO_STACK_SIZE
+#if PORF_CORO_USE_P3
+// no guard page under P3: an overflow overwrites memory before the canary is checked,
+// so room for deep recursion
+#define PORF_CORO_STACK_SIZE (1024u * 1024u)
+#else
 #define PORF_CORO_STACK_SIZE (256u * 1024u)
 #endif
+#endif
 #define PORF_CORO_P3_CANARY 0x504f5246434f524full // bottom-of-stack marker (P3: no guard page)
+// the region reserved under each P3 coroutine stack, which PORF_STACK_CHECK watches
+#if defined(__wasm__) && !defined(PORF_NO_STACK_CHECK)
+#define PORF_STACK_GUARD (64u * 1024u)
+#else
+#define PORF_STACK_GUARD 0u
+#endif
 #define PORF_CORO_MAX 16384
 
 typedef struct porf_coro {
@@ -4510,6 +5688,7 @@ typedef struct porf_coro {
   char* sp;               // saved stack pointer for GC while suspended
   char* caller_sp;        // inactive caller stack lower bound while running
   void* caller_stack_top;
+  u32 gc_walk;            // the collection that last walked it (porf_gc_mark_coro_roots)
 #if PORF_CORO_USE_UCONTEXT
   ucontext_t ctx;
   ucontext_t caller_ctx;
@@ -4519,6 +5698,8 @@ typedef struct porf_coro {
 #elif PORF_CORO_USE_P3
   u32 tid;                // this coroutine's thread
   u32 caller_tid;         // the thread that last started or resumed it
+  u32 caller_stack_limit; // the caller's stack limit and floor, restored when the coroutine
+  u32 caller_stack_floor; // yields back
   void (*fn)(void*);
   void* arg;
   i32 escaped;            // an exception left the body: rethrown on the caller's thread
@@ -4537,6 +5718,7 @@ typedef struct porf_coro {
 #endif
   jsval channel;          // value (or thrown exception) crossing the boundary
   i32 state;              // 0 idle, 1 running, 2 suspended, 3 done
+  i32 awaiting;           // suspended at an await (channel: the promise), not a yield
   i32 throw_pending;      // resume delivers channel as a throw at the await
   i32 entry_try_depth;    // porf_try_depth when the coroutine started
   i32 saved_try_depth;    // porf_try_depth at suspension
@@ -4559,10 +5741,35 @@ typedef struct porf_coro_call {
   i32 started;
   u32 box_body;
   i32 box_type;
+  i32 sl;                 // stackless: runs as sl_step over sl_frame, never on a stack of its own
+  void* sl_frame;
+  u32 sl_frame_size;
+  i32 (*sl_step)(struct porf_coro_call* call, jsval in, i32 is_throw);
 } porf_coro_call;
+
+// the call a stackless function's starter takes its frame for (set just before porf_invoke)
+static porf_coro_call* porf_sl_starting = 0;
+
+// a stackless await's operand as a promise: its own, or one fulfilled with it (every
+// await suspends, and resumes from a microtask, as the spec has it)
+static jsval porf_sl_promise(jsval v) {
+  if (porf_jv_type(v) == ${TYPES.promise}) return v;
+  const u32 p = porf_alloc(PORF_PROMISE_SIZE, ${TYPES.promise});
+  *(jsbits*)(MEM + p + PORF_PROMISE_RESULT) = porf_pack(v);
+  *(u32*)(MEM + p + PORF_PROMISE_FULFILL_HEAD) = 0;
+  *(u32*)(MEM + p + PORF_PROMISE_FULFILL_TAIL) = 0;
+  *(u32*)(MEM + p + PORF_PROMISE_REJECT_HEAD) = 0;
+  *(u32*)(MEM + p + PORF_PROMISE_REJECT_TAIL) = 0;
+  *(jsbits*)(MEM + p + PORF_PROMISE_PAYLOAD) = JV_UNDEFINED_BITS;
+  *(u8*)(MEM + p + PORF_PROMISE_STATE) = 1;
+  *(u8*)(MEM + p + PORF_PROMISE_FLAGS) = 0;
+  *(u8*)(MEM + p + PORF_PROMISE_HANDLED) = 0;
+  return porf_box((f64)p, ${TYPES.promise});
+}
 
 static porf_coro* porf_coro_cur = 0;
 #define PORF_CORO_RETURN porf_box(0.0, ${TYPES.__porffor_generator})
+static u32 porf_coro_gc_walk_epoch = 0;
 static porf_coro* porf_coro_live[PORF_CORO_MAX];
 static i32 porf_coro_live_len = 0;
 
@@ -4637,6 +5844,13 @@ static void porf_promise_attach_coro(jsval awaited, porf_coro_call* call, jsval 
   if (awaited.type != ${TYPES.promise}) porf_unreachable("coroutine awaited non-pending non-promise");
   const u32 p = (u32)awaited.val;
   *(u8*)(MEM + p + PORF_PROMISE_HANDLED) = 1;
+  // already settled (a stackless await always suspends): its reaction is queued now
+  const u8 state = *(u8*)(MEM + p + PORF_PROMISE_STATE);
+  if (state != 0) {
+    porf_promise_trigger_reactions(porf_promise_new_coro_reaction(call, out_promise, state == 2),
+      porf_unpack(*(jsbits*)(MEM + p + PORF_PROMISE_RESULT)));
+    return;
+  }
   porf_promise_append_raw_reaction(p, porf_promise_new_coro_reaction(call, out_promise, 0), 0);
   porf_promise_append_raw_reaction(p, porf_promise_new_coro_reaction(call, out_promise, 1), 1);
 }
@@ -4710,18 +5924,19 @@ static void porf_coro_stack_ensure(porf_coro* c) {
     return;
   }
 #if PORF_CORO_USE_P3
-  // no mprotect on WASI: a plain allocation, without a guard page
-  char* block = (char*)malloc((size_t)PORF_CORO_STACK_SIZE);
+  // no mprotect on WASI: a plain allocation, with a guard region below the stack that
+  // nothing else can be allocated in (PORF_STACK_CHECK traps on reaching it)
+  char* block = (char*)malloc((size_t)PORF_CORO_STACK_SIZE + PORF_STACK_GUARD);
   if (!block) {
     fprintf(stderr, "porffor: failed to allocate coroutine stack\\n");
     abort();
   }
   c->stack_map = block;
-  c->stack_map_size = (size_t)PORF_CORO_STACK_SIZE;
-  c->stack_lo = block;
-  c->stack_top = (char*)(((uintptr_t)block + (size_t)PORF_CORO_STACK_SIZE) & ~(uintptr_t)15u);
+  c->stack_map_size = (size_t)PORF_CORO_STACK_SIZE + PORF_STACK_GUARD;
+  c->stack_lo = block + PORF_STACK_GUARD;
+  c->stack_top = (char*)(((uintptr_t)c->stack_lo + (size_t)PORF_CORO_STACK_SIZE) & ~(uintptr_t)15u);
   c->sp = 0;
-  *(u64*)block = PORF_CORO_P3_CANARY;
+  *(u64*)c->stack_lo = PORF_CORO_P3_CANARY;
   return;
 #endif
   const size_t page = porf_coro_page_size();
@@ -4814,11 +6029,18 @@ static porf_coro_call* porf_coro_call_alloc(void) {
 
 static void porf_coro_call_free(porf_coro_call* call) {
   if (!call) return;
+#if defined(PORF_CORO_TRACE) && PORF_CORO_USE_P3
+  fprintf(stderr, "[coro] free c=%p tid=%u state=%d on=%u\\n", (void*)&call->coro, (unsigned)call->coro.tid, (int)call->coro.state, (unsigned)porf_p3_thread_index());
+#endif
   porf_coro_live_remove(&call->coro);
   porf_coro_stack_free(&call->coro);
   free(call->argv);
-  if (porf_coro_call_pool_len < PORF_CORO_CALL_POOL_MAX) porf_coro_call_pool[porf_coro_call_pool_len++] = call;
-    else free(call);
+  free(call->sl_frame);
+  if (porf_coro_call_pool_len < PORF_CORO_CALL_POOL_MAX) {
+    porf_coro_call_pool[porf_coro_call_pool_len++] = call;
+  } else {
+    free(call);
+  }
 }
 
 #if PORF_GC_ENABLED
@@ -4861,6 +6083,8 @@ static void porf_coro_gc_mark_call_fields(porf_coro_call* call, i32 mark_box) {
   porf_gc_mark_js(call->newtv.val, call->newtv.type);
   porf_gc_mark_js(call->result.val, call->result.type);
   porf_gc_mark_js(call->coro.channel.val, call->coro.channel.type);
+  // a stackless call's locals live in its frame: scanned as a stack would be
+  if (call->sl_frame) porf_coro_gc_scan_mem(call->sl_frame, (const char*)call->sl_frame + call->sl_frame_size);
   for (i32 i = 0; i < call->argc; i++) {
     const jsval v = porf_unpack(call->argv[i]);
     porf_gc_mark_js(v.val, v.type);
@@ -4929,6 +6153,7 @@ static void porf_coro_restore_caller(porf_coro* c) {
 // rethrown by porf_coro_enter/resume on the caller's side.
 __attribute__((noinline, used))
 void porf_coro_p3_run(porf_coro* c) {
+  __wasm_set_tls_base(porf_coro_p3_tls);
   const i32 depth = porf_try_depth++;
   if (_setjmp(porf_try_ensure()[depth]) == 0) {
     c->fn(c->arg);
@@ -4939,6 +6164,7 @@ void porf_coro_p3_run(porf_coro* c) {
   porf_try_depth = depth;
   c->state = 3;
   porf_coro_set_current_stack_top(c->caller_stack_top);
+  PORF_CT("finish", c, c->caller_tid);
   porf_p3_thread_resume_later(c->caller_tid); // the thread ends as this returns
 }
 
@@ -4951,7 +6177,16 @@ static void porf_coro_p3_check_stack(porf_coro* c) {
 }
 
 // on the caller's thread, around each switch into c: install c's try stack, then the caller's
+// room above the stack's bottom for the runtime's and libc's own (unchecked) frames
+#define PORF_STACK_MARGIN (16u * 1024u)
+
 static void porf_coro_p3_trys_in(porf_coro* c) {
+#if defined(__wasm__) && !defined(PORF_NO_STACK_CHECK)
+  c->caller_stack_limit = porf_stack_limit;
+  c->caller_stack_floor = porf_stack_floor;
+  porf_stack_limit = c->stack_lo ? (u32)(uintptr_t)c->stack_lo + PORF_STACK_MARGIN : 0;
+  porf_stack_floor = c->stack_lo ? (u32)(uintptr_t)c->stack_lo - PORF_STACK_GUARD : 0;
+#endif
   c->caller_try_data = porf_try_data;
   c->caller_try_cap = porf_try_cap;
   c->caller_try_depth = porf_try_depth;
@@ -4962,6 +6197,10 @@ static void porf_coro_p3_trys_in(porf_coro* c) {
 
 static void porf_coro_p3_trys_out(porf_coro* c) {
   porf_coro_p3_check_stack(c);
+#if defined(__wasm__) && !defined(PORF_NO_STACK_CHECK)
+  porf_stack_limit = c->caller_stack_limit;
+  porf_stack_floor = c->caller_stack_floor;
+#endif
   c->own_try_data = porf_try_data;
   c->own_try_cap = porf_try_cap;
   c->own_try_depth = porf_try_depth;
@@ -5073,7 +6312,9 @@ static int porf_coro_enter(porf_coro* c, void (*fn)(void*), void* arg) {
   c->own_try_depth = 0;
   c->caller_tid = porf_p3_thread_index();
   *(porf_coro**)(c->stack_top - 16) = c; // read by porf_coro_p3_start
+  porf_coro_p3_tls = __wasm_get_tls_base(); // adopted by porf_coro_p3_run
   c->tid = porf_p3_thread_new_indirect(porf_coro_p3_start, c->stack_top);
+  PORF_CT("enter", c, c->caller_tid);
   porf_coro_p3_trys_in(c);
   porf_p3_thread_suspend_then_resume(c->tid);
   porf_coro_p3_trys_out(c);
@@ -5108,6 +6349,7 @@ static jsval porf_coro_suspend(jsval out) {
 #elif PORF_CORO_USE_P3
   c->sp = porf_coro_read_sp();
   porf_coro_set_current_stack_top(c->caller_stack_top);
+  PORF_CT("suspend", c, c->caller_tid);
   porf_p3_thread_suspend_then_resume(c->caller_tid);
 #else
   if (_setjmp(c->resume_pt) == 0) {
@@ -5141,6 +6383,7 @@ static int porf_coro_resume_inner(porf_coro* c, jsval in, i32 is_throw) {
   if (swapcontext(&c->caller_ctx, &c->ctx) != 0) abort();
 #elif PORF_CORO_USE_P3
   c->caller_tid = porf_p3_thread_index();
+  PORF_CT("resume", c, c->caller_tid);
   porf_coro_p3_trys_in(c);
   porf_p3_thread_suspend_then_resume(c->tid);
   porf_coro_p3_trys_out(c);
@@ -5170,9 +6413,11 @@ static jsval porf_await(jsval v) {
   if (state == 1) return porf_unpack(*(jsbits*)(MEM + p + PORF_PROMISE_RESULT));
   if (state == 2) porf_throw(porf_unpack(*(jsbits*)(MEM + p + PORF_PROMISE_RESULT)));
 
+  porf_coro_cur->awaiting = 1;
   return porf_coro_suspend(v);
 }
 static jsval porf_yield(jsval v) {
+  if (porf_coro_cur) porf_coro_cur->awaiting = 0;
   return porf_coro_suspend(v);
 }
 

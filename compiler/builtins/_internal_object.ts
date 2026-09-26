@@ -552,6 +552,14 @@ export const __Porffor_object_get = (_obj: any, key: any): any => {
   }
 
   key = ecma262.ToPropertyKey(key);
+  // [Symbol.iterator] of the built-in iterables (their prototype objects carry no symbol
+  // keys), in a program that can name it at all
+  if (Porffor.comptime.flag`program.usesIterProtocol`) {
+    if (Porffor.type(key) == Porffor.TYPES.symbol) if (key === Symbol.iterator) {
+      const method: any = __Porffor_iter_builtinMethod(trueType);
+      if (method !== undefined) return method;
+    }
+  }
   if (trueType == Porffor.TYPES.array) {
     const index: i32 = __Porffor_array_propertyKeyIndex(key);
     if (index != -1) {

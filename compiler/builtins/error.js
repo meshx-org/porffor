@@ -6,7 +6,7 @@ export default () => {
     errors.push(name);
     out += `
 export const ${name} = function (
-  ${name === 'AggregateError' ? 'errors: any,' : ''} message: any
+  ${name === 'AggregateError' ? 'errors: any,' : ''} message: any, options: any
 ): ${name} {
   if (message === undefined) message = '';
     else message = ecma262.ToString(message);
@@ -20,6 +20,9 @@ export const ${name} = function (
 
   const obj: ${name} = Porffor.malloc(8);
   Porffor.IR.storeJv(obj, 0, message);
+
+  // InstallErrorCause: an options object with a cause gives the error its cause
+  if (Porffor.object.isObject(options)) if ('cause' in options) obj.cause = options.cause;
 
   // https://tc39.es/ecma262/multipage/fundamental-objects.html#sec-aggregate-error
   ${name === 'AggregateError' ? `

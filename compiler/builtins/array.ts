@@ -63,6 +63,29 @@ export const __Array_from = (arg: any, mapFn: any, thisArg: any = undefined): an
     return out;
   }
 
+  // an iterable (a Map, a generator, an object with [Symbol.iterator]) by the iterator protocol
+  // (a built-in iterator object is known by its __kind; [Symbol.iterator] is read only in a
+  // program that can name it)
+  let iterable: boolean = Porffor.fastOr(
+    Porffor.type(arg) == Porffor.TYPES.map,
+    Porffor.type(arg) == Porffor.TYPES.__porffor_generator
+  );
+  if (!iterable) if (Porffor.object.isObject(arg)) iterable = arg.__kind !== undefined;
+  if (Porffor.comptime.flag`program.usesIterProtocol`) {
+    if (!iterable) iterable = typeof arg[Symbol.iterator] === 'function';
+  }
+  if (iterable) {
+    let i: i32 = 0;
+    const mapping: boolean = Porffor.type(mapFn) != Porffor.TYPES.undefined;
+    if (mapping && Porffor.type(mapFn) != Porffor.TYPES.function) throw new TypeError('Called Array.from with a non-function mapFn');
+    for (const x of arg) {
+      out[i] = mapping ? mapFn.call(thisArg, x, i) : x;
+      i++;
+    }
+    out.length = i;
+    return out;
+  }
+
   if (__Porffor_object_isObject(arg)) {
     const obj: object = Porffor.type(arg) == Porffor.TYPES.object ? arg : __Porffor_object_underlying(arg);
     // check before i32 truncation: huge lengths saturate to exactly 2147483647
@@ -189,10 +212,10 @@ export const __Porffor_array_spread = (arr: any[], src: any) => {
 
   switch (Porffor.type(src)) {
     case Porffor.TYPES.set:
-      return __Porffor_array_spread(arr, Porffor.callThis(__Set_prototype_values, src));
+      return __Porffor_array_spread(arr, Porffor.callThis(__Porffor_set_valuesArray, src));
 
     case Porffor.TYPES.map:
-      return __Porffor_array_spread(arr, Porffor.callThis(__Map_prototype_entries, src));
+      return __Porffor_array_spread(arr, Porffor.callThis(__Porffor_map_entriesArray, src));
 
     case Porffor.TYPES.__porffor_generator:
       while (!Porffor.coroutine.resume(src, undefined, 0 as i32)) {
@@ -204,6 +227,42 @@ export const __Porffor_array_spread = (arr: any[], src: any) => {
 
     case Porffor.TYPES.__porffor_asyncgenerator:
       throw new TypeError('Cannot spread async generator');
+
+    // by code point: a surrogate pair is one element
+    case Porffor.TYPES.string: {
+      const units: i32 = src.length;
+      for (let i: i32 = 0; i < units; ) {
+        const ch: string = __Porffor_string_iterAt(src, i);
+        arr[len++] = ch;
+        i += ch.length;
+      }
+      return len;
+    }
+  }
+
+  // anything but an array, a typed array or a bytestring: the iterator protocol
+  const t: i32 = Porffor.type(src);
+  if (!Porffor.fastOr(
+    t == Porffor.TYPES.array,
+    t == Porffor.TYPES.bytestring,
+    Porffor.fastAnd(t >= Porffor.TYPES.uint8clampedarray, t <= Porffor.TYPES.float64array)
+  )) {
+    if (Porffor.comptime.flag`program.usesIterProtocol`) {
+      const rec: any = __Porffor_iter_open(src);
+      while (true) {
+        const v: any = __Porffor_iter_step(rec);
+        if (rec.done) break;
+        arr[len++] = v;
+      }
+    } else {
+      // a program that cannot make its own iterators: a built-in iterator object, or nothing
+      while (true) {
+        const v: any = __Porffor_iter_stepBuiltinOnly(src);
+        if (src.__done) break;
+        arr[len++] = v;
+      }
+    }
+    return len;
   }
 
   const srcLen: i32 = src.length;
@@ -1185,21 +1244,21 @@ export const __Porffor_array_fastPush = (arr: any[], el: any): i32 => {
 // keys/values/entries: array snapshots, the convention Map and Set follow here (not
 // lazy iterators, so spread, for-of and Array.from work but .next() does not). Holes
 // are indices and read as undefined, as the spec's array iterator would give them.
-export const __Array_prototype_keys = function (this: any[]) {
+export const __Porffor_array_keysArray = function (this: any[]) {
   const len: i32 = this.length;
   const out: any[] = Porffor.array.new(len);
   for (let i: i32 = 0; i < len; i++) Porffor.array.fastPush(out, i);
   return out;
 };
 
-export const __Array_prototype_values = function (this: any[]) {
+export const __Porffor_array_valuesArray = function (this: any[]) {
   const len: i32 = this.length;
   const out: any[] = Porffor.array.new(len);
   for (let i: i32 = 0; i < len; i++) Porffor.array.fastPush(out, this[i]);
   return out;
 };
 
-export const __Array_prototype_entries = function (this: any[]) {
+export const __Porffor_array_entriesArray = function (this: any[]) {
   const len: i32 = this.length;
   const out: any[] = Porffor.array.new(len);
   for (let i: i32 = 0; i < len; i++) {
@@ -1209,4 +1268,18 @@ export const __Array_prototype_entries = function (this: any[]) {
     Porffor.array.fastPush(out, entry);
   }
   return out;
+};
+
+// keys/values/entries/[Symbol.iterator]: iterators (iterator.ts) over the array, read as
+// they go (the *Array functions above are the snapshots the builtins use internally)
+export const __Array_prototype_keys = function (this: any[]) {
+  return __Porffor_iter_newKeys(this);
+};
+
+export const __Array_prototype_values = function (this: any[]) {
+  return __Porffor_iter_newValues(this);
+};
+
+export const __Array_prototype_entries = function (this: any[]) {
+  return __Porffor_iter_newEntries(this);
 };

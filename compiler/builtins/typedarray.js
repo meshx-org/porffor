@@ -133,6 +133,19 @@ export const __${name}_prototype_byteOffset$get = function (this: ${name}) {
   return Porffor.IR.loadI32(this, 8);
 };
 
+// keys/values/entries: iterators (iterator.ts) over the typed array, read as they go
+export const __${name}_prototype_keys = function (this: ${name}) {
+  return __Porffor_iter_newKeys(this);
+};
+
+export const __${name}_prototype_values = function (this: ${name}) {
+  return __Porffor_iter_newValues(this);
+};
+
+export const __${name}_prototype_entries = function (this: ${name}) {
+  return __Porffor_iter_newEntries(this);
+};
+
 export const __${name}_prototype_at = function (this: ${name}, index: any) {
   index = ecma262.ToIntegerOrInfinity(index);
 

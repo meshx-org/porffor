@@ -150,6 +150,9 @@ const undefinedCheckTarget = (left, right) => {
   if (right?.type === 'Identifier' && left?.type === 'Identifier' && left.name === 'undefined') return right;
 };
 
+// what -x, ~x or x++ gives for an operand of this type: a Number or a BigInt, else unknown
+const numericOf = type => type === TYPES.number || type === TYPES.bigint ? type : null;
+
 const storageExpressionType = node => {
   if (!node) return null;
   if (node._type != null) return typeof node._type === 'number' ? node._type : null;
@@ -172,10 +175,11 @@ const storageExpressionType = node => {
     if (node.operator === 'void') return TYPES.undefined;
     if (node.operator === 'delete') return TYPES.boolean;
     if (node.operator === 'typeof') return TYPES.bytestring;
-    return TYPES.number;
+    if (node.operator === '+' || !bigintPossible) return TYPES.number;
+    return numericOf(storageExpressionType(node.argument));
   }
 
-  if (node.type === 'UpdateExpression') return TYPES.number;
+  if (node.type === 'UpdateExpression') return bigintPossible ? numericOf(storageExpressionType(node.argument)) : TYPES.number;
 
   if (node.type === 'BinaryExpression' || node.type === 'LogicalExpression') {
     if (['==', '===', '!=', '!==', '>', '>=', '<', '<=', 'instanceof', 'in'].includes(node.operator)) return TYPES.boolean;
@@ -183,7 +187,8 @@ const storageExpressionType = node => {
 
     const l = storageExpressionType(node.left), r = storageExpressionType(node.right);
     if (l === TYPES.bigint || r === TYPES.bigint) return TYPES.bigint;
-    if (node.operator !== '+') return TYPES.number;
+    // a Number on either side makes a Number (a BigInt on the other throws)
+    if (node.operator !== '+') return !bigintPossible || node.operator === '>>>' || l === TYPES.number || r === TYPES.number ? TYPES.number : null;
     if (l === TYPES.number && r === TYPES.number) return TYPES.number;
     if (l === TYPES.string || r === TYPES.string) return TYPES.string;
     if (l === TYPES.bytestring && r === TYPES.bytestring) return TYPES.bytestring;
@@ -383,8 +388,9 @@ const analyzePattern = (kind, node) => {
       break;
 
     case 'ObjectPattern':
+      // each entry: a Property (its value is the pattern) or a RestElement (`...rest`)
       for (const x of node.properties) {
-        analyzePattern(kind, x.value);
+        analyzePattern(kind, x);
       }
       break;
 
@@ -751,10 +757,14 @@ const annotate = (node, parent = null, key = null) => {
 };
 
 let inEval = false, classFieldInitializerFunc = null;
+// the program can hold BigInts (parse.js): arithmetic on unknown types may give one
+let bigintPossible = false;
 const semantic = (node, _scopes = null) => {
   const oldScopes = scopes, oldInEval = inEval, oldClassFieldInitializerFunc = classFieldInitializerFunc;
   inEval = !!_scopes;
   classFieldInitializerFunc = null;
+  // an eval body keeps its program's answer; builtins are typed (as codegen has it)
+  if (!_scopes) bigintPossible = !globalThis.precompile && !!node._usesBigInt;
   if (!_scopes) {
     _scopes = [ node ];
     _scopes.lastFuncs = [ 0 ];

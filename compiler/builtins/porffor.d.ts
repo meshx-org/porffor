@@ -18,6 +18,7 @@ type PorfforGlobal = {
   coroutine: {
     resume(gen: any, value: any, mode: i32): boolean;
     value(gen: any): any;
+    awaiting(gen: any): boolean;
   }
 
   IR: {

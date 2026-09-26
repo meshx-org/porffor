@@ -68,6 +68,34 @@ export default (code, module = Prefs.module, opts = {}) => {
     return cg;
   }
 
+  // --units=N: a program that is one module (a bundle) is split over N units anyway: its
+  // functions spread over N C files, balanced by the size of their IR, so the C compiles
+  // in parallel and a change recompiles only the units it touches. (A module program's
+  // units are its source files.)
+  if ((!cg.units || cg.units.length === 1) && Prefs.units && Number(Prefs.units) > 1) {
+    const n = Number(Prefs.units);
+    // the one module's own unit (or 'main' for a script): its functions are spread
+    const base = cg.units?.[0]?.id ?? 'main';
+    const irSize = node => {
+      if (!Array.isArray(node)) return 0;
+      let count = 1;
+      for (const x of node) if (Array.isArray(x)) count += irSize(x);
+      return count;
+    };
+    const spread = cg.funcs
+      .filter(f => f && !f.internal && (f.unit ?? 'main') === base && !String(f.name).startsWith('#main'))
+      .map(f => [ f, irSize(f.body ?? f.wasm ?? []) ])
+      .sort((a, b) => b[1] - a[1]);
+    const loads = new Array(n).fill(0);
+    for (const [ f, size ] of spread) {
+      let least = 0;
+      for (let i = 1; i < n; i++) if (loads[i] < loads[least]) least = i;
+      f.unit = `${base}.u${least}`;
+      loads[least] += size;
+    }
+    cg.units = [ ...(cg.units ?? []), ...loads.map((_, i) => ({ id: `${base}.u${i}`, name: `${base}.u${i}` })) ];
+  }
+
   // module programs build one C unit per source file, cached and recompiled on change
   const outDir = !!outFile && (outFile.endsWith('/') || fs.existsSync(outFile) && fs.statSync(outFile).isDirectory());
   const split = !!cg.units && (target === 'native' || (outDir && !Prefs.nativeFetch));

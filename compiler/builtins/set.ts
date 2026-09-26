@@ -7,7 +7,7 @@ export const __Set_prototype_size$get = function (this: Set) {
   return keys.length - Porffor.IR.loadI32(this, 16);
 };
 
-export const __Set_prototype_values = function (this: Set) {
+export const __Porffor_set_valuesArray = function (this: Set) {
   // todo: this should return an iterator not array
   const keys: any[] = Porffor.IR.loadI32(this, 0);
   const keysEntries: i32 = Porffor.IR.loadI32(keys, 4);
@@ -22,8 +22,8 @@ export const __Set_prototype_values = function (this: Set) {
   return out;
 };
 
-export const __Set_prototype_keys = function (this: Set) {
-  return Porffor.callThis(__Set_prototype_values, this);
+export const __Porffor_set_keysArray = function (this: Set) {
+  return Porffor.callThis(__Porffor_set_valuesArray, this);
 };
 
 export const __Set_prototype_has = function (this: Set, value: any) {
@@ -77,8 +77,8 @@ export const Set = function (iterable: any): Set {
   return out;
 };
 
-export const __Set_prototype_entries = function (this: Set) {
-  const values: any[] = Porffor.callThis(__Set_prototype_values, this);
+export const __Porffor_set_entriesArray = function (this: Set) {
+  const values: any[] = Porffor.callThis(__Porffor_set_valuesArray, this);
   const out: any[] = Porffor.array.new(4);
 
   const size: i32 = values.length;
@@ -169,3 +169,16 @@ export const __Set_prototype_isDisjointFrom = function (this: Set, other: any) {
 
 export const __Set_prototype_toString = function (this: Set) { return '[object Set]'; };
 export const __Set_prototype_toLocaleString = function (this: Set) { return Porffor.callThis(__Set_prototype_toString, this); };
+
+// values/keys/entries/[Symbol.iterator]: iterators over a snapshot taken when made
+export const __Set_prototype_values = function (this: Set) {
+  return __Porffor_iter_newValues(Porffor.callThis(__Porffor_set_valuesArray, this));
+};
+
+export const __Set_prototype_keys = function (this: Set) {
+  return __Porffor_iter_newValues(Porffor.callThis(__Porffor_set_valuesArray, this));
+};
+
+export const __Set_prototype_entries = function (this: Set) {
+  return __Porffor_iter_newValues(Porffor.callThis(__Porffor_set_entriesArray, this));
+};

@@ -9,14 +9,21 @@ export const __ecma262_SameValueZero = (x: any, y: any): boolean => {
   return false;
 };
 
+// 7.1.1.1 OrdinaryToPrimitive: the first of the two methods that is callable and returns
+// a primitive wins. A method that returns null or undefined has returned a primitive (it
+// is not skipped: only a missing or non-callable method, or an object result, is).
 export const __ecma262_ToPrimitive_Number = (input: any): any => {
   // todo: %Symbol.toPrimitive%
 
-  let value: any = input.valueOf?.();
-  if (value != null && !Porffor.object.isObjectOrNull(value)) return value;
+  if (typeof input.valueOf === 'function') {
+    const value: any = input.valueOf?.(); // the optional call looks the method up dynamically
+    if (!Porffor.object.isObject(value)) return value;
+  }
 
-  value = input.toString?.();
-  if (value != null && !Porffor.object.isObjectOrNull(value)) return value;
+  if (typeof input.toString === 'function') {
+    const value: any = input.toString?.(); // the optional call looks the method up dynamically
+    if (!Porffor.object.isObject(value)) return value;
+  }
 
   throw new TypeError('Cannot convert an object to primitive');
 };
@@ -24,11 +31,15 @@ export const __ecma262_ToPrimitive_Number = (input: any): any => {
 export const __ecma262_ToPrimitive_String = (input: any): any => {
   // todo: %Symbol.toPrimitive%
 
-  let value: any = input.toString?.();
-  if (value != null && !Porffor.object.isObjectOrNull(value)) return value;
+  if (typeof input.toString === 'function') {
+    const value: any = input.toString?.(); // the optional call looks the method up dynamically
+    if (!Porffor.object.isObject(value)) return value;
+  }
 
-  value = input.valueOf?.();
-  if (value != null && !Porffor.object.isObjectOrNull(value)) return value;
+  if (typeof input.valueOf === 'function') {
+    const value: any = input.valueOf?.(); // the optional call looks the method up dynamically
+    if (!Porffor.object.isObject(value)) return value;
+  }
 
   throw new TypeError('Cannot convert an object to primitive');
 };
