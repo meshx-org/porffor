@@ -7,7 +7,7 @@ import {
 import { TYPES, TYPE_NAMES } from './types.js';
 import { ieee754_binary64 } from './encoding.js';
 import caseTablesC from './case_tables.js';
-import { planStackless, hasAwait, hasTry, hasSuspend } from './stackless.js';
+import { planStackless, hasTry, hasSuspend } from './stackless.js';
 
 // C type per IR value type
 const CT = [];
@@ -608,7 +608,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
       }
 
       case K.Call: {
-        if (node[N_A] === '__Porffor_coroutine_resume' || node[N_A] === '__Porffor_coroutine_value' || node[N_A] === '__Porffor_coroutine_awaiting') usesCoro = true;
+        if (node[N_A] === '__Porffor_coroutine_resume' || node[N_A] === '__Porffor_coroutine_value' || node[N_A] === '__Porffor_coroutine_awaiting' || node[N_A] === '__Porffor_coroutine_returning') usesCoro = true;
         const f = funcOf(node[N_A]);
         if (f) cur.protos[f.index] = f;
         // direct call to a coroutine starts it instead of running the body: split args into the invocation shape
@@ -650,6 +650,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
         usesCoro = true;
         return [`porf_await(${rx(node[N_A], P_COMMA)})`, P_POSTFIX];
       case K.Yield:
+        if (sl !== null) throw new Error('stackless: a yield was left inside an expression');
         usesCoro = true;
         return [`porf_yield(${rx(node[N_A], P_COMMA)})`, P_POSTFIX];
 
@@ -700,10 +701,14 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     else emit(`${ind()}porf_try_depth -= ${activeTryDepth - target};\n`);
   };
 
-  const emitAwait = (value, dst) => {
+  // an await hands its driver the promise to wait on; a yield hands the value to next()'s
+  // caller (__Porffor_coroutine_value), resuming with what the next next() sends
+  const emitAwait = (value, dst, yielding = false) => {
     const n = slEntry(n => `porf_resume_${n}`);
-    emit(`${ind()}call->coro.channel = porf_sl_promise(${jsArg(value)});\n`);
-    emit(`${ind()}call->coro.awaiting = 1;\n${ind()}call->coro.state = 2;\n`);
+    emit(yielding
+      ? `${ind()}call->coro.channel = ${jsArg(value)};\n`
+      : `${ind()}call->coro.channel = porf_sl_promise(${jsArg(value)});\n`);
+    emit(`${ind()}call->coro.awaiting = ${yielding ? 0 : 1};\n${ind()}call->coro.state = 2;\n`);
     emit(`${ind()}fr->porf_state = ${n};\n${ind()}return 0;\n`);
     emit(`${ind()}porf_resume_${n}:;\n${ind()}porf_resuming = 0;\n`);
     emit(`${ind()}if (porf_in_throw) porf_throw(porf_in);\n`);
@@ -715,8 +720,8 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     switch (node[N_KIND]) {
       case K.Assign:
         if (node[N_A][N_KIND] === K.Global) cur.globals[node[N_A][N_A]] = true;
-        if (sl !== null && node[N_B][N_KIND] === K.Await) {
-          emitAwait(node[N_B][N_A], varName(node[N_A][N_A]));
+        if (sl !== null && (node[N_B][N_KIND] === K.Await || node[N_B][N_KIND] === K.Yield)) {
+          emitAwait(node[N_B][N_A], varName(node[N_A][N_A]), node[N_B][N_KIND] === K.Yield);
           return;
         }
         emit(`${ind()}${varName(node[N_A][N_A])} = ${rx(node[N_B], P_COMMA)};\n`);
@@ -979,11 +984,12 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
         return;
 
       case K.Await:
+      case K.Yield:
         if (sl !== null) {
-          emitAwait(node[N_A], null);
+          emitAwait(node[N_A], null, node[N_KIND] === K.Yield);
           return;
         }
-        // falls through: a stackful await, as any other expression statement
+        // falls through: a stackful await or yield, as any other expression statement
 
       default: {
         if ((node[N_FX] & (FX.call | FX.writeMem | FX.writeLocal)) !== 0) {
@@ -1220,6 +1226,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     linkProtos.push(`${st}i32 __Porffor_coroutine_resume(jsval gen, jsval value, i32 mode);\n`);
     linkProtos.push(`${st}jsval __Porffor_coroutine_value(jsval gen);\n`);
     linkProtos.push(`${st}i32 __Porffor_coroutine_awaiting(jsval gen);\n`);
+    linkProtos.push(`${st}i32 __Porffor_coroutine_returning(void);\n`);
   }
   if (!split) {
     for (const f of linkFuncs) link.push(proto(f));
@@ -1508,15 +1515,21 @@ static porf_coro_call* porf_coro_unbox(jsval gen) {
 
 // TS-facing coroutine mechanism (generator.ts + for-of build the iterator protocol and
 // the { value, done } result on top of these). mode: 0 = next, 1 = throw the value at the
-// suspend point, 2 = return (force completion with the value). returns 1 once done.
+// suspend point, 2 = return: at a yield, the body returns the value from there, through its
+// finally blocks (codegen checks __Porffor_coroutine_returning after each yield), and not
+// yet started or done, completes with the value; 3 = complete with the value without
+// running the body. returns 1 once done.
+static i32 porf_gen_returning = 0;
+
+${st}i32 __Porffor_coroutine_returning(void) {
+  const i32 returning = porf_gen_returning;
+  porf_gen_returning = 0;
+  return returning;
+}
+
 	${st}i32 __Porffor_coroutine_resume(jsval gen, jsval value, i32 mode) {
 	  porf_coro_call* call = porf_coro_unbox(gen);
-	  if (mode == 2 && call->coro.state == 2) {
-	    call->result = value;
-	    value = PORF_CORO_RETURN;
-	    mode = 1;
-	  }
-	  if (mode == 2 || call->coro.state == 3) {
+	  if (mode == 3 || call->coro.state == 3 || (mode == 2 && !call->started)) {
 	    if (call->coro.state != 3) {
 	      porf_coro_live_remove(&call->coro);
 	      porf_coro_stack_free(&call->coro);
@@ -1532,14 +1545,17 @@ static porf_coro_call* porf_coro_unbox(jsval gen) {
   // hits the top-level uncaught handler. mirrors the guard in porf_coro_start /
   // the promise-reaction resume, but re-raises on the caller's stack since the
   // sync .next/.throw/.return driver has no out-promise to settle.
+  porf_gen_returning = mode == 2;
   const i32 try_idx = porf_try_depth++;
   if (_setjmp(porf_try_ensure()[try_idx]) == 0) {
     const i32 done = porf_coro_call_step(call, value, mode == 1);
     porf_try_depth = try_idx;
+    porf_gen_returning = 0;
     return done;
   }
 
   porf_try_depth = try_idx;
+  porf_gen_returning = 0;
   if (!call->sl) {
     porf_coro_set_current_stack_top(call->coro.caller_stack_top);
     porf_coro_cur = call->coro.parent;

@@ -870,21 +870,28 @@ const generateYield = (scope, decl) => {
       const delegate = reuse(scope, generate(scope, arg));
       const sent = tmp(scope, T.jsval, valUndefined());
       const result = tmp(scope, T.jsval, valUndefined());
+      // 2 once return() reached this yield: passed on to the delegate, whose own finally
+      // blocks run (and may yield on), and when it is done this generator returns too
+      const mode = tmp(scope, T.i32, Const(T.i32, 0));
       const L = fresh(scope);
       stmt(scope, Loop(null, null, collect(scope, () => {
-        const done = reuse(scope, Call('__Porffor_coroutine_resume', [ delegate, sent, Const(T.i32, 0) ], T.i32));
+        const done = reuse(scope, Call('__Porffor_coroutine_resume', [ delegate, sent, mode ], T.i32));
         emitIf(scope, done, () => {
+          emitIf(scope, mode, () => generatorReturn(scope, Call('__Porffor_coroutine_value', [ delegate ])));
           assign(scope, result, Call('__Porffor_coroutine_value', [ delegate ]));
           stmt(scope, Break(L));
         });
         assign(scope, sent, Yield(Call('__Porffor_coroutine_value', [ delegate ])));
+        assign(scope, mode, Bin('*', T.i32, Call('__Porffor_coroutine_returning', [], T.i32), Const(T.i32, 2)));
       }), L));
       return result;
     }
 
+    // in an async generator, yield* takes async iterables: a for await over them
     const valueName = '#yieldstar' + uniqId(scope);
     generateForOf(scope, {
       type: 'ForOfStatement',
+      await: scope.async === true,
       left: {
         type: 'VariableDeclaration',
         kind: 'const',
@@ -907,14 +914,46 @@ const generateYield = (scope, decl) => {
     return valUndefined();
   }
 
-  return Yield(generate(scope, arg));
+  return yieldPoint(scope, generate(scope, arg));
+};
+
+// a yield, and after it what return() asks for: the generator returns the value sent
+const yieldPoint = (scope, value) => {
+  const sent = tmp(scope, T.jsval, Yield(value));
+  emitIf(scope, Call('__Porffor_coroutine_returning', [], T.i32), () => generatorReturn(scope, sent));
+  return sent;
+};
+
+// a generator's return of an IR value (return() resuming it at a yield): through any finally
+const generatorReturn = (scope, value) => {
+  const fin = scope.finallyStack?.[scope.finallyStack.length - 1];
+  if (fin) {
+    if (scope.retType !== T.none) assign(scope, Local(fin.val, T.jsval), value);
+    finallyExit(scope, fin, FIN_RETURN);
+    return;
+  }
+  closeLoops(scope, null, true);
+  stmt(scope, scope.retType === T.none ? Return() : Return(value));
 };
 
 const generateReturn = (scope, decl) => {
-  const arg = decl.argument ?? DEFAULT_VALUE;
+  let arg = decl.argument ?? DEFAULT_VALUE;
 
   // inside try/catch with a finally: park the value and let the finalizer complete the return
   const fin = scope.finallyStack?.[scope.finallyStack.length - 1];
+  if (!fin && depth.some(d => d.genOpen && d.scope === scope)) {
+    // leaving for...of loops over generators: the value first, then they close (closeLoops)
+    if (scope.retType === T.none) {
+      if (arg.type !== 'Identifier') exprStmt(scope, generate(scope, arg));
+      arg = { type: 'Identifier', name: 'undefined' };
+    } else if (arg.type !== 'Identifier' && arg.type !== 'Literal') {
+      const name = '#ret_close' + uniqId(scope);
+      allocVar(scope, name);
+      assign(scope, Local(name, T.jsval), coerceValue(generate(scope, arg), T.jsval));
+      arg = identNode(name);
+    }
+    closeLoops(scope, null, true);
+  }
   if (fin) {
     if (scope.retType === T.none) {
       if (arg.type !== 'Identifier') exprStmt(scope, generate(scope, arg));
@@ -3645,8 +3684,39 @@ const generateForOfCore = (scope, decl) => {
   assign(scope, length, LenGet(pointer));
 
   const L = fresh(scope);
-  const d = { type: 'forof', brk: L, cont: L, contViaBreak: false };
+  // a generator stepped on the fast path is closed (return(), its finally blocks run) when a
+  // break or return leaves the loop early: closeLoops. genOpen: 1 a generator is open, 2 an
+  // async generator (closed through its driver, awaited). A throw leaves it open: only the
+  // protocol's try (recName) closes on that, with the generator in the loop's record
+  const mayBeGenerator = rootKnown == null || rootKnown === TYPES.__porffor_generator || rootKnown === TYPES.__porffor_asyncgenerator;
+  const d = { type: 'forof', brk: L, cont: L, contViaBreak: false, scope,
+    genOpen: recName == null && mayBeGenerator ? tmp(scope, T.i32, Const(T.i32, 0)) : null,
+    close: () => {
+      emitIf(scope, Bin('==', T.i32, d.genOpen, Const(T.i32, 1)), () => {
+        assign(scope, d.genOpen, Const(T.i32, 0));
+        exprStmt(scope, Call('__Porffor_coroutine_resume', [ root, valUndefined(), Const(T.i32, 2) ], T.i32));
+      });
+      if (isAwait) emitIf(scope, Bin('==', T.i32, d.genOpen, Const(T.i32, 2)), () => {
+        assign(scope, d.genOpen, Const(T.i32, 0));
+        exprStmt(scope, awaitValue(scope, builtinCall(scope, '__Porffor_AsyncGenerator_advance', [ root, valUndefined(), Const(T.i32, 2) ])));
+      });
+    } };
   consumePendingLabels(scope, d);
+
+  // after a generator's step (kind 1, or 2 async): finished, the loop ends; otherwise it is
+  // open until the next step, for a close if the loop is left early
+  const generatorStepped = (done, kind) => {
+    const rec = recName == null ? null : Local(recName, T.jsval);
+    emitIf(scope, done, () => {
+      if (rec) assign(scope, rec, valUndefined());
+      else if (d.genOpen) assign(scope, d.genOpen, Const(T.i32, 0));
+      stmt(scope, Break(L));
+    });
+    if (rec) emitIf(scope, Bin('==', T.i32, JvType(rec), Const(T.i32, TYPES.undefined)),
+      () => assign(scope, rec, builtinCall(scope, '__Porffor_iter_generatorRecord', [ root ])));
+    else if (d.genOpen) assign(scope, d.genOpen, Const(T.i32, kind));
+    return Call('__Porffor_coroutine_value', [ root ]);
+  };
   depth.push(d);
   inferLoopStart(scope);
 
@@ -3688,9 +3758,11 @@ const generateForOfCore = (scope, decl) => {
       } ],
 
       [ TYPES.__porffor_generator, () => {
+        // with the protocol, the generator is in the loop's record from its first step, so
+        // leaving the loop early closes it (return(), running its finally blocks); finished,
+        // it leaves the record again
         const done = reuse(scope, Call('__Porffor_coroutine_resume', [ root, valUndefined(), Const(T.i32, 0) ], T.i32));
-        emitIf(scope, done, () => stmt(scope, Break(L)));
-        return Call('__Porffor_coroutine_value', [ root ]);
+        return generatorStepped(done, 1);
       } ],
 
       [ TYPES.__porffor_asyncgenerator, () => {
@@ -3698,8 +3770,7 @@ const generateForOfCore = (scope, decl) => {
         // runs the generator through its own awaits to the next yield (or its end)
         const done = reuse(scope, truthy(scope, awaitValue(scope,
           builtinCall(scope, '__Porffor_AsyncGenerator_advance', [ root, valUndefined(), Const(T.i32, 0) ]))));
-        emitIf(scope, done, () => stmt(scope, Break(L)));
-        return Call('__Porffor_coroutine_value', [ root ]);
+        return generatorStepped(done, 2);
       } ],
 
       // by code point: a surrogate pair is one character
@@ -3930,6 +4001,14 @@ const consumePendingLabels = (scope, d) => {
   pendingLabels = [];
 };
 
+// the for...of loops of this function a jump leaves (to target: from the innermost out, the
+// target too when it is left), each closing a generator it still has open
+const closeLoops = (scope, target, leavesTarget) => {
+  const stop = target == null ? 0 : depth.indexOf(target) + (leavesTarget ? 0 : 1);
+  for (let i = depth.length - 1; i >= stop && i >= 0; i--)
+    if (depth[i].genOpen && depth[i].scope === scope) depth[i].close();
+};
+
 const generateBreak = (scope, decl) => {
   const target = decl.label ? scope.labels.get(decl.label.name) : getNearestLoop();
   const fin = finallyCrossing(scope, target);
@@ -3937,6 +4016,7 @@ const generateBreak = (scope, decl) => {
     finallyExit(scope, fin, fin.exits.push(() => generateBreak(scope, decl)));
     return valUndefined();
   }
+  closeLoops(scope, target, true);
   stmt(scope, Break(target.brk));
   return valUndefined();
 };
@@ -3948,6 +4028,7 @@ const generateContinue = (scope, decl) => {
     finallyExit(scope, fin, fin.exits.push(() => generateContinue(scope, decl)));
     return valUndefined();
   }
+  closeLoops(scope, target, false);
   stmt(scope, target.contViaBreak ? Break(target.cont) : Continue(target.cont));
   return valUndefined();
 };
@@ -5093,7 +5174,7 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
 
       func.identFailEarly = false;
 
-      if (func.coroInit) exprStmt(func, Yield(valUndefined()));
+      if (func.coroInit) yieldPoint(func, valUndefined());
 
       if (decl._baseClassFieldInit) stmt(func, CLASS_FIELD_INIT_MARKER);
 

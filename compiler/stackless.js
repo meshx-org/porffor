@@ -1,7 +1,8 @@
-// Stackless async functions (--stackless): an async function whose awaits can all be
-// lifted to statement level runs as a step function over a heap frame instead of on a
-// coroutine stack. This pass decides which functions qualify and rewrites their bodies so
-// every await is a statement of its own: `local = await x` or a bare `await x`. The
+// Stackless coroutines (--stackless): an async function or a generator (async too) whose
+// awaits or yields can all be lifted to statement level runs as a step function over a heap frame
+// instead of on a coroutine stack. This pass decides which functions qualify and rewrites
+// their bodies so every await or yield is a statement of its own: `local = await x` or a
+// bare `await x`, and the same for yield (yield* is a loop of yields by now: codegen). The
 // renderer (render.js) turns each of those into a suspension point; the frame holds the
 // function's params, locals and the temps made here.
 //
@@ -10,9 +11,9 @@
 // a try (finally is a catch by then: codegen lowers it). Entering a catch that way loses
 // the step's C locals as a resume does, so it counts as a suspension below.
 //
-// Not yet (the function stays stackful): generators, raw C, or an await in a loop's update.
+// Not yet (the function stays stackful): raw C, or an await or a yield in a loop's update.
 
-import { K, T, FX, N_KIND, N_TYPE, N_FX, N_A, N_B, N_C, KNames, Local, Assign, Await, Un, Break } from './ir.js';
+import { K, T, FX, N_KIND, N_TYPE, N_FX, N_A, N_B, N_C, KNames, Local, Assign, Await, Yield, Un, Break } from './ir.js';
 
 const isNode = node => Array.isArray(node) && typeof node[0] === 'number' &&
   KNames[node[0]] !== undefined && node.length === 6;
@@ -35,19 +36,21 @@ const makeHas = k => {
 
 export const hasAwait = makeHas(K.Await);
 export const hasTry = makeHas(K.Try);
-// where a step can be re-entered: at an await's resume, or at a catch
-export const hasSuspend = node => hasAwait(node) || hasTry(node);
+// where a step suspends: an await or a yield
+export const hasPause = node => hasAwait(node) || hasYield(node);
+// where a step can be re-entered: after a suspension, or at a catch
+export const hasSuspend = node => hasPause(node) || hasTry(node);
 const hasYield = makeHas(K.Yield);
 const hasRawC = makeHas(K.RawC);
 const hasContinue = makeHas(K.Continue);
 
-// an await where lifting cannot reach yet
+// an await or a yield where lifting cannot reach yet
 const blocked = node => {
   if (!Array.isArray(node)) return false;
   if (!isNode(node)) return node.some(blocked);
-  if (!hasAwait(node)) return false;
+  if (!hasPause(node)) return false;
   const k = node[N_KIND];
-  if (k === K.Loop && hasAwait(node[N_B])) return true;
+  if (k === K.Loop && hasPause(node[N_B])) return true;
   return blocked(node[N_A]) || blocked(node[N_B]) || blocked(node[N_C]);
 };
 
@@ -55,12 +58,13 @@ const blocked = node => {
 const PURE_KINDS = new Set([ K.Const, K.JvConst, K.DataRef, K.FuncIdx, K.FuncRec ]);
 
 /**
- * The body of `f` with every await lifted to a statement, and the temps that took,
- * or null when `f` is not an async function that can run stackless.
+ * The body of `f` with every await or yield lifted to a statement, and the temps that
+ * took, or null when `f` is not an async function or generator that can run stackless.
  */
 export const planStackless = f => {
-  if (!f || !f.async || f.generator || !f.hasAwait || !f.body) return null;
-  if (hasYield(f.body) || hasRawC(f.body) || blocked(f.body)) return null;
+  if (!f || !f.body) return null;
+  if (!f.generator && !(f.async && f.hasAwait)) return null;
+  if (hasRawC(f.body) || blocked(f.body)) return null;
 
   const temps = Object.create(null);
   let count = 0;
@@ -102,24 +106,24 @@ export const planStackless = f => {
 
   // an expression without awaits in it, their statements pushed to out first
   const liftExpr = (node, out) => {
-    if (!hasAwait(node)) return node;
+    if (!hasPause(node)) return node;
     const k = node[N_KIND];
 
-    if (k === K.Await) {
+    if (k === K.Await || k === K.Yield) {
       const value = liftExpr(node[N_A], out);
       const t = temp(T.jsval);
-      out.push(Assign(t, Await(value)));
+      out.push(Assign(t, (k === K.Await ? Await : Yield)(value)));
       return t;
     }
 
     // lazily evaluated operands: an await in them runs only on their branch
-    if (k === K.Select && (hasAwait(node[N_B]) || hasAwait(node[N_C]))) {
+    if (k === K.Select && (hasPause(node[N_B]) || hasPause(node[N_C]))) {
       const cond = liftExpr(node[N_A], out);
       const t = temp(node[N_TYPE]);
       out.push([ K.If, T.none, FX.call, cond, assignLifted(t, node[N_B]), assignLifted(t, node[N_C]) ]);
       return t;
     }
-    if (k === K.Bin && (node[N_A] === '&&' || node[N_A] === '||') && hasAwait(node[N_C])) {
+    if (k === K.Bin && (node[N_A] === '&&' || node[N_A] === '||') && hasPause(node[N_C])) {
       const t = temp(T.i32);
       const truth = x => Un('!', T.i32, Un('!', T.i32, x));
       out.push(Assign(t, truth(liftExpr(node[N_B], out))));
@@ -131,7 +135,7 @@ export const planStackless = f => {
     // everything evaluated before the last await is kept in a temp across it
     const list = operands(node);
     let last = -1;
-    for (let i = 0; i < list.length; i++) if (hasAwait(list[i])) last = i;
+    for (let i = 0; i < list.length; i++) if (hasPause(list[i])) last = i;
     const replace = new Map();
     for (let i = 0; i <= last; i++) {
       const operand = list[i];
@@ -154,15 +158,15 @@ export const planStackless = f => {
   };
 
   const liftStmt = (s, out) => {
-    if (s == null || !hasAwait(s)) {
+    if (s == null || !hasPause(s)) {
       out.push(s);
       return;
     }
     switch (s[N_KIND]) {
       case K.Assign: {
         const target = s[N_A], value = s[N_B];
-        if (value[N_KIND] === K.Await && target[N_KIND] === K.Local) {
-          out.push(Assign(target, Await(liftExpr(value[N_A], out))));
+        if ((value[N_KIND] === K.Await || value[N_KIND] === K.Yield) && target[N_KIND] === K.Local) {
+          out.push(Assign(target, (value[N_KIND] === K.Await ? Await : Yield)(liftExpr(value[N_A], out))));
           return;
         }
         out.push(Assign(target, liftExpr(value, out)));
@@ -171,6 +175,10 @@ export const planStackless = f => {
 
       case K.Await:
         out.push(Await(liftExpr(s[N_A], out)));
+        return;
+
+      case K.Yield:
+        out.push(Yield(liftExpr(s[N_A], out)));
         return;
 
       case K.If:
@@ -182,7 +190,7 @@ export const planStackless = f => {
         let cond = s[N_A];
         const head = [];
         // an await in the condition: checked at the top of the body instead
-        if (cond && hasAwait(cond)) {
+        if (cond && hasPause(cond)) {
           const c = liftExpr(cond, head);
           head.push([ K.If, T.none, FX.none, Un('!', T.i32, c), [ Break(null) ], null ]);
           cond = null;
@@ -277,7 +285,7 @@ const frameLocals = body => {
 
       case K.Assign: {
         const target = node[N_A], value = node[N_B];
-        if (value[N_KIND] === K.Await) {
+        if (value[N_KIND] === K.Await || value[N_KIND] === K.Yield) {
           // `x = await e`: e before the suspension, x after it
           walk(value[N_A], inAwaitLoop);
           suspend();
@@ -287,6 +295,7 @@ const frameLocals = body => {
       }
 
       case K.Await:
+      case K.Yield:
         walk(node[N_A], inAwaitLoop);
         suspend();
         return;

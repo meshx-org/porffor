@@ -56,6 +56,17 @@ export const __Porffor_iter_openAsync = (obj: any): object => {
   return rec;
 };
 
+// the loop record of a generator for...of steps on its fast path: only for the loop's try
+// to close it when the loop is left early (__Porffor_iter_close / closeAsync)
+export const __Porffor_iter_generatorRecord = (it: any): object => {
+  const rec: object = {};
+  rec.it = it;
+  rec.next = undefined;
+  rec.done = false;
+  rec.sync = false;
+  return rec;
+};
+
 // IteratorStep + IteratorValue: the next value, or undefined with rec.done set at the end
 export const __Porffor_iter_step = (rec: any): any => {
   const it: any = rec.it;
@@ -129,7 +140,8 @@ export const __Porffor_iter_close = (rec: any): void => {
   }
   if (Porffor.comptime.flag`hasType.__porffor_asyncgenerator`) {
     if (Porffor.type(it) == Porffor.TYPES.__porffor_asyncgenerator) {
-      Porffor.coroutine.resume(it, undefined, 2 as i32);
+      // through its driver (its finally blocks may await), not waited for here
+      __Porffor_AsyncGenerator_advance(it, undefined, 2 as i32);
       return;
     }
   }
@@ -152,7 +164,8 @@ export const __Porffor_iter_closeAsync = async (rec: any): void => {
   }
   if (Porffor.comptime.flag`hasType.__porffor_asyncgenerator`) {
     if (Porffor.type(it) == Porffor.TYPES.__porffor_asyncgenerator) {
-      Porffor.coroutine.resume(it, undefined, 2 as i32);
+      // through its driver: its finally blocks may await
+      await __Porffor_AsyncGenerator_advance(it, undefined, 2 as i32);
       return;
     }
   }

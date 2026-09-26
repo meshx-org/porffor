@@ -76,7 +76,8 @@ export const __Porffor_AsyncGenerator_step = (gen: __Porffor_AsyncGenerator, val
             __Porffor_promise_resolve(result, promise);
           },
           (e: any): void => {
-            Porffor.coroutine.resume(gen, undefined, 2 as i32);
+            // closed as it stands, its finally blocks not run (mode 3)
+            Porffor.coroutine.resume(gen, undefined, 3 as i32);
             __Porffor_promise_reject(e, promise);
           });
       } else {
