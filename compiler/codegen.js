@@ -2,7 +2,7 @@ import {
   K, T, FX, N_KIND, N_TYPE, N_FX, N_A, N_B, N_C,
   Const, JvConst, DataRef, Local, Global, Assign,
   Bin, Un, Select, Convert, CONVERT_SIGNED, CONVERT_RANGE_KNOWN,
-  Reinterpret, Box, JvType, JvNum, JvPtr, Eq, Add, Cmp, JvTruthy, JvFalsy, JvNullish,
+  Reinterpret, Box, JvType, JvNum, JvPtr, JvIsNum, Eq, Add, Cmp, JvTruthy, JvFalsy, JvNullish,
   Load, Store, MemCopy, MemFill,
   If, Loop, Break, Continue, BlockStmt, TypeSwitch, Return, Unreachable,
   Call, CallDynamic, Try, Throw, ThrowNew, Await, Yield,
@@ -1087,13 +1087,7 @@ const nullish = (scope, node, type = null) => {
 };
 
 // ToUint32 for bitwise operands: trunc, then wrap into [0, 2^32)
-const toUint32 = (scope, d) => {
-  const t = reuse(scope, Un('trunc', T.f64, d));
-  const w = reuse(scope, Bin('-', T.f64, t, Bin('*', T.f64,
-    Un('trunc', T.f64, Bin('/', T.f64, t, Const(T.f64, 4294967296))), Const(T.f64, 4294967296))));
-  return Convert(T.u32, Select(Bin('<', T.f64, w, Const(T.f64, 0)),
-    Bin('+', T.f64, w, Const(T.f64, 4294967296)), w), CONVERT_RANGE_KNOWN);
-};
+const toUint32 = (scope, d) => Call('porf_to_u32', [ d ], T.u32);
 
 // bitwise on f64s: ToUint32 both, run it as i32, mask shifts, back to f64
 const bitwiseOp = (scope, op, l, r) => {
@@ -2073,14 +2067,35 @@ const generateCall = (scope, decl) => {
           includeBuiltin(scope, x);
           continue;
         }
-        protoBC[t] = () => generate(scope, {
+        const builtinCall = args => generate(scope, {
           type: 'CallExpression',
           optional: decl.optional,
           callee: { type: 'Identifier', name: x },
-          arguments: decl.arguments,
+          arguments: args,
           _thisArg: targetIdent,
           _protoInternalCall: true
         });
+
+        // str.charCodeAt(number): a load at the call site (string loops call it per
+        // character), the builtin for any other index
+        if (protoName === 'charCodeAt' && (t === TYPES.string || t === TYPES.bytestring) &&
+            decl.arguments.length === 1 && decl.arguments[0].type !== 'SpreadElement') {
+          protoBC[t] = () => {
+            const val = generate(scope, decl.arguments[0]);
+            // a typed number (inside builtins): nothing to check
+            if (val[N_TYPE] !== T.jsval) return Call('porf_str_char_code', [ targetTmp, Convert(T.f64, val) ], T.jsval);
+
+            const idx = reuseNamed(scope, val);
+            const out = tmp(scope, T.jsval);
+            emitIf(scope, JvIsNum(idx),
+              () => assign(scope, out, Call('porf_str_char_code', [ targetTmp, JvNum(idx) ], T.jsval)),
+              () => assign(scope, out, builtinCall([ { type: 'Identifier', name: idx[N_A] } ])));
+            return out;
+          };
+          continue;
+        }
+
+        protoBC[t] = () => builtinCall(decl.arguments);
       }
 
       // the fallback call reads the object through targetTmp too: regenerating decl as-is
@@ -3369,7 +3384,7 @@ const generateUnary = (scope, decl) => {
       return bigintUnary('porf_bigint_neg', v => Box(Un('neg', T.f64, numValue(v)), Const(T.i32, TYPES.number)));
 
     case '~':
-      return bigintUnary('porf_bigint_not', v => Box(Convert(T.f64, Un('~', T.i32, Convert(T.i32, numValue(v)))), Const(T.i32, TYPES.number)));
+      return bigintUnary('porf_bigint_not', v => Box(Convert(T.f64, Un('~', T.i32, Convert(T.i32, toUint32(scope, numValue(v)), CONVERT_RANGE_KNOWN | CONVERT_SIGNED)), CONVERT_SIGNED), Const(T.i32, TYPES.number)));
 
     case '!': {
       const arg = decl.argument;

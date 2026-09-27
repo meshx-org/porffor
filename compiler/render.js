@@ -4412,6 +4412,20 @@ static inline u32 porf_f64_to_u32(f64 d) {
   if (d >= 4294967295.0) return 4294967295u;
   return (u32)d;
 }
+// ToUint32 (and ToInt32, read as i32): truncate, then wrap modulo 2^32. Below 2^63 in
+// magnitude a double truncates exactly to an i64, whose low 32 bits are the answer, with no
+// float division on the way (bitwise code chains these through its loop); NaN, the
+// infinities and the rest go the long way, out of line so the loop stays tight
+PORF_COLD static u32 porf_to_u32_slow(f64 d) {
+  if (d != d || d == INFINITY || d == -INFINITY) return 0;
+  f64 m = fmod(d, 4294967296.0); // exact, and d is already an integer this large
+  if (m < 0.0) m += 4294967296.0;
+  return (u32)m;
+}
+static inline u32 porf_to_u32(f64 d) {
+  if (__builtin_expect(d > -9223372036854775808.0 && d < 9223372036854775808.0, 1)) return (u32)(u64)(i64)d;
+  return porf_to_u32_slow(d);
+}
 
 static inline i32 porf_clz32(u32 x) { return x ? __builtin_clz(x) : 32; }
 static inline i32 porf_ctz32(u32 x) { return x ? __builtin_ctz(x) : 32; }
@@ -4892,14 +4906,29 @@ PORF_NOINLINE static jsval porf_str_flat_slow(jsval v) {
 }
 // a string value readable as characters: a rope's flat string, anything else as it is.
 // Every builtin argument goes through this, so it is a few compares, inlined, for the
-// values that are not ropes
+// values that are not ropes, and a load for a rope already flattened (a variable keeps
+// holding the rope after its first read, so a loop over it comes here every time)
 static inline __attribute__((always_inline)) jsval porf_str_flat(jsval v) {
-  if (__builtin_expect((v.type == ${TYPES.bytestring} || v.type == ${TYPES.string}) && porf_rope_is((u32)v.val), 0))
-    return porf_str_flat_slow(v);
+  if (__builtin_expect((v.type == ${TYPES.bytestring} || v.type == ${TYPES.string}) && porf_rope_is((u32)v.val), 0)) {
+    const u32 flat = *(u32*)(MEM + (u32)v.val + 12);
+    return flat ? porf_box((f64)flat, v.type) : porf_str_flat_slow(v);
+  }
   return v;
 }
 
-` : ''}${st}jsval porf_str_concat(jsval a, jsval b) {
+` : ''}// String.prototype.charCodeAt with a number index, for the call site: the builtin's
+// ToIntegerOrInfinity (NaN is 0, truncated toward zero) and a load
+static inline jsval porf_str_char_code(jsval s, f64 i) {
+${ropes ? `  s = porf_str_flat(s);
+` : ''}  const u32 p = (u32)s.val;
+  f64 t = trunc(i);
+  if (t != t) t = 0.0;
+  if (!(t >= 0.0 && t < (f64)*(u32*)(MEM + p))) return porf_box_num(NAN);
+  const u32 k = (u32)t;
+  return porf_box_num(s.type == ${TYPES.bytestring} ? (f64)*(u8*)(MEM + p + 4 + k) : (f64)*(u16*)(MEM + p + 4 + k * 2));
+}
+
+${st}jsval porf_str_concat(jsval a, jsval b) {
   volatile u32 keep_a = (u32)a.val, keep_b = (u32)b.val;
   const u32 pa = keep_a, pb = keep_b;
   const u32 la = *(u32*)(MEM + pa), lb = *(u32*)(MEM + pb);

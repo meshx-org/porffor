@@ -1,6 +1,6 @@
 import * as PrecompiledBuiltins from './builtins_precompiled.js';
 import { TYPES, TYPE_NAMES } from './types.js';
-import { Bin, Un, T, K, Const, JvConst, Box, JvType, JvNum, JvPtr, Convert, Reinterpret, CONVERT_SIGNED, N_KIND, N_TYPE, N_A, N_B, Local, Assign, Call, CallDynamic, If, TypeSwitch, Return, RawC, BlockStmt } from './ir.js';
+import { Bin, Un, T, K, Const, JvConst, Box, JvType, JvNum, JvPtr, JvIsNum, Select, Convert, Reinterpret, CONVERT_SIGNED, N_KIND, N_TYPE, N_A, N_B, Local, Assign, Call, CallDynamic, If, TypeSwitch, Return, RawC, BlockStmt } from './ir.js';
 import './prefs.js';
 
 const f64FromBytes = bytes => {
@@ -446,8 +446,10 @@ export const fullPrototypes = new Set();
 
 export const BuiltinFuncs = () => {
   const _ = Object.create(null);
-  // libm-backed Math: jsval params so public methods do ToNumber, boxed returns for builtin callers
-  const nativeMathArg = name => JvNum(Call('__ecma262_ToNumber', [ Local(name, T.jsval) ]));
+  // libm-backed Math: jsval params so public methods do ToNumber, boxed returns for builtin
+  // callers. A number argument skips the ToNumber call
+  const nativeMathArg = name => Select(JvIsNum(Local(name, T.jsval)), JvNum(Local(name, T.jsval)),
+    JvNum(Call('__ecma262_ToNumber', [ Local(name, T.jsval) ])));
   const nativeMathUnary = name => {
     _[`__Math_${name}`] = {
       params: [ { name: 'x', type: T.jsval } ],
@@ -529,7 +531,6 @@ return porf_box_num(pow(baseNum, exponentNum));`, false)
     ]
   };
 
-  // todo: does not follow spec with +-Infinity and values >2**32
   _.__Math_clz32 = {
     params: [ { name: 'x', type: T.jsval } ],
     localNames: [ 'n' ],
@@ -538,7 +539,7 @@ return porf_box_num(pow(baseNum, exponentNum));`, false)
     returnType: TYPES.number,
     body: [
       Assign(Local('n', T.f64), nativeMathArg('x')),
-      RawC('return porf_box_num((f64)porf_clz32(porf_f64_to_u32(n)));', false)
+      RawC('return porf_box_num((f64)porf_clz32(porf_to_u32(n)));', false)
     ]
   };
 
@@ -563,13 +564,7 @@ return porf_box_num(pow(baseNum, exponentNum));`, false)
     body: [
       Assign(Local('xNum', T.f64), nativeMathArg('x')),
       Assign(Local('yNum', T.f64), nativeMathArg('y')),
-      RawC(`f64 xd = trunc(xNum);
-xd -= floor(xd / 4294967296.0) * 4294967296.0;
-if (xd < 0.0) xd += 4294967296.0;
-f64 yd = trunc(yNum);
-yd -= floor(yd / 4294967296.0) * 4294967296.0;
-if (yd < 0.0) yd += 4294967296.0;
-return porf_box_num((f64)(i32)((u32)xd * (u32)yd));`, false)
+      RawC('return porf_box_num((f64)(i32)(porf_to_u32(xNum) * porf_to_u32(yNum)));', false)
     ]
   };
 

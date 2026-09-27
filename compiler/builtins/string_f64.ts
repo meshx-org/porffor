@@ -122,7 +122,7 @@ export const __String_fromCodePoint = (...codePoints: any[]): string => {
 export const __String_prototype_charCodeAt = function (this: string, index: number) {
   const len: i32 = this.length;
 
-  index = Math.trunc(index);
+  index = ecma262.ToIntegerOrInfinity(index);
   if (Porffor.fastOr(index < 0, index >= len)) return NaN;
 
   return Porffor.IR.loadU16(Porffor.IR.ptr(this) + index * 2, 4);
@@ -131,7 +131,7 @@ export const __String_prototype_charCodeAt = function (this: string, index: numb
 export const __ByteString_prototype_charCodeAt = function (this: bytestring, index: number) {
   const len: i32 = this.length;
 
-  index = Math.trunc(index);
+  index = ecma262.ToIntegerOrInfinity(index);
   if (Porffor.fastOr(index < 0, index >= len)) return NaN;
 
   return Porffor.IR.loadU8(Porffor.IR.ptr(this) + index, 4);
