@@ -152,6 +152,8 @@ export default (code, module = Prefs.module, opts = {}) => {
       [ '-Wl,--gc-sections' ];
     const darwinReleaseCompileArgs = process.platform === 'darwin' && !Prefs.d ? [ '-fvisibility=hidden' ] : [];
     const compileOnlyArgs = [
+      // JS rounds every operation: no fused multiply-add (the C also says so, for clang)
+      ...(isTinyCC ? [] : [ '-ffp-contract=off' ]),
       '-fno-exceptions',
       '-fno-unwind-tables', '-fno-asynchronous-unwind-tables',
       '-fno-ident', '-ffunction-sections', '-fdata-sections',

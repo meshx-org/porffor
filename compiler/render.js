@@ -4091,6 +4091,10 @@ const RUNTIME_HEAD = (prefs, usesCoro = false, toStr = null, bigintUsed = true, 
 // 0 when every one is stackless, and nothing needs a coroutine stack or a thread. An
 // embedding reads it too: the component glue lifts async exports with a callback then
 #define PORF_STACKFUL ${stackful ? 1 : 0}
+// JS rounds after every operation: a * b + c must not become one fused multiply-add (one
+// rounding), which C allows by default (0.1 * 10 - 1 is 0, not 5.55e-17). Clang honours
+// this; for GCC, which ignores it, the build passes -ffp-contract=off
+#pragma STDC FP_CONTRACT OFF
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
