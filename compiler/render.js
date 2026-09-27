@@ -361,6 +361,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     __Porffor_object_set: 'value', __Porffor_object_set_withHash: 'value',
     __Porffor_object_setStrict: 'value', __Porffor_object_setStrict_withHash: 'value',
     __Porffor_object_define: 'value', __Porffor_object_fastAdd: 'value', __Porffor_object_expr_init: 'value',
+    __Porffor_object_set_ic: 'value', __Porffor_object_set_icMiss: 'value',
     __Map_prototype_set: 'value', __WeakMap_prototype_set: 'value'
   };
   const ropeFlatten = f => {

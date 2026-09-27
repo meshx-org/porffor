@@ -667,6 +667,55 @@ export const __Porffor_object_get_icMiss = (_obj: any, key: any, hash: i32, slot
   return __Porffor_object_get_withHash(_obj, key, hash);
 };
 
+// obj.key = value, cached per site as __Porffor_object_get_ic caches reads: the slot holds
+// the offset of the key's entry. A hit is an own, writable data property of a plain object
+// (so no setter to run and nothing to check), written as the full set writes one; anything
+// else takes the full set (strict or not), and the first property found fills the slot
+export const __Porffor_object_set_ic = (_obj: any, key: any, value: any, hash: i32, slot: i32, strict: boolean): any => {
+  if (Porffor.type(_obj) == Porffor.TYPES.object) {
+    if (Porffor.IR.ptr(_obj) != 0) {
+      const off: i32 = Porffor.IR.loadI32(slot, 0);
+      if (off < Porffor.IR.loadU16(_obj, 0) * 20) {
+        const entryPtr: i32 = Porffor.IR.loadI32(_obj, 12) + off;
+        if (Porffor.IR.loadI32(entryPtr, 0) == hash) {
+          // writable (0b1000), not an accessor (0b0001)
+          if ((Porffor.IR.loadU8(entryPtr, 16) & 0b1001) == 0b1000) {
+            Porffor.IR.storeUnF64(entryPtr, 8, value);
+            Porffor.IR.storeU8(entryPtr, 17, Porffor.type(value));
+            Porffor.IR.gcBarrierValue(_obj, Porffor.TYPES.object, value);
+            return value;
+          }
+        }
+      }
+    }
+  }
+
+  return __Porffor_object_set_icMiss(_obj, key, value, hash, slot, strict);
+};
+
+export const __Porffor_object_set_icMiss = (_obj: any, key: any, value: any, hash: i32, slot: i32, strict: boolean): any => {
+  if (strict) __Porffor_object_setStrict_withHash(_obj, key, value, hash);
+    else __Porffor_object_set_withHash(_obj, key, value, hash);
+
+  // where the key is now (a set that added it appended it); first writer wins, so a
+  // polymorphic site misses instead of refilling each time
+  if (Porffor.IR.loadI32(slot, 0) == 2147483647) {
+    if (Porffor.type(_obj) == Porffor.TYPES.object) {
+      if (Porffor.IR.ptr(_obj) != 0) {
+        const entriesPtr: i32 = Porffor.IR.loadI32(_obj, 12);
+        const endPtr: i32 = entriesPtr + Porffor.IR.loadU16(_obj, 0) * 20;
+        for (let ptr: i32 = entriesPtr; ptr < endPtr; ptr += 20) {
+          if (Porffor.IR.loadI32(ptr, 0) == hash) {
+            Porffor.IR.storeI32(slot, 0, ptr - entriesPtr);
+            break;
+          }
+        }
+      }
+    }
+  }
+  return value;
+};
+
 export const __Porffor_object_get_withHash = (_obj: any, key: any, hash: i32): any => {
   let obj: any = _obj;
   const trueType: i32 = Porffor.type(obj);
