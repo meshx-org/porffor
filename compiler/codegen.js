@@ -4555,8 +4555,10 @@ const generateObject = (scope, decl) => {
         noFuncIndex = true;
       }
 
-      // keep closure owner identity for semantic capture resolution
-      value = { ...value, id, _noFuncIndex: noFuncIndex, _closureSource: value._closureSource ?? value };
+      // keep closure owner identity for semantic capture resolution; an accessor's name is
+      // "get x" / "set x"
+      value = { ...value, id, _noFuncIndex: noFuncIndex, _closureSource: value._closureSource ?? value,
+        ...((kind === 'get' || kind === 'set') && typeof key.value === 'string' ? { _jsName: kind + ' ' + key.value } : {}) };
     }
 
     const hash = slot >= 0 && !computed && kind === 'init' && !keys.has(key.value)
@@ -4960,6 +4962,8 @@ const generateClass = (scope, decl) => {
     type: (!expr || decl._porfDefaultName) ? 'FunctionDeclaration' : 'FunctionExpression',
     _selfAware: !!decl.superClass,
     _onlyConstr: true,
+    // a class's constructor: its prototype property is read-only
+    _class: true,
     _subclass: !!decl.superClass,
     _superClassExpr: decl.superClass ? classSuperExpr() : null,
     _baseClassFieldInit: !decl.superClass && body.some(x => x.type === 'PropertyDefinition' && !x.static),
@@ -5030,7 +5034,9 @@ const generateClass = (scope, decl) => {
       let noFuncIndex = false;
       if (typeof key.value === 'string' && !id) { id = { type: 'Identifier', name: key.value }; noFuncIndex = true; }
       value = { ...value, id, _noFuncIndex: noFuncIndex, strict: true, _noGlobalThis: true,
-        _closureSource: closureSource._closureSource ?? closureSource };
+        _closureSource: closureSource._closureSource ?? closureSource,
+        // an accessor's name is "get x" / "set x"
+        ...((kind === 'get' || kind === 'set') && typeof key.value === 'string' ? { _jsName: kind + ' ' + key.value } : {}) };
     }
 
     if (type === 'PropertyDefinition' && !_static) {
@@ -5407,7 +5413,7 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
     method: !arrow && (decl._method || decl.generator || decl.async), // has this, not constructable
     async: decl.async,
     generator: decl.generator,
-    subclass: decl._subclass, _onlyConstr: decl._onlyConstr, _noGlobalThis: decl._noGlobalThis,
+    subclass: decl._subclass, _onlyConstr: decl._onlyConstr, _noGlobalThis: decl._noGlobalThis, isClass: !!decl._class,
     // what the Function constructor makes is strict only by its own directive
     strict: decl._constructed ? false : scope.strict || decl.strict,
     usesArguments: decl._usesArguments,
@@ -5705,6 +5711,7 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
   for (const p of func.params) func.locals[p.name] = { type: p.type, metadata: { param: true } };
 
   func.jsLength = jsLength;
+  if (decl._jsName) func.jsName = decl._jsName;
 
   if (func.topLevel) func.generate();
   if (globalThis.precompile) func.generate();

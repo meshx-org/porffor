@@ -182,16 +182,35 @@ export const __ecma262_SecFromTime = (t: number): number => __ecma262_Modulo(Mat
 // 1. Return 𝔽(ℝ(t) modulo ℝ(msPerSecond)).
 export const __ecma262_msFromTime = (t: number): number => __ecma262_Modulo(t, 1000);
 
+// the host time zone's offset from UTC at the time value t, in ms (render.js: the host's
+// own, or UTC where it has none)
+export const __Porffor_tz_offsetMs = (t: number): number => {
+  let out: number = t;
+  Porffor.c`out = porf_tz_offset_ms(out);`;
+  return out;
+};
+
+// the host time zone's IANA name ("UTC" where it has none; its offset, +01:00, where it
+// gives no name)
+export const __Porffor_tz_id = (): bytestring => {
+  let out: bytestring = '';
+  Porffor.c`out = porf_tz_id();`;
+  return out;
+};
+
 // 21.4.1.25 LocalTime (t)
 // https://tc39.es/ecma262/multipage/numbers-and-dates.html#sec-localtime
-export const __ecma262_LocalTime = (t: number): number => t;
+export const __ecma262_LocalTime = (t: number): number => t + __Porffor_tz_offsetMs(t);
 
 // 21.4.1.26 UTC (t)
 // https://tc39.es/ecma262/multipage/numbers-and-dates.html#sec-utc-t
 export const __ecma262_UTC = (t: number): number => {
   // 1. If t is not finite, return NaN.
   if (!Number.isFinite(t)) return NaN;
-  return t;
+
+  // the offset at the instant t names in local time: at a gap or a repeat, the one before
+  // the transition
+  return t - __Porffor_tz_offsetMs(t - __Porffor_tz_offsetMs(t));
 };
 
 // 21.4.1.27 MakeTime (hour, min, sec, ms)
@@ -478,6 +497,7 @@ export const __ecma262_ParseDTSF = (string: bytestring): number => {
   let s: number = 0;
   let milli: number = 0;
   let offset: number = 0; // minutes east of UTC
+  let zoned: boolean = false; // an offset or Z given
   let hasTime: boolean = false;
 
   const sep: i32 = __Porffor_date_charAt(string, i);
@@ -517,6 +537,7 @@ export const __ecma262_ParseDTSF = (string: bytestring): number => {
 
     const tz: i32 = __Porffor_date_charAt(string, i);
     if (Porffor.fastOr(tz == 90, tz == 122)) { // Z or z
+      zoned = true;
       i++;
     } else if (Porffor.fastOr(tz == 43, tz == 45)) { // ±HH:mm
       const tzHour: number = __Porffor_date_digits(string, i + 1, 2);
@@ -526,18 +547,20 @@ export const __ecma262_ParseDTSF = (string: bytestring): number => {
       if (Porffor.fastOr(tzMin < 0, tzMin > 59)) return NaN;
       offset = tzHour * 60 + tzMin;
       if (tz == 45) offset = -offset;
+      zoned = true;
       i += 5 + colon;
     }
   }
 
   if (i != len) return NaN;
 
-  // date-only forms are UTC; a date-time without an offset is local time, which is UTC here
+  // date-only forms are UTC; a date-time without an offset is local time
   const t: number = __ecma262_MakeDate(
     __ecma262_MakeDay(y, m - 1, dt),
     __ecma262_MakeTime(h, min, s, milli)
   );
-  return __ecma262_TimeClip(hasTime ? t - offset * 60000 : t);
+  if (!hasTime) return __ecma262_TimeClip(t);
+  return __ecma262_TimeClip(zoned ? t - offset * 60000 : __ecma262_UTC(t));
 };
 
 // RFC 7231 or Date.prototype.toString() parser
@@ -594,10 +617,13 @@ export const __ecma262_ParseRFC7231OrToString = (string: bytestring): number => 
   let h: number = 0;
   let min: number = 0;
   let s: number = 0;
-  let tz: number = 0;
+  let tz: number = 0; // GMT+hhmm
+  let tzSign: number = 1;
+  let zoned: boolean = false; // GMT given: else local time
 
   let n: number = 0;
   let nInd: number = 0;
+  let digits: boolean = false; // n holds a number (which can be 0)
 
   const len: i32 = string.length;
   const endPtr: i32 = Porffor.IR.ptr(string) + len;
@@ -607,14 +633,16 @@ export const __ecma262_ParseRFC7231OrToString = (string: bytestring): number => 
     if (Porffor.fastAnd(chr >= 48, chr <= 57)) { // 0-9
       n *= 10;
       n += chr - 48;
+      digits = true;
       continue;
     }
 
+    if (chr == 71) zoned = true; // G(MT)
     if (chr == 45) { // -
-      if (nInd == 4) n = -n;
+      if (nInd == 4) tzSign = -1;
     }
 
-    if (n > 0) {
+    if (digits) {
       if (nInd == 0) y = n;
         else if (nInd == 1) h = n;
         else if (nInd == 2) min = n;
@@ -623,13 +651,16 @@ export const __ecma262_ParseRFC7231OrToString = (string: bytestring): number => 
 
       n = 0;
       nInd++;
+      digits = false;
     }
   }
 
-  return __ecma262_TimeClip(__ecma262_MakeDate(
+  const t: number = __ecma262_MakeDate(
     __ecma262_MakeDay(y, m, dt),
     __ecma262_MakeTime(h, min, s, 0)
-  ));
+  );
+  if (!zoned) return __ecma262_TimeClip(__ecma262_UTC(t));
+  return __ecma262_TimeClip(t - tzSign * (Math.trunc(tz / 100) * 60 + tz % 100) * 60000);
 };
 
 // 21.4.3.2 Date.parse (string)
@@ -1746,8 +1777,24 @@ export const __ecma262_DateString = (tv: number): bytestring => {
 // 21.4.4.41.3 TimeZoneString (tv)
 // https://tc39.es/ecma262/multipage/numbers-and-dates.html#sec-timezonestring
 export const __ecma262_TimeZoneString = (tv: number) => {
-  // todo: time zone support
-  return '+0000 (UTC)';
+  // 1. Let systemTimeZoneIdentifier be SystemTimeZoneIdentifier().
+  // 2-4. Let offsetNs be the offset of that zone at tv, and offset 𝔽(truncate(offsetNs / 10**6)).
+  const offset: number = __Porffor_tz_offsetMs(tv) / 60000;
+
+  // 5-9. The sign, then the absolute offset's hours and minutes, each two digits.
+  const out: bytestring = Porffor.malloc(96);
+  Porffor.IR.storeI32(out, 0, 0);
+  __Porffor_bytestring_appendChar(out, offset < 0 ? 45 : 43); // - or +
+  const abs: number = Math.abs(Math.trunc(offset));
+  __Porffor_bytestring_appendPadNum(out, Math.trunc(abs / 60), 2);
+  __Porffor_bytestring_appendPadNum(out, abs % 60, 2);
+
+  // 10. Let tzName be an implementation-defined string: the zone's IANA name.
+  __Porffor_bytestring_appendChar(out, 32); // ' '
+  __Porffor_bytestring_appendChar(out, 40); // (
+  __Porffor_bytestring_appendStr(out, __Porffor_tz_id());
+  __Porffor_bytestring_appendChar(out, 41); // )
+  return out;
 };
 
 // 21.4.4.41.4 ToDateString (tv)

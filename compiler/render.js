@@ -358,7 +358,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
 
   // flags are derived here (only consumer), no stored func.flags. coroFlags = FN_* kind, fnFlags byte:
   // bits 0-2 coroutine kind, 3 callable (has return type), 4 constructor, 5 generator init suspension,
-  // 6 stackless (runs as a step function over a heap frame, see stackless.js)
+  // 6 stackless (runs as a step function over a heap frame, see stackless.js), 7 a class's constructor
   const FN_CORO_INIT = 1 << 5;
   const FN_STACKLESS = 1 << 6;
   // the coroutines that run without a stack of their own (all but a few: see stackless.js),
@@ -373,7 +373,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
   const isCoro = f => !!(f && (f.async || f.generator));
   const needsCoro = f => !!(f && (f.generator || (f.async && f.hasAwait)));
   const isSyncAsync = f => !!(f && f.async && !f.generator && !needsCoro(f));
-  const fnFlags = f => f ? (coroFlags(f) | (f.returnType != null ? 1 << 3 : 0) | (f.constr ? 1 << 4 : 0)) : 0;
+  const fnFlags = f => f ? (coroFlags(f) | (f.returnType != null ? 1 << 3 : 0) | (f.constr ? 1 << 4 : 0) | (f.isClass ? 1 << 7 : 0)) : 0;
   const jsArg = n => n[N_TYPE] === T.jsval ? rx(n, P_COMMA) : `porf_box_num(${rx(n, P_COMMA)})`;
   const packArg = n => `porf_pack(${jsArg(n)})`;
 
@@ -5156,6 +5156,69 @@ ${st}jsval porf_num_to_exp(f64 d) {
   if (k > 1) { *o++ = '.'; memcpy(o, digs + 1, (size_t)(k - 1)); o += k - 1; }
   o += snprintf(o, 8, "e%c%d", pt - 1 >= 0 ? '+' : '-', pt - 1 >= 0 ? pt - 1 : 1 - pt);
   const int n = (int)(o - buf);
+  const u32 s = porf_bstr_new((u32)n);
+  memcpy(MEM + s + 4, buf, (size_t)n);
+  return porf_box((f64)s, ${TYPES.bytestring});
+}
+
+// The host's time zone, which Date's local time and Temporal.Now read: its offset from UTC
+// at an instant (ms since the epoch, in ms) and its IANA name. Natively libc's: localtime_r
+// for the offset, TZ or the /etc/localtime link for the name. An embedder that can ask its
+// host defines PORF_HOST_TIMEZONE and the two porf_host_tz_* functions (yel-porffor, over
+// wasi:clocks/timezone). Else UTC, as on plain WASI: wasi-libc has no zone data.
+#if defined(PORF_HOST_TIMEZONE)
+f64 porf_host_tz_offset_ms(f64 t);
+int porf_host_tz_id(char* buf, int cap);
+${sti}f64 porf_tz_offset_ms(f64 t) { return t == t ? porf_host_tz_offset_ms(t) : 0; }
+${sti}int porf_tz_id_c(char* buf, int cap) { return porf_host_tz_id(buf, cap); }
+#elif !defined(__wasi__)
+${st}f64 porf_tz_offset_ms(f64 t) {
+  static int ready = 0;
+  if (!ready) { tzset(); ready = 1; }
+  if (t != t) return 0;
+  const time_t s = (time_t)floor(t / 1000.0);
+  struct tm tm;
+  return localtime_r(&s, &tm) ? (f64)tm.tm_gmtoff * 1000.0 : 0;
+}
+${st}int porf_tz_id_c(char* buf, int cap) {
+  // TZ=":Europe/Budapest", TZ="Europe/Budapest" or a path into a zoneinfo directory (an
+  // empty TZ is UTC); with no TZ, what /etc/localtime links to
+  // (/usr/share/zoneinfo/Europe/Budapest)
+  const char* tz = getenv("TZ");
+  char link[256];
+  if (tz && *tz == ':') tz++;
+  if (!tz) {
+    const ssize_t n = readlink("/etc/localtime", link, sizeof link - 1);
+    if (n <= 0) return 0;
+    link[n] = 0;
+    tz = link;
+  }
+  const char* zi = strstr(tz, "zoneinfo/");
+  if (zi) tz = zi + 9;
+  int n = 0;
+  for (; tz[n] && n < cap; n++) {
+    const char c = tz[n];
+    // a POSIX rule (EST5EDT,M3.2.0) or a path is no IANA name: the offset stands in for it
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '/' || c == '_' || c == '-' || c == '+')) return 0;
+    buf[n] = c;
+  }
+  return tz[n] || *tz == '/' ? 0 : n;
+}
+#else
+${sti}f64 porf_tz_offset_ms(f64 t) { (void)t; return 0; }
+${sti}int porf_tz_id_c(char* buf, int cap) { (void)buf; (void)cap; return 0; }
+#endif
+
+// the host time zone's name as a string, "UTC" when it has none, else its offset (+01:00)
+// when it gives no IANA name
+${st}jsval porf_tz_id(void) {
+  char buf[64];
+  int n = porf_tz_id_c(buf, sizeof buf);
+  if (n <= 0) {
+    const i32 off = (i32)(porf_tz_offset_ms(porf_performance_time_origin() + porf_performance_now()) / 60000.0);
+    if (off == 0) { memcpy(buf, "UTC", 3); n = 3; }
+      else n = snprintf(buf, sizeof buf, "%c%02d:%02d", off < 0 ? '-' : '+', abs(off) / 60, abs(off) % 60);
+  }
   const u32 s = porf_bstr_new((u32)n);
   memcpy(MEM + s + 4, buf, (size_t)n);
   return porf_box((f64)s, ${TYPES.bytestring});

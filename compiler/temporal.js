@@ -63,7 +63,8 @@ var Temporal = {
     static _getStringOption(options, name, fallback, allowed) {
       let value = options[name];
       if (value === undefined) return fallback;
-      value = String(value);
+      // ToString (a template: a symbol is a TypeError, where String() would name it)
+      value = \`\${value}\`;
       if (allowed && allowed.indexOf(value) < 0) {
         throw new RangeError('Invalid ' + name);
       }
@@ -81,7 +82,7 @@ var Temporal = {
     }
 
     static _normalizeUnit(unit, name, allowed) {
-      let value = String(unit);
+      let value = \`\${unit}\`;
       if (value.length > 1 && value.charCodeAt(value.length - 1) === 115) {
         const singular = value.slice(0, -1);
         if (
@@ -114,7 +115,7 @@ var Temporal = {
     }
 
     static _normalizeRoundingMode(mode, fallback) {
-      const out = mode === undefined ? (fallback === undefined ? 'halfExpand' : fallback) : String(mode);
+      const out = mode === undefined ? (fallback === undefined ? 'halfExpand' : fallback) : \`\${mode}\`;
       if (out === 'ceil' || out === 'floor' || out === 'trunc' || out === 'expand' ||
         out === 'halfCeil' || out === 'halfFloor' || out === 'halfExpand' || out === 'halfTrunc' || out === 'halfEven') {
         return out;
@@ -334,7 +335,8 @@ var Temporal = {
         else if (v.id !== undefined) v = v.id;
       }
 
-      v = String(v);
+      // an identifier is a string already (a number is no time zone)
+      if (typeof v !== 'string') throw new TypeError('timeZone must be a string');
       if (v.length === 0) throw new RangeError('Invalid timeZone');
       if (v.indexOf('[') >= 0 && v.indexOf(']') > v.indexOf('[')) {
         const ann = Temporal.PlainDate._extractAnnotations(v);
@@ -378,11 +380,19 @@ var Temporal = {
       return v;
     }
 
-    static _timeZoneOffsetNanoseconds(timeZone) {
+    // the zone's offset at an instant (epochNs), or at a wall-clock time (wall: epochNs is
+    // that time read as UTC, and at a gap or a repeat the offset before the transition wins)
+    static _timeZoneOffsetNanoseconds(timeZone, epochNs, wall) {
       const tz = Duration._normalizeTimeZoneId(timeZone, 'timeZone');
       if (tz === 'UTC') return 0;
       if (tz.charCodeAt(0) === 43 || tz.charCodeAt(0) === 45) {
         return Duration._offsetNanoseconds(tz, 'timeZone');
+      }
+      // the host's own zone: the host knows its offset at any instant (no other zone's data)
+      if (tz === __Porffor_tz_id()) {
+        let ms = Math.floor(epochNs / 1000000);
+        if (wall) ms -= __Porffor_tz_offsetMs(ms);
+        return __Porffor_tz_offsetMs(ms) * 1000000;
       }
       return 0;
     }
@@ -400,7 +410,7 @@ var Temporal = {
         else throw new TypeError((label || 'calendar') + ' must be a string');
       }
 
-      v = String(v);
+      if (typeof v !== 'string') throw new TypeError((label || 'calendar') + ' must be a string');
       if (v.indexOf('[') >= 0 && v.indexOf('u-ca=') >= 0) {
         const ann = Temporal.PlainDate._extractAnnotations(v);
         v = ann.calendar;
@@ -652,7 +662,7 @@ var Temporal = {
         return (duration.years * 365 + duration.months * 30 + duration.weeks * 7 + duration.days) * 86400;
       }
 
-      const startMs = Date.UTC(base.year, base.month - 1, base.day);
+      const startMs = Temporal.PlainDate._utcMs(base.year, base.month - 1, base.day);
 
       let year = base.year + duration.years;
       let month = base.month + duration.months;
@@ -669,9 +679,9 @@ var Temporal = {
       const dim = Temporal.PlainDate._daysInMonth(year, month);
       if (day > dim) day = dim;
 
-      const shifted = new Date(Date.UTC(year, month - 1, day));
+      const shifted = new Date(Temporal.PlainDate._utcMs(year, month - 1, day));
       shifted.setUTCDate(shifted.getUTCDate() + duration.weeks * 7 + duration.days);
-      const endMs = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate());
+      const endMs = Temporal.PlainDate._utcMs(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate());
       return (endMs - startMs) / 1000;
     }
 
@@ -1256,7 +1266,7 @@ var Temporal = {
     }
 
     static _epochDay(date) {
-      return Math.trunc(Date.UTC(date._year, date._month - 1, date._day) / 86400000);
+      return Math.trunc(Temporal.PlainDate._utcMs(date._year, date._month - 1, date._day) / 86400000);
     }
 
     static _differenceMonthsDays(lhs, rhs) {
@@ -1325,6 +1335,11 @@ var Temporal = {
         if (eq >= 0) {
           const key = tag.slice(0, eq);
           const val = tag.slice(eq + 1);
+          // a key is lowercase: a letter or _ first, then letters, digits, _ and -
+          for (let k = 0; k < key.length; k++) {
+            const c = key.charCodeAt(k);
+            if (!((c >= 97 && c <= 122) || c === 95 || (k > 0 && ((c >= 48 && c <= 57) || c === 45)))) throw new RangeError('Invalid annotation key');
+          }
           if (key === 'u-ca') {
             if (sawCalendar) throw new RangeError('Duplicate calendar annotation');
             calendar = Temporal.Duration._normalizeCalendarId(val, 'calendar');
@@ -1445,7 +1460,9 @@ var Temporal = {
         let month = monthValue === undefined ? undefined : Temporal.Duration._toInteger(monthValue, 'month');
         const monthCodeValue = value.monthCode;
         if (monthCodeValue !== undefined) {
-          const monthCode = String(monthCodeValue);
+          // ToPrimitive, then a string it must be
+          const monthCode = typeof monthCodeValue === 'object' || typeof monthCodeValue === 'function' ? \`\${monthCodeValue}\` : monthCodeValue;
+          if (typeof monthCode !== 'string') throw new TypeError('monthCode must be a string');
           if (monthCode.length !== 3 || monthCode.charCodeAt(0) !== 77) throw new RangeError('Invalid monthCode');
           const parsedMonth = Temporal.Duration._parseNDigits(monthCode, 1, 2);
           if (parsedMonth < 1 || parsedMonth > 12) throw new RangeError('Invalid monthCode');
@@ -1478,11 +1495,11 @@ var Temporal = {
     }
 
     static _isoWeek(date) {
-      const tmp = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+      const tmp = Temporal.PlainDate._utcDate(date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate());
       const day = tmp.getUTCDay();
       const isoDay = day === 0 ? 7 : day;
       tmp.setUTCDate(tmp.getUTCDate() + 4 - isoDay);
-      const yearStart = new Date(Date.UTC(tmp.getUTCFullYear(), 0, 1));
+      const yearStart = Temporal.PlainDate._utcDate(tmp.getUTCFullYear(), 1, 1);
       const diff = Math.floor((tmp - yearStart) / 86400000);
       const week = Math.floor(diff / 7) + 1;
       return { week, year: tmp.getUTCFullYear() };
@@ -1492,32 +1509,48 @@ var Temporal = {
     get month() { return Temporal.PlainDate._requireThis(this, 'month')._month; }
     get day() { return Temporal.PlainDate._requireThis(this, 'day')._day; }
     get calendarId() { return Temporal.PlainDate._requireThis(this, 'calendarId')._calendar; }
-    get monthCode() { return 'M' + Temporal.Duration._pad(this.month, 2); }
+    get monthCode() { Temporal.PlainDate._requireThis(this, 'monthCode'); return 'M' + Temporal.Duration._pad(this.month, 2); }
+    // Date.UTC's time value, at the full year (Date.UTC reads years 0 to 99 as 1900 to 1999);
+    // month from 0, and fields past their range carry over as there
+    static _utcMs(year, month, day, hour = 0, minute = 0, second = 0, millisecond = 0) {
+      const d = new Date(0);
+      d.setUTCFullYear(year, month, day);
+      d.setUTCHours(hour, minute, second, millisecond);
+      return d.getTime();
+    }
+    // (a Date at the full year: Date.UTC would read years 0 to 99 as 1900 to 1999)
+    static _utcDate(year, month, day) {
+      const d = new Date(0);
+      d.setUTCFullYear(year, month - 1, day);
+      return d;
+    }
     get dayOfWeek() {
-      const d = new Date(Date.UTC(this.year, this.month - 1, this.day));
-      const x = d.getUTCDay();
+      Temporal.PlainDate._requireThis(this, 'dayOfWeek');
+      const x = Temporal.PlainDate._utcDate(this.year, this.month, this.day).getUTCDay();
       return x === 0 ? 7 : x;
     }
     get dayOfYear() {
-      const d = new Date(Date.UTC(this.year, this.month - 1, this.day));
-      const s = new Date(Date.UTC(this.year, 0, 1));
+      Temporal.PlainDate._requireThis(this, 'dayOfYear');
+      const d = Temporal.PlainDate._utcDate(this.year, this.month, this.day);
+      const s = Temporal.PlainDate._utcDate(this.year, 1, 1);
       return Math.floor((d - s) / 86400000) + 1;
     }
     get weekOfYear() {
-      const d = new Date(Date.UTC(this.year, this.month - 1, this.day));
-      return Temporal.PlainDate._isoWeek(d).week;
+      Temporal.PlainDate._requireThis(this, 'weekOfYear');
+      return Temporal.PlainDate._isoWeek(Temporal.PlainDate._utcDate(this.year, this.month, this.day)).week;
     }
     get yearOfWeek() {
-      const d = new Date(Date.UTC(this.year, this.month - 1, this.day));
-      return Temporal.PlainDate._isoWeek(d).year;
+      Temporal.PlainDate._requireThis(this, 'yearOfWeek');
+      return Temporal.PlainDate._isoWeek(Temporal.PlainDate._utcDate(this.year, this.month, this.day)).year;
     }
-    get daysInWeek() { return 7; }
-    get daysInMonth() { return Temporal.PlainDate._daysInMonth(this.year, this.month); }
-    get daysInYear() { return Temporal.PlainDate._isLeapYear(this.year) ? 366 : 365; }
-    get monthsInYear() { return 12; }
-    get inLeapYear() { return Temporal.PlainDate._isLeapYear(this.year); }
-    get era() { return this.year <= 0 ? 'bce' : 'ce'; }
-    get eraYear() { return this.year <= 0 ? 1 - this.year : this.year; }
+    get daysInWeek() { Temporal.PlainDate._requireThis(this, 'daysInWeek'); return 7; }
+    get daysInMonth() { Temporal.PlainDate._requireThis(this, 'daysInMonth'); return Temporal.PlainDate._daysInMonth(this.year, this.month); }
+    get daysInYear() { Temporal.PlainDate._requireThis(this, 'daysInYear'); return Temporal.PlainDate._isLeapYear(this.year) ? 366 : 365; }
+    get monthsInYear() { Temporal.PlainDate._requireThis(this, 'monthsInYear'); return 12; }
+    get inLeapYear() { Temporal.PlainDate._requireThis(this, 'inLeapYear'); return Temporal.PlainDate._isLeapYear(this.year); }
+    // the ISO calendar has no eras
+    get era() { Temporal.PlainDate._requireThis(this, 'era'); return undefined; }
+    get eraYear() { Temporal.PlainDate._requireThis(this, 'eraYear'); return undefined; }
 
     with(item, options) {
       const d = Temporal.PlainDate._requireThis(this, 'with');
@@ -1561,7 +1594,7 @@ var Temporal = {
         if (day > dim) day = dim;
       }
 
-      const date = new Date(Date.UTC(year, month - 1, day));
+      const date = new Date(Temporal.PlainDate._utcMs(year, month - 1, day));
       const dayDelta = d.weeks * 7 + d.days;
       if (dayDelta !== 0) date.setUTCDate(date.getUTCDate() + dayDelta);
       if (d.hours || d.minutes || d.seconds || d.milliseconds || d.microseconds || d.nanoseconds) {
@@ -1649,6 +1682,16 @@ var Temporal = {
     equals(other) {
       Temporal.PlainDate._requireThis(this, 'equals');
       return Temporal.PlainDate.compare(this, other) === 0 && this._calendar === Temporal.PlainDate.from(other)._calendar;
+    }
+
+    toPlainYearMonth() {
+      Temporal.PlainDate._requireThis(this, 'toPlainYearMonth');
+      return new Temporal.PlainYearMonth(this._year, this._month, this._calendar);
+    }
+
+    toPlainMonthDay() {
+      Temporal.PlainDate._requireThis(this, 'toPlainMonthDay');
+      return new Temporal.PlainMonthDay(this._month, this._day, this._calendar);
     }
 
     toPlainDateTime(item) {
@@ -2028,8 +2071,8 @@ var Temporal = {
       return Temporal.Duration._offsetNanoseconds(offsetText, 'offset');
     }
 
-    static _timeZoneOffsetNanoseconds(timeZone) {
-      return Temporal.Duration._timeZoneOffsetNanoseconds(timeZone);
+    static _timeZoneOffsetNanoseconds(timeZone, epochNs, wall) {
+      return Temporal.Duration._timeZoneOffsetNanoseconds(timeZone, epochNs, wall);
     }
 
     static _parseISODateTimeString(value) {
@@ -2113,14 +2156,14 @@ var Temporal = {
       const d = parts.date;
       const t = parts.time;
 
-      const ms = Date.UTC(d.year, d.month - 1, d.day, t.hour, t.minute, t.second, t.millisecond);
+      const ms = Temporal.PlainDate._utcMs(d.year, d.month - 1, d.day, t.hour, t.minute, t.second, t.millisecond);
       let ns = ms * 1000000 + t.microsecond * 1000 + t.nanosecond;
 
       let offset = 0;
       if (parts.offsetNanoseconds != null && preferOffset !== false) {
         offset = parts.offsetNanoseconds;
       } else if (parts.timeZone !== undefined) {
-        offset = Temporal.PlainDateTime._timeZoneOffsetNanoseconds(parts.timeZone);
+        offset = Temporal.PlainDateTime._timeZoneOffsetNanoseconds(parts.timeZone, ns, true);
       }
 
       ns -= offset;
@@ -2196,9 +2239,9 @@ var Temporal = {
     }
 
     static _toEpochNanoseconds(dt, timeZone) {
-      const ms = Date.UTC(dt._year, dt._month - 1, dt._day, dt._hour, dt._minute, dt._second, dt._millisecond);
+      const ms = Temporal.PlainDate._utcMs(dt._year, dt._month - 1, dt._day, dt._hour, dt._minute, dt._second, dt._millisecond);
       const frac = dt._microsecond * 1000 + dt._nanosecond;
-      const offset = Temporal.PlainDateTime._timeZoneOffsetNanoseconds(timeZone);
+      const offset = Temporal.PlainDateTime._timeZoneOffsetNanoseconds(timeZone, ms * 1000000, true);
       return ms * 1000000 + frac - offset;
     }
 
@@ -2212,16 +2255,18 @@ var Temporal = {
     get microsecond() { return Temporal.PlainDateTime._requireThis(this, 'microsecond')._microsecond; }
     get nanosecond() { return Temporal.PlainDateTime._requireThis(this, 'nanosecond')._nanosecond; }
     get calendarId() { return Temporal.PlainDateTime._requireThis(this, 'calendarId')._calendar; }
-    get monthCode() { return 'M' + Temporal.Duration._pad(this.month, 2); }
-    get dayOfWeek() { return this.toPlainDate().dayOfWeek; }
-    get dayOfYear() { return this.toPlainDate().dayOfYear; }
-    get weekOfYear() { return this.toPlainDate().weekOfYear; }
-    get yearOfWeek() { return this.toPlainDate().yearOfWeek; }
-    get daysInWeek() { return 7; }
-    get daysInMonth() { return this.toPlainDate().daysInMonth; }
-    get daysInYear() { return this.toPlainDate().daysInYear; }
-    get monthsInYear() { return 12; }
-    get inLeapYear() { return this.toPlainDate().inLeapYear; }
+    get monthCode() { Temporal.PlainDateTime._requireThis(this, 'monthCode'); return 'M' + Temporal.Duration._pad(this.month, 2); }
+    get era() { Temporal.PlainDateTime._requireThis(this, 'era'); return undefined; }
+    get eraYear() { Temporal.PlainDateTime._requireThis(this, 'eraYear'); return undefined; }
+    get dayOfWeek() { Temporal.PlainDateTime._requireThis(this, 'dayOfWeek'); return this.toPlainDate().dayOfWeek; }
+    get dayOfYear() { Temporal.PlainDateTime._requireThis(this, 'dayOfYear'); return this.toPlainDate().dayOfYear; }
+    get weekOfYear() { Temporal.PlainDateTime._requireThis(this, 'weekOfYear'); return this.toPlainDate().weekOfYear; }
+    get yearOfWeek() { Temporal.PlainDateTime._requireThis(this, 'yearOfWeek'); return this.toPlainDate().yearOfWeek; }
+    get daysInWeek() { Temporal.PlainDateTime._requireThis(this, 'daysInWeek'); return 7; }
+    get daysInMonth() { Temporal.PlainDateTime._requireThis(this, 'daysInMonth'); return this.toPlainDate().daysInMonth; }
+    get daysInYear() { Temporal.PlainDateTime._requireThis(this, 'daysInYear'); return this.toPlainDate().daysInYear; }
+    get monthsInYear() { Temporal.PlainDateTime._requireThis(this, 'monthsInYear'); return 12; }
+    get inLeapYear() { Temporal.PlainDateTime._requireThis(this, 'inLeapYear'); return this.toPlainDate().inLeapYear; }
 
     with(item, options) {
       const d = Temporal.PlainDateTime._requireThis(this, 'with');
@@ -2241,6 +2286,13 @@ var Temporal = {
         item.nanosecond === undefined ? d._nanosecond : item.nanosecond,
         item.calendar === undefined ? d._calendar : item.calendar
       );
+    }
+
+    withPlainTime(plainTimeLike = undefined) {
+      Temporal.PlainDateTime._requireThis(this, 'withPlainTime');
+      // no time: midnight
+      const time = plainTimeLike === undefined ? new Temporal.PlainTime() : Temporal.PlainTime.from(plainTimeLike);
+      return new Temporal.PlainDateTime(this._year, this._month, this._day, time.hour, time.minute, time.second, time.millisecond, time.microsecond, time.nanosecond, this._calendar);
     }
 
     withCalendar(calendar) {
@@ -2271,7 +2323,7 @@ var Temporal = {
         if (day > dim) day = dim;
       }
 
-      const ms = Date.UTC(year, month - 1, day, this._hour, this._minute, this._second, this._millisecond);
+      const ms = Temporal.PlainDate._utcMs(year, month - 1, day, this._hour, this._minute, this._second, this._millisecond);
       let ns = ms * 1000000 + this._microsecond * 1000 + this._nanosecond;
       const dayAndTime = new Temporal.Duration(0, 0, d.weeks, d.days, d.hours, d.minutes, d.seconds, d.milliseconds, d.microseconds, d.nanoseconds);
       ns += Temporal.Duration._totalNanoseconds(dayAndTime);
@@ -2500,14 +2552,14 @@ var Temporal = {
 
     get year() { return Temporal.PlainYearMonth._requireThis(this, 'year')._year; }
     get month() { return Temporal.PlainYearMonth._requireThis(this, 'month')._month; }
-    get monthCode() { return 'M' + Temporal.Duration._pad(this.month, 2); }
+    get monthCode() { Temporal.PlainYearMonth._requireThis(this, 'monthCode'); return 'M' + Temporal.Duration._pad(this.month, 2); }
     get calendarId() { return Temporal.PlainYearMonth._requireThis(this, 'calendarId')._calendar; }
-    get daysInMonth() { return Temporal.PlainDate._daysInMonth(this.year, this.month); }
-    get daysInYear() { return Temporal.PlainDate._isLeapYear(this.year) ? 366 : 365; }
-    get monthsInYear() { return 12; }
-    get inLeapYear() { return Temporal.PlainDate._isLeapYear(this.year); }
-    get era() { return this.year <= 0 ? 'bce' : 'ce'; }
-    get eraYear() { return this.year <= 0 ? 1 - this.year : this.year; }
+    get daysInMonth() { Temporal.PlainYearMonth._requireThis(this, 'daysInMonth'); return Temporal.PlainDate._daysInMonth(this.year, this.month); }
+    get daysInYear() { Temporal.PlainYearMonth._requireThis(this, 'daysInYear'); return Temporal.PlainDate._isLeapYear(this.year) ? 366 : 365; }
+    get monthsInYear() { Temporal.PlainYearMonth._requireThis(this, 'monthsInYear'); return 12; }
+    get inLeapYear() { Temporal.PlainYearMonth._requireThis(this, 'inLeapYear'); return Temporal.PlainDate._isLeapYear(this.year); }
+    get era() { Temporal.PlainYearMonth._requireThis(this, 'era'); return this.year <= 0 ? 'bce' : 'ce'; }
+    get eraYear() { Temporal.PlainYearMonth._requireThis(this, 'eraYear'); return this.year <= 0 ? 1 - this.year : this.year; }
 
     with(item, options) {
       const ym = Temporal.PlainYearMonth._requireThis(this, 'with');
@@ -2607,6 +2659,8 @@ var Temporal = {
       const y = Temporal.Duration._formatIsoYear(this._year);
       const m = Temporal.Duration._pad(this._month, 2);
       let out = y + '-' + m;
+      // with the reference day after it when a calendar is shown (TemporalYearMonthToString)
+      if (calendarName === 'always' || calendarName === 'critical' || this._calendar !== 'iso8601') out += '-' + Temporal.Duration._pad(this._referenceISODay, 2);
       if (calendarName === 'always') {
         out += '[u-ca=' + this._calendar + ']';
       } else if (calendarName === 'critical') {
@@ -2665,14 +2719,20 @@ var Temporal = {
         const t = txt.indexOf('T');
         if (t >= 0) txt = txt.slice(0, t);
 
+        // a whole date: its month and day (the ISO calendar's reference year is always 1972)
         if (txt.length >= 10) {
           const d = Temporal.PlainDate._parseDatePart(txt);
-          return new Temporal.PlainMonthDay(d.month, d.day, ann.calendar, d.year);
+          const iso = ann.calendar === undefined || String(ann.calendar).toLowerCase() === 'iso8601';
+          return new Temporal.PlainMonthDay(d.month, d.day, ann.calendar, iso ? 1972 : d.year);
         }
 
-        if (txt.length === 7 && txt.charCodeAt(0) === 45 && txt.charCodeAt(1) === 45 && txt.charCodeAt(4) === 45) {
-          const month = Temporal.Duration._parseNDigits(txt, 2, 2);
-          const day = Temporal.Duration._parseNDigits(txt, 5, 2);
+        // a month and day: --MM-DD, --MMDD, MM-DD or MMDD
+        let md = txt;
+        if (md.charCodeAt(0) === 45 && md.charCodeAt(1) === 45) md = md.slice(2);
+        if (md.length === 5 && md.charCodeAt(2) === 45) md = md.slice(0, 2) + md.slice(3);
+        if (md.length === 4) {
+          const month = Temporal.Duration._parseNDigits(md, 0, 2);
+          const day = Temporal.Duration._parseNDigits(md, 2, 2);
           if (month < 0 || day < 0) throw new RangeError('Invalid PlainMonthDay string');
           return new Temporal.PlainMonthDay(month, day, ann.calendar, 1972);
         }
@@ -2760,7 +2820,9 @@ var Temporal = {
       const opts = Temporal.Duration._toOptions(options);
       const calendarName = Temporal.Duration._getStringOption(opts, 'calendarName', 'auto', [ 'auto', 'always', 'never', 'critical' ]);
 
-      let out = '--' + Temporal.Duration._pad(this._month, 2) + '-' + Temporal.Duration._pad(this._day, 2);
+      // MM-DD, with the reference year before it when a calendar is shown (TemporalMonthDayToString)
+      let out = Temporal.Duration._pad(this._month, 2) + '-' + Temporal.Duration._pad(this._day, 2);
+      if (calendarName === 'always' || calendarName === 'critical' || this._calendar !== 'iso8601') out = Temporal.Duration._formatIsoYear(this._referenceISOYear) + '-' + out;
       if (calendarName === 'always') {
         out += '[u-ca=' + this._calendar + ']';
       } else if (calendarName === 'critical') {
@@ -2805,7 +2867,7 @@ var Temporal = {
     }
 
     static _instantToPlainDateTime(epochNanoseconds, timeZone, calendar) {
-      const offset = Temporal.PlainDateTime._timeZoneOffsetNanoseconds(timeZone);
+      const offset = Temporal.PlainDateTime._timeZoneOffsetNanoseconds(timeZone, epochNanoseconds);
       let local = epochNanoseconds + offset;
       let ms = local >= 0 ? Math.trunc(local / 1000000) : Math.floor(local / 1000000);
       let rem = local - ms * 1000000;
@@ -2880,27 +2942,32 @@ var Temporal = {
     get timeZoneId() { return Temporal.ZonedDateTime._requireThis(this, 'timeZoneId')._timeZone; }
     get calendarId() { return Temporal.ZonedDateTime._requireThis(this, 'calendarId')._calendar; }
 
-    get year() { return this.toPlainDateTime().year; }
-    get month() { return this.toPlainDateTime().month; }
-    get day() { return this.toPlainDateTime().day; }
-    get hour() { return this.toPlainDateTime().hour; }
-    get minute() { return this.toPlainDateTime().minute; }
-    get second() { return this.toPlainDateTime().second; }
-    get millisecond() { return this.toPlainDateTime().millisecond; }
-    get microsecond() { return this.toPlainDateTime().microsecond; }
-    get nanosecond() { return this.toPlainDateTime().nanosecond; }
-    get monthCode() { return this.toPlainDateTime().monthCode; }
-    get dayOfWeek() { return this.toPlainDateTime().dayOfWeek; }
-    get dayOfYear() { return this.toPlainDateTime().dayOfYear; }
-    get weekOfYear() { return this.toPlainDateTime().weekOfYear; }
-    get yearOfWeek() { return this.toPlainDateTime().yearOfWeek; }
-    get daysInWeek() { return this.toPlainDateTime().daysInWeek; }
-    get daysInMonth() { return this.toPlainDateTime().daysInMonth; }
-    get daysInYear() { return this.toPlainDateTime().daysInYear; }
-    get monthsInYear() { return this.toPlainDateTime().monthsInYear; }
-    get inLeapYear() { return this.toPlainDateTime().inLeapYear; }
-    get offsetNanoseconds() { return Temporal.PlainDateTime._timeZoneOffsetNanoseconds(this._timeZone); }
+    get year() { Temporal.ZonedDateTime._requireThis(this, 'year'); return this.toPlainDateTime().year; }
+    get month() { Temporal.ZonedDateTime._requireThis(this, 'month'); return this.toPlainDateTime().month; }
+    get day() { Temporal.ZonedDateTime._requireThis(this, 'day'); return this.toPlainDateTime().day; }
+    get hour() { Temporal.ZonedDateTime._requireThis(this, 'hour'); return this.toPlainDateTime().hour; }
+    get minute() { Temporal.ZonedDateTime._requireThis(this, 'minute'); return this.toPlainDateTime().minute; }
+    get second() { Temporal.ZonedDateTime._requireThis(this, 'second'); return this.toPlainDateTime().second; }
+    get millisecond() { Temporal.ZonedDateTime._requireThis(this, 'millisecond'); return this.toPlainDateTime().millisecond; }
+    get microsecond() { Temporal.ZonedDateTime._requireThis(this, 'microsecond'); return this.toPlainDateTime().microsecond; }
+    get nanosecond() { Temporal.ZonedDateTime._requireThis(this, 'nanosecond'); return this.toPlainDateTime().nanosecond; }
+    get monthCode() { Temporal.ZonedDateTime._requireThis(this, 'monthCode'); return this.toPlainDateTime().monthCode; }
+    get era() { Temporal.ZonedDateTime._requireThis(this, 'era'); return undefined; }
+    get eraYear() { Temporal.ZonedDateTime._requireThis(this, 'eraYear'); return undefined; }
+    get dayOfWeek() { Temporal.ZonedDateTime._requireThis(this, 'dayOfWeek'); return this.toPlainDateTime().dayOfWeek; }
+    get dayOfYear() { Temporal.ZonedDateTime._requireThis(this, 'dayOfYear'); return this.toPlainDateTime().dayOfYear; }
+    get weekOfYear() { Temporal.ZonedDateTime._requireThis(this, 'weekOfYear'); return this.toPlainDateTime().weekOfYear; }
+    get yearOfWeek() { Temporal.ZonedDateTime._requireThis(this, 'yearOfWeek'); return this.toPlainDateTime().yearOfWeek; }
+    get daysInWeek() { Temporal.ZonedDateTime._requireThis(this, 'daysInWeek'); return this.toPlainDateTime().daysInWeek; }
+    get daysInMonth() { Temporal.ZonedDateTime._requireThis(this, 'daysInMonth'); return this.toPlainDateTime().daysInMonth; }
+    get daysInYear() { Temporal.ZonedDateTime._requireThis(this, 'daysInYear'); return this.toPlainDateTime().daysInYear; }
+    get monthsInYear() { Temporal.ZonedDateTime._requireThis(this, 'monthsInYear'); return this.toPlainDateTime().monthsInYear; }
+    get inLeapYear() { Temporal.ZonedDateTime._requireThis(this, 'inLeapYear'); return this.toPlainDateTime().inLeapYear; }
+    // a day is 24 hours in UTC and at a fixed offset (as this computes every time zone)
+    get hoursInDay() { Temporal.ZonedDateTime._requireThis(this, 'hoursInDay'); return 24; }
+    get offsetNanoseconds() { Temporal.ZonedDateTime._requireThis(this, 'offsetNanoseconds'); return Temporal.PlainDateTime._timeZoneOffsetNanoseconds(this._timeZone, this._epochNanoseconds); }
     get offset() {
+      Temporal.ZonedDateTime._requireThis(this, 'offset');
       return Temporal.Duration._formatOffsetNanoseconds(this.offsetNanoseconds);
     }
 
@@ -2920,6 +2987,24 @@ var Temporal = {
     withCalendar(calendar) {
       Temporal.ZonedDateTime._requireThis(this, 'withCalendar');
       return new Temporal.ZonedDateTime(this._epochNanoseconds, this._timeZone, calendar);
+    }
+
+    withPlainTime(plainTimeLike = undefined) {
+      Temporal.ZonedDateTime._requireThis(this, 'withPlainTime');
+      // no time: the start of the day
+      if (plainTimeLike === undefined) return this.startOfDay();
+      const time = Temporal.PlainTime.from(plainTimeLike);
+      return this.toPlainDateTime().withPlainTime(time).toZonedDateTime(this._timeZone);
+    }
+
+    getTimeZoneTransition(directionParam) {
+      Temporal.ZonedDateTime._requireThis(this, 'getTimeZoneTransition');
+      if (directionParam === undefined) throw new TypeError('getTimeZoneTransition requires a direction');
+      const opts = typeof directionParam === 'string' ? { direction: directionParam } : Temporal.Duration._toOptions(directionParam);
+      const direction = Temporal.Duration._getStringOption(opts, 'direction', undefined, [ 'next', 'previous' ]);
+      if (direction === undefined) throw new RangeError('direction is required');
+      // UTC and fixed offsets have no transitions (and this computes named zones as those)
+      return null;
     }
 
     withTimeZone(timeZone) {
@@ -3065,30 +3150,178 @@ var Temporal = {
     },
 
     plainDateISO(timeZone = undefined) {
-      const tz = Temporal.Duration._normalizeTimeZoneId(timeZone === undefined ? 'UTC' : timeZone, 'timeZone');
+      const tz = Temporal.Duration._normalizeTimeZoneId(timeZone === undefined ? __Porffor_tz_id() : timeZone, 'timeZone');
       const instant = Temporal.Now.instant();
       return Temporal.ZonedDateTime._instantToPlainDateTime(instant.epochNanoseconds, tz, 'iso8601').toPlainDate();
     },
 
     plainTimeISO(timeZone = undefined) {
-      const tz = Temporal.Duration._normalizeTimeZoneId(timeZone === undefined ? 'UTC' : timeZone, 'timeZone');
+      const tz = Temporal.Duration._normalizeTimeZoneId(timeZone === undefined ? __Porffor_tz_id() : timeZone, 'timeZone');
       const instant = Temporal.Now.instant();
       return Temporal.ZonedDateTime._instantToPlainDateTime(instant.epochNanoseconds, tz, 'iso8601').toPlainTime();
     },
 
     plainDateTimeISO(timeZone = undefined) {
-      const tz = Temporal.Duration._normalizeTimeZoneId(timeZone === undefined ? 'UTC' : timeZone, 'timeZone');
+      const tz = Temporal.Duration._normalizeTimeZoneId(timeZone === undefined ? __Porffor_tz_id() : timeZone, 'timeZone');
       const instant = Temporal.Now.instant();
       return Temporal.ZonedDateTime._instantToPlainDateTime(instant.epochNanoseconds, tz, 'iso8601');
     },
 
     zonedDateTimeISO(timeZone = undefined) {
-      const tz = Temporal.Duration._normalizeTimeZoneId(timeZone === undefined ? 'UTC' : timeZone, 'timeZone');
+      const tz = Temporal.Duration._normalizeTimeZoneId(timeZone === undefined ? __Porffor_tz_id() : timeZone, 'timeZone');
       return Temporal.Now.instant().toZonedDateTimeISO(tz);
     },
 
     timeZoneId() {
-      return 'UTC';
+      return __Porffor_tz_id();
     }
   }
-};`;
+};
+
+// what the classes and object literals above do not say as the spec does: each function's
+// length (a parameter with a default stops the count here, the spec counts its own way),
+// [Symbol.toStringTag] on each prototype, Temporal and Temporal.Now, and the namespaces'
+// members not enumerable
+(() => {
+  // (a method not implemented here is skipped)
+  const len = (f, n) => { if (typeof f === 'function') Object.defineProperty(f, 'length', { value: n, configurable: true }); };
+  len(Temporal.Duration, 0);
+  len(Temporal.Duration.compare, 2);
+  len(Temporal.Duration.from, 1);
+  len(Temporal.Duration.prototype.abs, 0);
+  len(Temporal.Duration.prototype.add, 1);
+  len(Temporal.Duration.prototype.negated, 0);
+  len(Temporal.Duration.prototype.round, 1);
+  len(Temporal.Duration.prototype.subtract, 1);
+  len(Temporal.Duration.prototype.toJSON, 0);
+  len(Temporal.Duration.prototype.toLocaleString, 0);
+  len(Temporal.Duration.prototype.toString, 0);
+  len(Temporal.Duration.prototype.total, 1);
+  len(Temporal.Duration.prototype.valueOf, 0);
+  len(Temporal.Duration.prototype.with, 1);
+  len(Temporal.Instant, 1);
+  len(Temporal.Instant.compare, 2);
+  len(Temporal.Instant.from, 1);
+  len(Temporal.Instant.fromEpochMilliseconds, 1);
+  len(Temporal.Instant.fromEpochNanoseconds, 1);
+  len(Temporal.Instant.prototype.add, 1);
+  len(Temporal.Instant.prototype.equals, 1);
+  len(Temporal.Instant.prototype.round, 1);
+  len(Temporal.Instant.prototype.since, 1);
+  len(Temporal.Instant.prototype.subtract, 1);
+  len(Temporal.Instant.prototype.toJSON, 0);
+  len(Temporal.Instant.prototype.toLocaleString, 0);
+  len(Temporal.Instant.prototype.toString, 0);
+  len(Temporal.Instant.prototype.toZonedDateTimeISO, 1);
+  len(Temporal.Instant.prototype.until, 1);
+  len(Temporal.Instant.prototype.valueOf, 0);
+  len(Temporal.Now.instant, 0);
+  len(Temporal.Now.plainDateISO, 0);
+  len(Temporal.Now.plainDateTimeISO, 0);
+  len(Temporal.Now.plainTimeISO, 0);
+  len(Temporal.Now.timeZoneId, 0);
+  len(Temporal.Now.zonedDateTimeISO, 0);
+  len(Temporal.PlainDate, 3);
+  len(Temporal.PlainDate.compare, 2);
+  len(Temporal.PlainDate.from, 1);
+  len(Temporal.PlainDate.prototype.add, 1);
+  len(Temporal.PlainDate.prototype.equals, 1);
+  len(Temporal.PlainDate.prototype.since, 1);
+  len(Temporal.PlainDate.prototype.subtract, 1);
+  len(Temporal.PlainDate.prototype.toJSON, 0);
+  len(Temporal.PlainDate.prototype.toLocaleString, 0);
+  len(Temporal.PlainDate.prototype.toPlainDateTime, 0);
+  len(Temporal.PlainDate.prototype.toPlainMonthDay, 0);
+  len(Temporal.PlainDate.prototype.toPlainYearMonth, 0);
+  len(Temporal.PlainDate.prototype.toString, 0);
+  len(Temporal.PlainDate.prototype.toZonedDateTime, 1);
+  len(Temporal.PlainDate.prototype.until, 1);
+  len(Temporal.PlainDate.prototype.valueOf, 0);
+  len(Temporal.PlainDate.prototype.with, 1);
+  len(Temporal.PlainDate.prototype.withCalendar, 1);
+  len(Temporal.PlainDateTime, 3);
+  len(Temporal.PlainDateTime.compare, 2);
+  len(Temporal.PlainDateTime.from, 1);
+  len(Temporal.PlainDateTime.prototype.add, 1);
+  len(Temporal.PlainDateTime.prototype.equals, 1);
+  len(Temporal.PlainDateTime.prototype.round, 1);
+  len(Temporal.PlainDateTime.prototype.since, 1);
+  len(Temporal.PlainDateTime.prototype.subtract, 1);
+  len(Temporal.PlainDateTime.prototype.toJSON, 0);
+  len(Temporal.PlainDateTime.prototype.toLocaleString, 0);
+  len(Temporal.PlainDateTime.prototype.toPlainDate, 0);
+  len(Temporal.PlainDateTime.prototype.toPlainTime, 0);
+  len(Temporal.PlainDateTime.prototype.toString, 0);
+  len(Temporal.PlainDateTime.prototype.toZonedDateTime, 1);
+  len(Temporal.PlainDateTime.prototype.until, 1);
+  len(Temporal.PlainDateTime.prototype.valueOf, 0);
+  len(Temporal.PlainDateTime.prototype.with, 1);
+  len(Temporal.PlainDateTime.prototype.withCalendar, 1);
+  len(Temporal.PlainDateTime.prototype.withPlainTime, 0);
+  len(Temporal.PlainMonthDay, 2);
+  len(Temporal.PlainMonthDay.from, 1);
+  len(Temporal.PlainMonthDay.prototype.equals, 1);
+  len(Temporal.PlainMonthDay.prototype.toJSON, 0);
+  len(Temporal.PlainMonthDay.prototype.toLocaleString, 0);
+  len(Temporal.PlainMonthDay.prototype.toPlainDate, 1);
+  len(Temporal.PlainMonthDay.prototype.toString, 0);
+  len(Temporal.PlainMonthDay.prototype.valueOf, 0);
+  len(Temporal.PlainMonthDay.prototype.with, 1);
+  len(Temporal.PlainTime, 0);
+  len(Temporal.PlainTime.compare, 2);
+  len(Temporal.PlainTime.from, 1);
+  len(Temporal.PlainTime.prototype.add, 1);
+  len(Temporal.PlainTime.prototype.equals, 1);
+  len(Temporal.PlainTime.prototype.round, 1);
+  len(Temporal.PlainTime.prototype.since, 1);
+  len(Temporal.PlainTime.prototype.subtract, 1);
+  len(Temporal.PlainTime.prototype.toJSON, 0);
+  len(Temporal.PlainTime.prototype.toLocaleString, 0);
+  len(Temporal.PlainTime.prototype.toString, 0);
+  len(Temporal.PlainTime.prototype.until, 1);
+  len(Temporal.PlainTime.prototype.valueOf, 0);
+  len(Temporal.PlainTime.prototype.with, 1);
+  len(Temporal.PlainYearMonth, 2);
+  len(Temporal.PlainYearMonth.compare, 2);
+  len(Temporal.PlainYearMonth.from, 1);
+  len(Temporal.PlainYearMonth.prototype.add, 1);
+  len(Temporal.PlainYearMonth.prototype.equals, 1);
+  len(Temporal.PlainYearMonth.prototype.since, 1);
+  len(Temporal.PlainYearMonth.prototype.subtract, 1);
+  len(Temporal.PlainYearMonth.prototype.toJSON, 0);
+  len(Temporal.PlainYearMonth.prototype.toLocaleString, 0);
+  len(Temporal.PlainYearMonth.prototype.toPlainDate, 1);
+  len(Temporal.PlainYearMonth.prototype.toString, 0);
+  len(Temporal.PlainYearMonth.prototype.until, 1);
+  len(Temporal.PlainYearMonth.prototype.valueOf, 0);
+  len(Temporal.PlainYearMonth.prototype.with, 1);
+  len(Temporal.ZonedDateTime, 2);
+  len(Temporal.ZonedDateTime.compare, 2);
+  len(Temporal.ZonedDateTime.from, 1);
+  len(Temporal.ZonedDateTime.prototype.add, 1);
+  len(Temporal.ZonedDateTime.prototype.equals, 1);
+  len(Temporal.ZonedDateTime.prototype.getTimeZoneTransition, 1);
+  len(Temporal.ZonedDateTime.prototype.round, 1);
+  len(Temporal.ZonedDateTime.prototype.since, 1);
+  len(Temporal.ZonedDateTime.prototype.startOfDay, 0);
+  len(Temporal.ZonedDateTime.prototype.subtract, 1);
+  len(Temporal.ZonedDateTime.prototype.toInstant, 0);
+  len(Temporal.ZonedDateTime.prototype.toJSON, 0);
+  len(Temporal.ZonedDateTime.prototype.toLocaleString, 0);
+  len(Temporal.ZonedDateTime.prototype.toPlainDate, 0);
+  len(Temporal.ZonedDateTime.prototype.toPlainDateTime, 0);
+  len(Temporal.ZonedDateTime.prototype.toPlainTime, 0);
+  len(Temporal.ZonedDateTime.prototype.toString, 0);
+  len(Temporal.ZonedDateTime.prototype.until, 1);
+  len(Temporal.ZonedDateTime.prototype.valueOf, 0);
+  len(Temporal.ZonedDateTime.prototype.with, 1);
+  len(Temporal.ZonedDateTime.prototype.withCalendar, 1);
+  len(Temporal.ZonedDateTime.prototype.withPlainTime, 0);
+  len(Temporal.ZonedDateTime.prototype.withTimeZone, 1);
+  const tag = (o, name) => Object.defineProperty(o, Symbol.toStringTag, { value: name, configurable: true });
+  for (const x of [ 'Duration', 'Instant', 'PlainDate', 'PlainTime', 'PlainDateTime', 'PlainYearMonth', 'PlainMonthDay', 'ZonedDateTime' ]) tag(Temporal[x].prototype, 'Temporal.' + x);
+  tag(Temporal, 'Temporal');
+  tag(Temporal.Now, 'Temporal.Now');
+  for (const k of Object.keys(Temporal.Now)) Object.defineProperty(Temporal.Now, k, { enumerable: false });
+  for (const k of Object.keys(Temporal)) Object.defineProperty(Temporal, k, { enumerable: false });
+})();`;

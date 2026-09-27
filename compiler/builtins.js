@@ -749,6 +749,8 @@ return porf_box((f64)dst, ${TYPES.string});`, false) ]
   _.__Porffor_funcLut_length = lutFn(TYPES.number, `return porf_box_num((f64)${lutRead('porf_fnlen')});`);
 
   _.__Porffor_funcLut_flags = lutFn(TYPES.number, `return porf_box_num((f64)((${lutRead('porf_fnflags')} >> 3) & 3));`);
+  // a class's constructor (its prototype is read-only)
+  _.__Porffor_funcLut_isClass = lutFn(TYPES.boolean, `return porf_box((f64)((${lutRead('porf_fnflags')} >> 7) & 1), ${TYPES.boolean});`);
 
   _.__Porffor_funcLut_name = lutFn(TYPES.bytestring, `return porf_box((f64)${lutRead('porf_fnname')}, ${TYPES.bytestring});`);
 

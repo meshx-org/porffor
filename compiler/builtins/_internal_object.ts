@@ -244,10 +244,18 @@ export const __Porffor_underlyingRebuild = (): void => {
   }
 };
 
+// a Number object as the side table finds it: its payload is its number, which as a pointer
+// (a double to u32) is undefined in C when negative, so it goes by its uint32
+export const __Porffor_object_numberKey = (_obj: any): any => {
+  const n: number = Porffor.as(_obj, Porffor.TYPES.number);
+  return Porffor.as(n >>> 0, Porffor.TYPES.numberobject);
+};
+
 // the side-table object holding a non-object value's own properties, if it has one yet
 // (null if not): __Porffor_object_underlying makes one, for a value it has to write to
 export const __Porffor_object_underlyingFind = (_obj: any): any => {
   const objType: i32 = Porffor.type(_obj);
+  if (objType == Porffor.TYPES.numberobject) _obj = __Porffor_object_numberKey(_obj);
   if (Porffor.fastOr(underlyingStore == 0, underlyingBuckets == 0)) return null;
   let lookupHash: i32 = Porffor.IR.ptr(_obj);
   lookupHash = lookupHash >>> 3;
@@ -282,6 +290,7 @@ export const __Porffor_object_underlying = (_obj: any): any => {
   }
 
   if (objType > 0x05) {
+    if (objType == Porffor.TYPES.numberobject) _obj = __Porffor_object_numberKey(_obj);
     if (underlyingStore == 0) {
       underlyingStore = Porffor.malloc();
       Porffor.IR.storeI32(underlyingStore, 0, 0);
@@ -366,7 +375,8 @@ export const __Porffor_object_underlying = (_obj: any): any => {
           __Porffor_object_fastAdd(underlying, 'prototype', builtinProto, 0b0000);
         } else {
           const proto: object = __Porffor_object_new(1);
-          __Porffor_object_fastAdd(underlying, 'prototype', proto, 0b1000);
+          // writable, but for a class
+          __Porffor_object_fastAdd(underlying, 'prototype', proto, __Porffor_funcLut_isClass(_obj) ? 0b0000 : 0b1000);
           __Porffor_object_fastAdd(proto, 'constructor', _obj, 0b1010);
         }
         // a built-in constructor's static methods (Object.keys read as O.keys)

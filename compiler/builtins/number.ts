@@ -29,7 +29,8 @@ export const Number = function (value: any): number|any {
   // 4. Let O be ? OrdinaryCreateFromConstructor(NewTarget, "%Number.prototype%", « [[NumberData]] »).
   // 5. Set O.[[NumberData]] to n.
   // 6. Return O.
-  return n as NumberObject;
+  // retagged, keeping the number (a cast to an object type would make it a pointer: -5 was 0)
+  return Porffor.as(n, Porffor.TYPES.numberobject);
 };
 
 export const isNaN = (value: any): boolean => {
