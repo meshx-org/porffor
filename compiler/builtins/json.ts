@@ -548,7 +548,10 @@ export const __Porffor_json_parseValue = (text: any, posPtr: i32, len: i32): any
     }
 
     Porffor.IR.storeI32(posPtr, 0, pos);
-    return ecma262.StringToNumber(Porffor.callThis(__ByteString_prototype_slice, text, start, pos));
+    // the number's own characters, sliced as the text's kind of string (a text with any
+    // character above U+00FF is two bytes a character)
+    if (Porffor.type(text) == Porffor.TYPES.bytestring) return ecma262.StringToNumber(Porffor.callThis(__ByteString_prototype_slice, text, start, pos));
+    return ecma262.StringToNumber(Porffor.callThis(__String_prototype_slice, text, start, pos));
   }
 
   throw new SyntaxError('Unexpected token');
