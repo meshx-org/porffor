@@ -2,6 +2,17 @@ import './prefs.js';
 import parse from './parser/index.js';
 import link from './modules.js';
 
+const usesImportCall = node => {
+  if (node == null || typeof node !== 'object') return false;
+  if (Array.isArray(node)) return node.some(usesImportCall);
+  if (node.type === 'ImportExpression') return true;
+  for (const key in node) {
+    if (key === 'start' || key === 'end') continue;
+    if (usesImportCall(node[key])) return true;
+  }
+  return false;
+};
+
 // Whether the program can make an iterator of its own: it names Symbol.iterator or
 // Symbol.asyncIterator (the only way to define one), the Iterator global (Iterator.from
 // wraps any object with a next) or Proxy (a proxy iterates as its target does). Without
@@ -382,7 +393,11 @@ export default (input, entry = null) => {
   globalThis.typedInput = types && Prefs.optTypes;
 
   const file = entry?.file ?? globalThis.file;
-  const ast = entry && Prefs.module && !globalThis.precompile ? link(input, file[0] === '/' ? file : process.cwd() + '/' + file, { ts: types, scripts: entry.scripts }) : parse(input, { module: !!Prefs.module, ts: types });
+  const linking = entry && file && !globalThis.precompile;
+  const path = linking && (file[0] === '/' ? file : process.cwd() + '/' + file);
+  let ast = linking && Prefs.module ? link(input, path, { ts: types, scripts: entry.scripts }) : parse(input, { module: !!Prefs.module, ts: types });
+  // a script's import() calls load modules too
+  if (linking && !Prefs.module && /\bimport\b/.test(input) && usesImportCall(ast)) ast = link(input, path, { ts: types, script: ast });
   if (ast._ts) globalThis.typedInput = Prefs.optTypes;
   bindHomeObjects(ast);
   bindOwnNames(ast);

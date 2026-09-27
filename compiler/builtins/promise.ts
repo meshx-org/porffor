@@ -508,6 +508,34 @@ export const __Promise_try = (cb: any, ...args: any[]): Promise => {
   return obj;
 };
 
+// import(): the specifier's ToString and the checks of the options reject the promise rather
+// than throw. load (the compiler's, for the call site) runs in a job of its own, as a host's
+// loading finishes after import() returns: the namespace it returns or its throw settles it
+export const __Porffor_import = (load: any, specifier: any, options: any): Promise => {
+  const promise: Promise = __Porffor_promise_create();
+  let key: any;
+  try {
+    key = __ecma262_ToString(specifier);
+    if (options !== undefined) {
+      if (!__Porffor_object_isObject(options)) throw new TypeError('The second argument of import() must be an object');
+      const attributes: any = options.with;
+      if (attributes !== undefined) {
+        if (!__Porffor_object_isObject(attributes)) throw new TypeError('The with option of import() must be an object');
+        const keys: any[] = __Object_keys(attributes);
+        for (let i: i32 = 0; i < keys.length; i++) {
+          if (typeof attributes[keys[i]] !== 'string') throw new TypeError('Import attribute values must be strings');
+        }
+      }
+    }
+  } catch (e) {
+    __Porffor_promise_reject(e, promise);
+    return promise;
+  }
+
+  __Porffor_promise_enqueueReaction(__Porffor_promise_newReaction(load, promise, 0), key);
+  return promise;
+};
+
 export const __Promise_prototype_toString = function (this: any) { return '[object Promise]'; };
 export const __Promise_prototype_toLocaleString = function (this: any) { return Porffor.callThis(__Promise_prototype_toString, this); };
 

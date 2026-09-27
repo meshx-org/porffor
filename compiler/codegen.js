@@ -597,6 +597,17 @@ const generate = (scope, decl, name = undefined, valueUnused = false) => {
     case 'MetaProperty':
       return generateMeta(scope, decl);
 
+    // the linker turns import() into a call loading what it resolves to. unlinked (no file to
+    // resolve from), it still evaluates its arguments and rejects
+    case 'ImportExpression':
+      return generate(scope, { type: 'CallExpression', optional: false, callee: { type: 'Identifier', name: '__Porffor_import' }, arguments: [
+        { type: 'ArrowFunctionExpression', params: [], async: false, generator: false, expression: false, body: { type: 'BlockStatement', body: [
+          { type: 'ThrowStatement', argument: { type: 'NewExpression', callee: { type: 'Identifier', name: 'Error' }, arguments: [ { type: 'Literal', value: 'porffor: import() without a file to resolve from' } ] } }
+        ] } },
+        decl.source,
+        decl.options ?? { type: 'UnaryExpression', operator: 'void', prefix: true, argument: { type: 'Literal', value: 0 } }
+      ] });
+
     case 'ConditionalExpression':
       return generateConditional(scope, decl);
 
@@ -2087,6 +2098,7 @@ const generateCall = (scope, decl) => {
         if (e.name === 'SyntaxError') return internalThrow(scope, 'SyntaxError', e.message);
         throw e;
       }
+      parsed.body[0].expression._constructed = true;
       return generate(scope, parsed.body[0].expression);
     }
   }
@@ -4622,10 +4634,12 @@ const primObjAlias = {
 };
 
 // builtins that look a method up by name at runtime: when one is in the program, so is the
-// method (String([1, 2]) needs Array.prototype.toString though the program never names it)
+// method (String([1, 2]) needs Array.prototype.toString though the program never names it).
+// So is a name a builtin defines: a module namespace's Symbol.toStringTag
 const RUNTIME_METHOD_LOOKUPS = {
   __ecma262_ToPrimitive_Number: [ 'valueOf', 'toString' ],
-  __ecma262_ToPrimitive_String: [ 'toString', 'valueOf' ]
+  __ecma262_ToPrimitive_String: [ 'toString', 'valueOf' ],
+  __Porffor_namespace: [ 'toStringTag' ]
 };
 
 // %TypedArray%.prototype can be reached: through a prototype read of a kind's constructor used
@@ -5394,7 +5408,8 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
     async: decl.async,
     generator: decl.generator,
     subclass: decl._subclass, _onlyConstr: decl._onlyConstr, _noGlobalThis: decl._noGlobalThis,
-    strict: scope.strict || decl.strict,
+    // what the Function constructor makes is strict only by its own directive
+    strict: decl._constructed ? false : scope.strict || decl.strict,
     usesArguments: decl._usesArguments,
     ast: decl,
     unit: decl._unit ?? scope.unit,
