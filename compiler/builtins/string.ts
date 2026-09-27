@@ -22,6 +22,10 @@ export const __Porffor_strcmp = (a: any, b: any): boolean => {
   return true;
 };
 
+// --ropes: the string itself, as characters to read (a rope flattened: every builtin's
+// arguments are, on the way in, so this only has to hand its argument back)
+export const __Porffor_string_flat = (s: any): any => s;
+
 export const __Porffor_strcat = (a: any, b: any): any => {
   // a and b must be string or bytestring
 

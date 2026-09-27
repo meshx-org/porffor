@@ -3619,6 +3619,27 @@ export const __Porffor_regex_match = (regexp: any, input: any) => {
   return __Porffor_regex_interpret(regexp, input, 0);
 };
 
+// String.prototype.search (RegExp.prototype[@@search]): the index of the first match, or -1.
+// Always from the start: lastIndex is set to 0 for the search and put back after it
+export const __Porffor_regex_search = (regexp: any, input: any): number => {
+  if (Porffor.type(regexp) !== Porffor.TYPES.regexp) regexp = new RegExp(regexp);
+  if ((Porffor.type(input) | 0b10000000) !== Porffor.TYPES.bytestring) input = ecma262.ToString(input);
+
+  const previous: i32 = Porffor.IR.loadI32(regexp, 8);
+  Porffor.IR.storeI32(regexp, 8, 0);
+  const match: any = __Porffor_regex_interpret(regexp, input, 0);
+  Porffor.IR.storeI32(regexp, 8, previous);
+  if (match == null) return -1;
+  return match.index;
+};
+
+export const __String_prototype_search = function (this: string, regexp: any) {
+  return __Porffor_regex_search(regexp, this);
+};
+export const __ByteString_prototype_search = function (this: bytestring, regexp: any) {
+  return __Porffor_regex_search(regexp, this);
+};
+
 export const __String_prototype_match = function (this: string, regexp: any) {
   return __Porffor_regex_match(regexp, this);
 };

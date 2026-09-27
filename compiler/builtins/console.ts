@@ -345,6 +345,9 @@ export const __Porffor_print = (arg: any, colors: boolean = true, depth: number 
     case Porffor.TYPES.urierror:
       __Porffor_printString(Porffor.callThis(__URIError_prototype_toString, arg));
       return;
+    case Porffor.TYPES.suppressederror:
+      __Porffor_printString(Porffor.callThis(__SuppressedError_prototype_toString, arg));
+      return;
   }
 };
 

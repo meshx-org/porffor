@@ -67,10 +67,13 @@ registerInternalType('__Porffor_ClosureEnv');
 registerInternalType('__Porffor_Generator');
 registerInternalType('__Porffor_AsyncGenerator');
 
-for (const x of [ '', 'Aggregate', 'Type', 'Reference', 'Syntax', 'Range', 'Eval', 'URI' ])
+for (const x of [ '', 'Aggregate', 'Type', 'Reference', 'Syntax', 'Range', 'Eval', 'URI', 'Suppressed' ])
   registerInternalType(`${x}Error`);
 
 registerInternalType('Proxy');
+
+registerInternalType('DisposableStack');
+registerInternalType('AsyncDisposableStack');
 
 registerInternalType('TextEncoder');
 registerInternalType('TextDecoder');

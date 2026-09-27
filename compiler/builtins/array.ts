@@ -207,6 +207,42 @@ export const __Array_prototype_push = function (this: any[], ...items: any[]) {
   return newLen;
 };
 
+// An Array.prototype method whose this is not an array (a proxy, an array-like) runs on a
+// copy of it (codegen's #this guard): its length and elements read through [[Get]], so a
+// proxy's traps run. By index, never by iterator: iterating a proxy of an array calls the
+// array iterator with the proxy as this, which would copy through this again.
+export const __Porffor_array_snapshot = (obj: any): any[] => {
+  const o: any = obj;
+  // ToLength: an integer, clamped at 0. Builtins compile .length as a raw load
+  // (--fast-length), which only an array or a string can answer: anything else (a proxy,
+  // whose get trap then runs, or an array-like) is read as the property it is
+  let len: number = 0;
+  if (Porffor.type(o) == Porffor.TYPES.array) len = o.length;
+    else len = ecma262.ToIntegerOrInfinity(__Porffor_object_get(o, 'length'));
+  if (len < 0) len = 0;
+  if (len > 268435455) throw new RangeError('Invalid array length');
+  const n: i32 = len;
+  const out: any[] = Porffor.array.new(n);
+  for (let i: i32 = 0; i < n; i++) out[i] = o[i];
+  out.length = n;
+  return out;
+};
+
+// After a mutating method ran on the copy: what changed goes back through [[Set]] and
+// [[Delete]] (new or different elements, those past the new length), then the length
+export const __Porffor_array_writeBack = (obj: any, before: any[], after: any[]): void => {
+  const o: any = obj;
+  const oldLen: i32 = before.length;
+  const newLen: i32 = after.length;
+  for (let i: i32 = 0; i < newLen; i++) {
+    if (i >= oldLen || !Object.is(before[i], after[i])) o[i] = after[i];
+  }
+  for (let i: i32 = newLen; i < oldLen; i++) delete o[i];
+  // boxed first: an i32 set on an untyped object leaves an unboxed result behind
+  const boxedLen: any = newLen;
+  if (newLen != oldLen) o.length = boxedLen;
+};
+
 export const __Porffor_array_spread = (arr: any[], src: any) => {
   let len: i32 = arr.length;
 

@@ -582,6 +582,11 @@ const annotate = (node, parent = null, key = null) => {
         node._resolvedBinding = true;
         node._resolvedVariable = variable;
         variable.node._refs = (variable.node._refs ?? 0) + 1;
+        // a function declaration whose name is assigned: calls to it go through the
+        // binding, not straight to the function (babel's helpers rebind their own names)
+        if (variable.node.type === 'FunctionDeclaration' &&
+            ((parent?.type === 'AssignmentExpression' && key === 'left') || parent?.type === 'UpdateExpression'))
+          variable.node._reassigned = true;
         // reads from other funcs or before the dominating init can see undefined
         if (variable.func !== currentFunc || !variable.node._storageInitSeen) {
           node._noStorageInfer = true;
@@ -671,7 +676,9 @@ const annotate = (node, parent = null, key = null) => {
       }
       break;
 
-    case 'ThisExpression': {
+    // super.x in an arrow reads the method's this as well as its home object
+    case 'ThisExpression':
+    case 'Super': {
       const currentFunc = scopes[scopes.lastFuncs.at(-1)];
       const owner = findLexicalThisOwner(currentFunc);
       if (owner) {

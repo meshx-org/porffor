@@ -53,6 +53,7 @@ const help = () => {
   if (process.argv.includes('all')) {
     for (let [ flag, desc ] of Object.entries({
       'fast-length': 'Non-compliant optimization to make .length faster',
+      'ropes': 'Build long string concatenations as ropes, flattened when read (s += x in a loop is linear)',
       'profile-compiler': 'Log general compiler performance (on by default when compiling to a file)',
       'jN': 'Parallel C compile jobs for module builds (default: CPU count)',
     })) {

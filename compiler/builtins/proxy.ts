@@ -5,7 +5,8 @@ import type {} from './porffor.d.ts';
 // The object operations in _internal_object.ts / object.ts / reflect.ts hand a proxy to
 // the functions below, and every operation whose trap is missing falls through to the
 // target. Not implemented yet: apply/construct (callable proxies), the prototype and
-// extensibility traps, defineProperty, invariant checks and Proxy.revocable.
+// extensibility traps, defineProperty and invariant checks. A revoked proxy
+// (Proxy.revocable) has neither target nor handler, and every operation on it throws.
 
 // Returns any, not Proxy: a return annotation re-tags the returned value, which would
 // turn the function returned below into a "proxy" pointing at function memory.
@@ -31,6 +32,48 @@ export const __Porffor_proxy_target = (proxy: any): any => {
   return Porffor.IR.loadJv(proxy, 0);
 };
 
+// The handler, or a TypeError once the proxy has been revoked
+export const __Porffor_proxy_handler = (proxy: any): any => {
+  const handler: any = Porffor.IR.loadJv(proxy, 8);
+  if (handler == null) throw new TypeError('Cannot perform operation on a revoked proxy');
+  return handler;
+};
+
+// Proxy.revocable's revoke: the proxy lets go of target and handler (a second call does nothing)
+export const __Porffor_proxy_revoke = (proxy: any): void => {
+  Porffor.IR.storeJv(proxy, 0, null);
+  Porffor.IR.storeJv(proxy, 8, null);
+};
+
+// Proxy.revocable: a proxy, as new Proxy makes it, and the function that revokes it
+export const __Proxy_revocable = (target: any, handler: any): object => {
+  if (target == null) throw new TypeError('Cannot create proxy with a non-object as target');
+  if (handler == null) throw new TypeError('Cannot create proxy with a non-object as handler');
+  if (!Porffor.object.isObject(target)) throw new TypeError('Cannot create proxy with a non-object as target');
+  if (!Porffor.object.isObject(handler)) throw new TypeError('Cannot create proxy with a non-object as handler');
+
+  const out: object = {};
+  // a function target stays the function itself (see Proxy above): nothing to revoke
+  if (Porffor.type(target) == Porffor.TYPES.function) {
+    out.proxy = target;
+    out.revoke = __Porffor_proxy_revokeNothing;
+    return out;
+  }
+
+  const proxy: Proxy = Porffor.malloc(16);
+  Porffor.IR.storeJv(proxy, 0, target);
+  Porffor.IR.storeJv(proxy, 8, handler);
+  const made: any = proxy;
+  out.proxy = made;
+  // no closures in builtins: revoke is __Porffor_proxy_revoke bound to this proxy
+  const bind: any = __Function_prototype_bind;
+  const revoke: any = __Porffor_proxy_revoke;
+  out.revoke = Porffor.callThis(bind, revoke, undefined, made);
+  return out;
+};
+
+export const __Porffor_proxy_revokeNothing = (): void => {};
+
 // The accessor that target.[[Get]]/[[Set]] would reach for key: walks target's chain the
 // way the spec's OrdinaryGet does, so it can be called with the proxy (or whatever the
 // receiver is) as this. Returns undefined for a data property or no property at all;
@@ -51,7 +94,7 @@ export const __Porffor_proxy_findAccessor = (target: any, key: any): any => {
 
 export const __Porffor_proxy_get = (proxy: any, key: any, receiver: any): any => {
   const target: any = Porffor.IR.loadJv(proxy, 0);
-  const handler: any = Porffor.IR.loadJv(proxy, 8);
+  const handler: any = __Porffor_proxy_handler(proxy);
   const trap: any = handler.get;
   if (trap == null) {
     // target.[[Get]](key, receiver)
@@ -70,7 +113,7 @@ export const __Porffor_proxy_get = (proxy: any, key: any, receiver: any): any =>
 
 export const __Porffor_proxy_set = (proxy: any, key: any, value: any, receiver: any, strict: boolean): any => {
   const target: any = Porffor.IR.loadJv(proxy, 0);
-  const handler: any = Porffor.IR.loadJv(proxy, 8);
+  const handler: any = __Porffor_proxy_handler(proxy);
   const trap: any = handler.set;
   if (trap == null) {
     // target.[[Set]](key, value, receiver): a setter on target's chain runs with receiver
@@ -97,7 +140,7 @@ export const __Porffor_proxy_set = (proxy: any, key: any, value: any, receiver: 
 
 export const __Porffor_proxy_has = (proxy: any, key: any): boolean => {
   const target: any = Porffor.IR.loadJv(proxy, 0);
-  const handler: any = Porffor.IR.loadJv(proxy, 8);
+  const handler: any = __Porffor_proxy_handler(proxy);
   const trap: any = handler.has;
   if (trap == null) return __Porffor_object_in(target, key);
 
@@ -106,7 +149,7 @@ export const __Porffor_proxy_has = (proxy: any, key: any): boolean => {
 
 export const __Porffor_proxy_deleteProperty = (proxy: any, key: any, strict: boolean): boolean => {
   const target: any = Porffor.IR.loadJv(proxy, 0);
-  const handler: any = Porffor.IR.loadJv(proxy, 8);
+  const handler: any = __Porffor_proxy_handler(proxy);
   const trap: any = handler.deleteProperty;
   if (trap == null) {
     if (strict) return __Porffor_object_deleteStrict(target, key);
@@ -121,7 +164,7 @@ export const __Porffor_proxy_deleteProperty = (proxy: any, key: any, strict: boo
 // [[OwnPropertyKeys]]: the trap's array-like, checked to hold only strings and symbols.
 export const __Porffor_proxy_ownKeys = (proxy: any): any[] => {
   const target: any = Porffor.IR.loadJv(proxy, 0);
-  const handler: any = Porffor.IR.loadJv(proxy, 8);
+  const handler: any = __Porffor_proxy_handler(proxy);
   const trap: any = handler.ownKeys;
   if (trap == null) return __Reflect_ownKeys(target);
 
@@ -144,7 +187,7 @@ export const __Porffor_proxy_ownKeys = (proxy: any): any[] => {
 // ToPropertyDescriptor + FromPropertyDescriptor would (extra fields are dropped).
 export const __Porffor_proxy_getOwnPropertyDescriptor = (proxy: any, key: any): any => {
   const target: any = Porffor.IR.loadJv(proxy, 0);
-  const handler: any = Porffor.IR.loadJv(proxy, 8);
+  const handler: any = __Porffor_proxy_handler(proxy);
   const trap: any = handler.getOwnPropertyDescriptor;
   if (trap == null) return __Object_getOwnPropertyDescriptor(target, key);
 

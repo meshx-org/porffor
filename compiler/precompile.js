@@ -450,6 +450,10 @@ const precompile = async () => {
     if (localMeta.length) meta.localMetadata = localMeta;
     if (x.data && Object.keys(x.data).length) meta.data = x.data;
     if (x.constr) meta.constr = 1;
+    // a coroutine stays one: an async builtin awaits on its own, not on its caller's stack
+    if (x.async) meta.async = 1;
+    if (x.generator) meta.generator = 1;
+    if (x.hasAwait) meta.hasAwait = 1;
     if (x.closureAware) meta.closureAware = 1;
     if (x.selfAware) meta.selfAware = 1;
     if (x.hasRestArgument) meta.hasRestArgument = 1;

@@ -307,7 +307,7 @@ export const BuiltinVars = ({ builtinFuncs }) => {
 
     // special case: the native errors' prototypes inherit from Error.prototype, so a
     // TypeError is instanceof Error (and inherits Error.prototype's members)
-    if ([ 'AggregateError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError' ].some(e => x === `__${e}_prototype`)) {
+    if ([ 'AggregateError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError', 'SuppressedError' ].some(e => x === `__${e}_prototype`)) {
       const errorProto = (_scope, { includeBuiltin }) => {
         includeBuiltin('#get___Error_prototype');
         return Box(Call('#get___Error_prototype', [], T.ptr), Const(T.i32, TYPES.object));
@@ -388,7 +388,7 @@ export const BuiltinVars = ({ builtinFuncs }) => {
     }, autoFuncKeys(x).slice(0, 12)));
   }
 
-  for (const x of [ 'Array', 'ArrayBuffer', 'Atomics', 'Date', 'Error', 'JSON', 'Object', 'Promise', 'Reflect', 'String', 'Symbol', 'Uint8Array', 'Int8Array', 'Uint8ClampedArray', 'Uint16Array', 'Int16Array', 'Uint32Array', 'Int32Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array', 'SharedArrayBuffer', 'BigInt', 'Boolean', 'DataView', 'AggregateError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError', 'Function', 'Map', 'RegExp', 'Set', 'WeakMap', 'WeakRef', 'WeakSet', 'TextEncoder', 'TextDecoder' ]) {
+  for (const x of [ 'Array', 'ArrayBuffer', 'Atomics', 'Date', 'Error', 'JSON', 'Object', 'Promise', 'Reflect', 'String', 'Symbol', 'Uint8Array', 'Int8Array', 'Uint8ClampedArray', 'Uint16Array', 'Int16Array', 'Uint32Array', 'Int32Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array', 'SharedArrayBuffer', 'BigInt', 'Boolean', 'DataView', 'AggregateError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError', 'SuppressedError', 'DisposableStack', 'AsyncDisposableStack', 'Function', 'Map', 'RegExp', 'Set', 'WeakMap', 'WeakRef', 'WeakSet', 'TextEncoder', 'TextDecoder' ]) {
     object(x, {
       ...(typedArrayBytesPerElement[x] == null ? {} : props({
         writable: false,
@@ -941,6 +941,8 @@ return sign * (i64)((((u64)*(u32*)(MEM + ptr + 4)) << 32) + (u64)*(u32*)(MEM + p
   // the options argument (for a cause) is not counted
   for (const name of [ 'Error', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError' ]) _[name].jsLength = 1;
   _.AggregateError.jsLength = 2;
+  // absent only while precompile first builds it
+  if (_.SuppressedError) _.SuppressedError.jsLength = 3;
   _.__BigInt_prototype_toString.jsLength = 0;
 
   return _;

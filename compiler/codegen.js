@@ -777,8 +777,9 @@ const lookup = (scope, name, allowImplicitArguments = true, markFunctionReferenc
   if (allowImplicitArguments && scope.usesArguments && name === 'arguments' && !scope.arrow)
     return Local('#allargs', T.jsval);
 
-  // self-reference reads the function's own value (#callee), preserving identity
-  if (scope.selfAware && name === scope.name) return Local('#callee', T.jsval);
+  // self-reference reads the function's own value (#callee), preserving identity; a
+  // declaration whose name is assigned is read through its binding, which may differ now
+  if (scope.selfAware && name === scope.name && !scope.ast?._reassigned) return Local('#callee', T.jsval);
 
   if (name in globals) {
     const global = Global(name, globals[name].type ?? T.jsval);
@@ -1027,8 +1028,26 @@ const generateReturn = (scope, decl) => {
 
 // a + b: both known primitive strings -> direct strcat, else the coercing concatStrings builtin
 const knownStr = ty => ty === TYPES.string || ty === TYPES.bytestring;
-const concatStrings = (scope, left, right, leftType, rightType) =>
-  builtinCall(scope, knownStr(leftType) && knownStr(rightType) ? '__Porffor_strcat' : '__Porffor_concatStrings', [ reuse(scope, left), reuse(scope, right) ]);
+// (--ropes: the runtime's +, which coerces as + does when a side is unknown, and makes a
+// rope rather than a copy; the builtins take their arguments flat)
+const concatStrings = (scope, left, right, leftType, rightType) => {
+  if (Prefs.ropes) {
+    const jv = (v, ty) => v[N_TYPE] === T.jsval ? v : ty != null ? Box(v, Const(T.i32, ty)) : valNumber(v);
+    // a side not known to be a string is ToString'd as the builtin does (a user toString
+    // runs), unless it is one at run time: then it is kept as it is, a rope unflattened
+    const str = (v, ty) => {
+      if (knownStr(ty)) return reuse(scope, jv(v, ty));
+      const out = tmp(scope, T.jsval, jv(v, ty));
+      const t = reuse(scope, JvType(out));
+      emitIf(scope, Bin('&&', T.i32, Bin('!=', T.i32, t, Const(T.i32, TYPES.string)), Bin('!=', T.i32, t, Const(T.i32, TYPES.bytestring))),
+        () => assign(scope, out, builtinCall(scope, '__ecma262_ToString', [ out ])));
+      return out;
+    };
+    const l = str(left, leftType);
+    return Add(l, str(right, rightType));
+  }
+  return builtinCall(scope, knownStr(leftType) && knownStr(rightType) ? '__Porffor_strcat' : '__Porffor_concatStrings', [ reuse(scope, left), reuse(scope, right) ]);
+};
 
 // truthiness as i32. JvTruthy is the shared runtime helper, statically-known
 // types collapse to the cheap path. `type` = inferred porffor type (TYPES|null)
@@ -1343,6 +1362,10 @@ const materializeIRBuiltin = (func, name, def) => {
   func.returnType = def.returnType;
   func.returnTypes = def.returnTypes;
   func.constr = !!def.constr;
+  // an async or generator builtin is a coroutine of its own (called, it starts one)
+  if (def.async) func.async = true;
+  if (def.generator) func.generator = true;
+  if (def.hasAwait) func.hasAwait = true;
   func.locals = Object.create(null);
   for (const p of func.params) func.locals[p.name] = { type: p.type, metadata: { param: true } };
   if (def.localTypes) {
@@ -2030,7 +2053,8 @@ const generateCall = (scope, decl) => {
     target = object;
   }
 
-  if (protoName && target) {
+  // super.m() dispatches as a member call (its this is not the object super names)
+  if (protoName && target && target.type !== 'Super') {
     const targetKnownType = knownType(scope, getNodeType(scope, target));
 
     const builtinProtoCands = builtinPrototypeFuncs.get(protoName) ?? [];
@@ -2110,7 +2134,9 @@ const generateCall = (scope, decl) => {
     const isLocal = decl.callee.type === 'Identifier' && !isBuiltinMember && lookupName(scope, name)[0] != null;
     const closureBacked = decl.callee.type === 'Identifier' && (decl.callee._closureFunc || scope.closureCaptures?.[name] || (!decl.callee._skipClosureOwnLocals && scope.closureOwnLocals?.[name]));
     const binding = decl.callee._resolvedVariable?.node ?? scope.closureCaptures?.[name]?.node ?? scope.closureOwnLocals?.[name]?.node;
-    if (!isBuiltinMember && closureBacked && name && isFuncType(binding?.type) && directCallOnlyRefs(binding)) {
+    // a function declaration whose name is assigned somewhere is called through its binding
+    const rebound = decl.callee.type === 'Identifier' && decl.callee._resolvedVariable?.node?._reassigned === true;
+    if (!isBuiltinMember && !rebound && closureBacked && name && isFuncType(binding?.type) && directCallOnlyRefs(binding)) {
       func = resolveNamedFunction(scope, name);
       // per-iteration snapshot envs can't be recomputed from the caller's env
       if (getPerIterationClosureCaptureNames(func).length > 0) func = null;
@@ -2121,12 +2147,12 @@ const generateCall = (scope, decl) => {
     }
     if (isBuiltinMember) {
       isBuiltin = true;
-    } else if (!func && !isLocal && !closureBacked && name) {
+    } else if (!func && !rebound && !isLocal && !closureBacked && name) {
       func = resolveNamedFunction(scope, name);
       if (!func && name in funcIndex) func = funcByName(name);
       if (!func && name in builtinFuncs) isBuiltin = true;
     }
-    if (!func && !isBuiltin && !isLocal && !closureBacked && scope.name === name) func = scope;
+    if (!func && !rebound && !isBuiltin && !isLocal && !closureBacked && scope.name === name) func = scope;
   }
 
   if (isBuiltin && !hasSpread) {
@@ -2157,8 +2183,10 @@ const generateCall = (scope, decl) => {
   let calleeVal, thisVal = null;
   const callee = decl.callee.expression ?? decl.callee;
   if (!decl._new && (callee.type === 'MemberExpression')) {
-    thisVal = reuse(scope, generate(scope, callee.object));
-    calleeVal = generateMember(scope, callee, thisVal);
+    const objVal = reuse(scope, generate(scope, callee.object));
+    calleeVal = generateMember(scope, callee, objVal);
+    // super.m(): m is looked up on the parent's prototype, and called on this, unchanged
+    thisVal = callee.object.type === 'Super' ? reuse(scope, generate(scope, { type: 'ThisExpression', _noGlobalThis: true, _closureThisFunc: callee.object._closureThisFunc })) : objVal;
   } else {
     calleeVal = generate(scope, decl.callee);
     thisVal = decl._thisArg ? reuse(scope, generate(scope, decl._thisArg)) : createThisArg(scope, decl);
@@ -2219,15 +2247,19 @@ const generateThis = (scope, decl) => {
   return Local('#this', T.jsval);
 };
 
+// super: the prototype of the method's [[HomeObject]] (the class's prototype, or the class
+// for a static method), not of this: from a subclass's instance, this's prototype chain
+// would find the calling method's own class again. Elsewhere, this's prototype's prototype
 const generateSuper = (scope, decl) => generate(scope, {
   type: 'CallExpression',
   callee: { type: 'Identifier', name: '__Porffor_object_getPrototype' },
   arguments: [
-    {
+    // an arrow's is its method's, which parse.js names for it
+    scope.ast?._homeObject ?? (scope.ast?.homeRef && (scope.ast.homeStatic ? scope.ast.homeRef : getObjProp(scope.ast.homeRef, 'prototype'))) ?? {
       type: 'CallExpression',
       callee: { type: 'Identifier', name: '__Porffor_object_getPrototype' },
       arguments: [
-        { type: 'ThisExpression', _noGlobalThis: true }
+        { type: 'ThisExpression', _noGlobalThis: true, _closureThisFunc: decl._closureThisFunc }
       ]
     }
   ]
@@ -2951,7 +2983,7 @@ const isIdentAssignable = (scope, name, op = '=') => {
 };
 
 // todo: generate this array procedurally
-const builtinPrototypeGets = ['size', 'description', 'byteLength', 'byteOffset', 'buffer', 'detached', 'resizable', 'growable', 'maxByteLength', 'name', 'message', 'constructor', 'source', 'flags', 'global', 'ignoreCase', 'multiline', 'dotAll', 'unicode', 'sticky', 'hasIndices', 'unicodeSets', 'lastIndex', 'encoding', 'fatal', 'ignoreBOM'];
+const builtinPrototypeGets = ['size', 'description', 'byteLength', 'byteOffset', 'buffer', 'detached', 'resizable', 'growable', 'maxByteLength', 'name', 'message', 'constructor', 'source', 'flags', 'global', 'ignoreCase', 'multiline', 'dotAll', 'unicode', 'sticky', 'hasIndices', 'unicodeSets', 'lastIndex', 'encoding', 'fatal', 'ignoreBOM', 'disposed'];
 
 const ctHash = prop => {
   if (!Prefs.ctHash || !prop ||
@@ -2986,7 +3018,9 @@ const ctHash = prop => {
 
 
 const generateAssign = (scope, decl, valueUnused = false) => {
-  if (decl.left.type === 'Identifier' && decl.left._selfBinding) {
+  // a function or class expression's own name, inside it, is read-only; a function
+  // declaration's name is an ordinary binding (babel's _extends reassigns its own)
+  if (decl.left.type === 'Identifier' && decl.left._selfBinding && decl.left._selfBinding.type !== 'FunctionDeclaration') {
     if (scope.strict || decl.left._classBinding) return internalThrow(scope, 'TypeError', `Cannot assign to constant variable ${decl.left.name}`);
 
     const v = generate(scope, decl.right);
@@ -3609,6 +3643,10 @@ const awaitValue = (scope, value) => {
   return Await(value);
 };
 
+// Array.prototype methods that change this, and those that return it (#this guard)
+const ARRAY_MUTATORS = new Set([ 'push', 'pop', 'shift', 'unshift', 'splice', 'reverse', 'sort', 'fill', 'copyWithin' ]);
+const ARRAY_RETURNS_THIS = new Set([ 'reverse', 'sort', 'fill', 'copyWithin' ]);
+
 // types for...of iterates without the iterator protocol (its fast paths below)
 const FAST_ITERABLES = new Set([
   TYPES.array, TYPES.string, TYPES.bytestring, TYPES.set, TYPES.map,
@@ -3662,8 +3700,11 @@ const generateForOfProtocol = (scope, decl) => {
 };
 
 const generateForOfCore = (scope, decl) => {
-  const root = tmp(scope, T.jsval, coerceValue(generate(scope, decl.right), T.jsval));
   const rootKnown = knownType(scope, getNodeType(scope, decl.right));
+  let rootValue = coerceValue(generate(scope, decl.right), T.jsval);
+  // --ropes: a string is read character by character below, so a rope is flattened first
+  if (Prefs.ropes && (rootKnown == null || knownStr(rootKnown))) rootValue = builtinCall(scope, '__Porffor_string_flat', [ rootValue ]);
+  const root = tmp(scope, T.jsval, rootValue);
   const rootTy = reuse(scope, JvType(root));
   const isAwait = decl.await === true;
 
@@ -4389,13 +4430,22 @@ const resolveMemberDemandsOnce = scope => {
         tn = x.slice(2, x.indexOf('_prototype_'));
       }
 
-      const t = TYPES[tn.toLowerCase()];
+      // Porffor's own types are named with __ (__Porffor_Generator_prototype_next is
+      // TYPES.__porffor_generator's): without it their methods are never readable
+      const t = TYPES[tn.toLowerCase()] ?? TYPES['__' + tn.toLowerCase()];
       if (t == null || !usesAnyType([ t, primObjAlias[t] ])) continue;
       includeBuiltin(scope, x);
       if (!getterOnly) {
         const getter = '#get___' + tn + '_prototype';
         if (getter in builtinFuncs) includeBuiltin(scope, getter);
       }
+    }
+
+    // a constructor used as a value (const O = Object) may have its static methods read
+    // through it: those named like the property (__Porffor_object_builtinStatics adds them)
+    for (const [ ctor, x ] of builtinStaticFuncs.get(propName) ?? []) {
+      if (!(ctor in funcIndex) || !funcByName(ctor).indirect) continue;
+      includeBuiltin(scope, x);
     }
   }
 };
@@ -4515,9 +4565,11 @@ const generateMember = (scope, decl, objValue = null) => {
     builtinCall(scope, signed ? '__Porffor_bigint_fromS64' : '__Porffor_bigint_fromU64', [ Load('i64', taAddr(8), 4) ]);
 
   const strGet = (ctype, size, strType) => () => {
+    // --ropes: its characters are read directly, so a rope is flattened first
+    const str = Prefs.ropes ? reuse(scope, builtinCall(scope, '__Porffor_string_flat', [ obj ])) : obj;
     const out = reuse(scope, Alloc(Const(T.i32, 8), strType));
     stmt(scope, Store('u32', out, 0, Const(T.u32, 1)));
-    const src = Bin('+', T.u32, Bin('+', T.u32, JvPtr(obj), Const(T.u32, 4)),
+    const src = Bin('+', T.u32, Bin('+', T.u32, JvPtr(str), Const(T.u32, 4)),
       size === 1 ? Convert(T.u32, numValue(prop), 0) : Bin('*', T.u32, Convert(T.u32, numValue(prop), 0), Const(T.u32, size)));
     stmt(scope, Store(ctype, out, 4, Load(ctype, src, 0)));
     return valOf(out, strType);
@@ -4712,7 +4764,13 @@ const generateClass = (scope, decl) => {
     let { type, value, kind, static: _static, computed } = x;
     if (kind === 'constructor') continue;
 
-    if (type === 'MethodDefinition') { value._method = true; value._noGlobalThis = true; }
+    if (type === 'MethodDefinition') {
+      value._method = true;
+      value._noGlobalThis = true;
+      // its [[HomeObject]]: super in it is this object's prototype, whatever this is
+      // (through homeRef, which parse.js gives it: analysis saw that reference, not root)
+      value._homeObject = _static ? (value.homeRef ?? root) : getObjProp(value.homeRef ?? root, 'prototype');
+    }
 
     if (type === 'StaticBlock') {
       genStmt(scope, { type: 'BlockStatement', body: x.body });
@@ -5110,9 +5168,28 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
         const t = func.overrideThisType;
         const thisRef = () => Local('#this', T.jsval);
         const prettyName = name.slice(2).replace('_prototype_', '.prototype.');
+        const method = name.slice(name.indexOf('_prototype_') + '_prototype_'.length);
         if (t === TYPES.array) {
-          emitIf(func, Bin('!=', T.i32, JvType(thisRef()), Const(T.i32, TYPES.array)),
-            () => assign(func, thisRef(), builtinCall(func, '__Array_from', [ thisRef(), valUndefined(), valUndefined() ])));
+          // generic: any object can be this (a proxy, an array-like). The method runs on a
+          // copy read through [[Get]] (__Porffor_array_snapshot); a mutating one then writes
+          // what changed back through [[Set]] and [[Delete]], and gives back the object where
+          // it returns this. The final state is the spec's; the order of the traps is not
+          emitIf(func, Bin('!=', T.i32, JvType(thisRef()), Const(T.i32, TYPES.array)), () => {
+            if (!ARRAY_MUTATORS.has(method)) {
+              assign(func, thisRef(), builtinCall(func, '__Porffor_array_snapshot', [ thisRef() ]));
+              return;
+            }
+            allocVar(func, '#array_orig');
+            allocVar(func, '#array_before');
+            const orig = Local('#array_orig', T.jsval);
+            const before = Local('#array_before', T.jsval);
+            assign(func, orig, thisRef());
+            assign(func, thisRef(), builtinCall(func, '__Porffor_array_snapshot', [ orig ]));
+            assign(func, before, builtinCall(func, '__Porffor_array_snapshot', [ thisRef() ]));
+            const result = reuse(func, Call(func.index, func.params.map(p => Local(p.name, p.type)), func.retType));
+            exprStmt(func, builtinCall(func, '__Porffor_array_writeBack', [ orig, before, thisRef() ]));
+            stmt(func, Return(ARRAY_RETURNS_THIS.has(method) ? orig : result));
+          });
         } else if (t === TYPES.string) {
           emitIf(func, Bin('!=', T.i32, JvType(thisRef()), Const(T.i32, TYPES.string)), () => {
             const nonNullish = () => internalThrow(func, 'TypeError', `${prettyName} expects 'this' to be non-nullish`);
@@ -5127,8 +5204,12 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
           TYPES.number, TYPES.promise, TYPES.symbol, TYPES.function,
           TYPES.set, TYPES.map, TYPES.weakref, TYPES.weakset, TYPES.weakmap,
           TYPES.arraybuffer, TYPES.sharedarraybuffer, TYPES.dataview,
-          TYPES.textencoder, TYPES.textdecoder
-        ].includes(t)) {
+          TYPES.textencoder, TYPES.textdecoder, TYPES.disposablestack, TYPES.asyncdisposablestack
+        ].includes(t) ||
+          // typed arrays hold their elements in slots of their own; so does a RegExp, for all
+          // but its generic flags getter and toString
+          (t !== TYPES.array && TYPE_NAMES[t]?.endsWith('Array')) ||
+          (t === TYPES.regexp && method !== 'flags$get' && method !== 'toString')) {
           const guard = () => internalThrow(func, 'TypeError', `${prettyName} expects 'this' to be a ${TYPE_NAMES[t]}`);
           emitIf(func, Bin('!=', T.i32, JvType(thisRef()), Const(T.i32, t)),
             t === TYPES.number
@@ -5297,7 +5378,10 @@ const generateModules = (scope, body) => {
   let unit = null, group = [];
   const flush = () => {
     if (group.length === 0) return;
-    const [ func ] = generateFunc(scope, { type: 'Program', id: { name: `#mod_${unit}` }, _module: true, _unit: unit, strict: scope.strict, body: { type: 'BlockStatement', body: group } });
+    // the program's top-level bindings that closures capture (block-scoped ones, per-iteration
+    // loop ones) live in the env of the function running that code: here the module's
+    const [ func ] = generateFunc(scope, { type: 'Program', id: { name: `#mod_${unit}` }, _module: true, _unit: unit, strict: scope.strict,
+      _capturedVars: scope.ast?._capturedVars, _closureSource: scope.ast?._program, body: { type: 'BlockStatement', body: group } });
     exprStmt(scope, Call(func.index, [], T.none));
     group = [];
   };
@@ -5433,7 +5517,7 @@ const inferDirectCallParamTypes = root => {
   }
 };
 
-let globals, funcs, funcsByIndex, funcIndex, funcNameCollisions, currentFuncIndex, depth, data, dataUnits, dataCache, modular, rawHead, builtinGlobalInits, includedBuiltinGlobalInits, usedTypes, globalInfer, builtinFuncs, builtinVars, builtinPrototypeFuncs, builtinPrototypeGetters, builtinPrototypeObjectGetters, topLevelFunc;
+let globals, funcs, funcsByIndex, funcIndex, funcNameCollisions, currentFuncIndex, depth, data, dataUnits, dataCache, modular, rawHead, builtinGlobalInits, includedBuiltinGlobalInits, usedTypes, globalInfer, builtinFuncs, builtinVars, builtinPrototypeFuncs, builtinStaticFuncs, builtinPrototypeGetters, builtinPrototypeObjectGetters, topLevelFunc;
 
 export default (program, opts = {}) => {
   const entryName = opts.entryName ?? '#main';
@@ -5469,6 +5553,8 @@ export default (program, opts = {}) => {
     builtinVars = BuiltinVars({ builtinFuncs });
 
     builtinPrototypeFuncs = new Map();
+    // method name -> [ constructor, builtin ]: a constructor's static methods (__Object_keys)
+    builtinStaticFuncs = new Map();
     builtinPrototypeGetters = new Map();
     builtinPrototypeObjectGetters = new Map();
     for (const x in builtinFuncs) {
@@ -5483,6 +5569,13 @@ export default (program, opts = {}) => {
         else map.set(name, [ x ]);
       } else if (x.startsWith('#get___') && x.endsWith('_prototype')) {
         builtinPrototypeObjectGetters.set(x.slice(7, -'_prototype'.length), x);
+      } else {
+        const found = /^__([A-Z][A-Za-z0-9]*)_([a-zA-Z][a-zA-Z0-9]*)$/.exec(x);
+        if (found && found[2] !== 'prototype' && found[1] in builtinFuncs) {
+          const entries = builtinStaticFuncs.get(found[2]);
+          if (entries) entries.push([ found[1], x ]);
+          else builtinStaticFuncs.set(found[2], [ [ found[1], x ] ]);
+        }
       }
     }
 
@@ -5537,11 +5630,34 @@ export default (program, opts = {}) => {
   }
   inferDirectCallParamTypes(program);
 
+  // globalThis.x = v anywhere makes x a global binding, but only once codegen reaches that
+  // assignment: a function generated before it (a bundle's library code, ahead of the shim
+  // that installs setTimeout) would compile its reads of x as not defined. Every such name
+  // is a global from the start.
+  const declareGlobalThisNames = node => {
+    if (node == null || typeof node !== 'object') return;
+    if (Array.isArray(node)) return node.forEach(declareGlobalThisNames);
+    if (node.type === 'AssignmentExpression' && node.operator === '=') {
+      const name = globalThisBindingName(node.left);
+      if (name) {
+        allocVar(null, name, true);
+        setVarMetadata(null, name, true, { kind: 'var' });
+      }
+    }
+    for (const key in node) {
+      if (key[0] === '_' || key === 'loc' || key === 'range') continue;
+      const value = node[key];
+      if (value && typeof value === 'object') declareGlobalThisNames(value);
+    }
+  };
+  declareGlobalThisNames(program.body);
+
   generateFunc({}, {
     type: 'Program',
     id: { name: entryName },
     _topLevel: true,
     strict: Prefs.module,
+    _program: program,
     _captures: program._captures,
     _capturedVars: program._capturedVars,
     _capturesThis: program._capturesThis,

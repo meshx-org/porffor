@@ -1,4 +1,4 @@
-// Stackless coroutines (--stackless): an async function or a generator (async too) whose
+// Stackless coroutines: an async function or a generator (async too) whose
 // awaits or yields can all be lifted to statement level runs as a step function over a heap frame
 // instead of on a coroutine stack. This pass decides which functions qualify and rewrites
 // their bodies so every await or yield is a statement of its own: `local = await x` or a
@@ -11,9 +11,12 @@
 // a try (finally is a catch by then: codegen lowers it). Entering a catch that way loses
 // the step's C locals as a resume does, so it counts as a suspension below.
 //
-// Not yet (the function stays stackful): raw C, or an await or a yield in a loop's update.
+// Raw C (Porffor.c, console.log's output) runs in a step as it is, naming its locals as
+// frame fields where they are; every local it names is kept in the frame. Not yet (the
+// function stays stackful): raw C that returns or jumps (it would leave the step's own
+// control flow), or that awaits or yields itself (porf_await, porf_yield: stackful only).
 
-import { K, T, FX, N_KIND, N_TYPE, N_FX, N_A, N_B, N_C, KNames, Local, Assign, Await, Yield, Un, Break } from './ir.js';
+import { K, T, FX, N_KIND, N_TYPE, N_FX, N_A, N_B, N_C, KNames, Local, Assign, Await, Yield, Un, Break, BlockStmt } from './ir.js';
 
 const isNode = node => Array.isArray(node) && typeof node[0] === 'number' &&
   KNames[node[0]] !== undefined && node.length === 6;
@@ -41,17 +44,29 @@ export const hasPause = node => hasAwait(node) || hasYield(node);
 // where a step can be re-entered: after a suspension, or at a catch
 export const hasSuspend = node => hasPause(node) || hasTry(node);
 const hasYield = makeHas(K.Yield);
-const hasRawC = makeHas(K.RawC);
+// raw C a step cannot hold: it returns or jumps, or suspends on a coroutine stack
+const RAW_C_BLOCKS = /\breturn\b|\bgoto\b|\bporf_await\b|\bporf_yield\b/;
+const hasBlockingRawC = node => {
+  if (!Array.isArray(node)) return false;
+  if (!isNode(node)) return node.some(hasBlockingRawC);
+  if (node[N_KIND] === K.RawC) return RAW_C_BLOCKS.test(String(node[N_A]));
+  return hasBlockingRawC(node[N_A]) || hasBlockingRawC(node[N_B]) || hasBlockingRawC(node[N_C]);
+};
+// the locals raw C names (marked \u0001name\u0001, see resolveRawC in render.js)
+const rawCLocals = text => [ ...String(text).matchAll(/\u0001([^\u0001]*)\u0001/g) ].map(m => m[1]);
 const hasContinue = makeHas(K.Continue);
 
-// an await or a yield where lifting cannot reach yet
-const blocked = node => {
-  if (!Array.isArray(node)) return false;
-  if (!isNode(node)) return node.some(blocked);
-  if (!hasPause(node)) return false;
-  const k = node[N_KIND];
-  if (k === K.Loop && hasPause(node[N_B])) return true;
-  return blocked(node[N_A]) || blocked(node[N_B]) || blocked(node[N_C]);
+// A loop's continues (to label, or unlabelled and not in a loop inside it) as breaks out of
+// the block of its body: the update then runs after that block, as a statement
+const continuesAsBreaks = (node, label, block, nested = false) => {
+  if (!Array.isArray(node)) return node;
+  if (!isNode(node)) return node.map(x => continuesAsBreaks(x, label, block, nested));
+  if (node[N_KIND] === K.Continue && (label != null ? node[N_A] === label : !nested)) return Break(block);
+  const inner = nested || node[N_KIND] === K.Loop;
+  return [ node[N_KIND], node[N_TYPE], node[N_FX],
+    continuesAsBreaks(node[N_A], label, block, inner),
+    continuesAsBreaks(node[N_B], label, block, inner),
+    continuesAsBreaks(node[N_C], label, block, inner) ];
 };
 
 // values an await cannot change: safe to leave in place before one
@@ -64,7 +79,7 @@ const PURE_KINDS = new Set([ K.Const, K.JvConst, K.DataRef, K.FuncIdx, K.FuncRec
 export const planStackless = f => {
   if (!f || !f.body) return null;
   if (!f.generator && !(f.async && f.hasAwait)) return null;
-  if (hasRawC(f.body) || blocked(f.body)) return null;
+  if (hasBlockingRawC(f.body)) return null;
 
   const temps = Object.create(null);
   let count = 0;
@@ -195,6 +210,15 @@ export const planStackless = f => {
           head.push([ K.If, T.none, FX.none, Un('!', T.i32, c), [ Break(null) ], null ]);
           cond = null;
         }
+        // one in the update: it runs as a statement after the body, which is a block that
+        // the loop's continues leave (as breaks) to reach it
+        if (s[N_B] && hasPause(s[N_B])) {
+          const block = `__porf_upd${count++}`;
+          const inner = continuesAsBreaks(body, label, block);
+          out.push([ K.Loop, T.none, s[N_FX], cond, null, [
+            [ ...head, BlockStmt(liftStmts(inner), block), ...liftStmts([ s[N_B] ]) ], label ] ]);
+          return;
+        }
         out.push([ K.Loop, T.none, s[N_FX], cond, s[N_B], [ [ ...head, ...liftStmts(body) ], label ] ]);
         return;
       }
@@ -298,6 +322,11 @@ const frameLocals = body => {
       case K.Yield:
         walk(node[N_A], inAwaitLoop);
         suspend();
+        return;
+
+      case K.RawC:
+        // what raw C reads and writes is not in the IR: every local it names stays
+        for (const name of rawCLocals(node[N_A])) frame.add(name);
         return;
 
       case K.If:

@@ -651,7 +651,12 @@ export const __Object_prototype_toString = function (this: any) {
   // 2. If the this value is null, return "[object Null]".
   if (this === null) return '[object Null]';
 
-  // todo: toStringTag support
+  // an object's [Symbol.toStringTag] string is its tag (only a program with symbols has one)
+  if (Porffor.comptime.flag`hasType.symbol`) if (Porffor.object.isObject(this)) {
+    const tag: any = this[Symbol.toStringTag];
+    if ((Porffor.type(tag) | 0b10000000) == Porffor.TYPES.bytestring) return '[object ' + tag + ']';
+  }
+
   if (Porffor.type(this) == Porffor.TYPES.array) return '[object Array]';
   if (Porffor.type(this) == Porffor.TYPES.function) return '[object Function]';
   if (Porffor.fastOr(

@@ -52,10 +52,17 @@ export const __Number_isFinite = (value: any): boolean => {
   return delta == delta;
 };
 
-export const __Number_isInteger = (value: number): boolean => value == Infinity || value == -Infinity || value % 1 == 0;
+// IsIntegralNumber: a Number (no conversion: a string or a boolean is not one), finite,
+// and whole
+export const __Number_isInteger = (value: any): boolean => {
+  if (Porffor.type(value) != Porffor.TYPES.number) return false;
+  const delta: number = value - value;
+  if (delta != delta) return false;
+  return value % 1 == 0;
+};
 
-export const __Number_isSafeInteger = (value: number): boolean => {
-  if (value % 1 != 0) return false;
+export const __Number_isSafeInteger = (value: any): boolean => {
+  if (!__Number_isInteger(value)) return false;
   return value >= -9007199254740991 && value <= 9007199254740991;
 };
 

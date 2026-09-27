@@ -6,7 +6,7 @@ export default () => {
     errors.push(name);
     out += `
 export const ${name} = function (
-  ${name === 'AggregateError' ? 'errors: any,' : ''} message: any, options: any
+  ${name === 'AggregateError' ? 'errors: any,' : ''}${name === 'SuppressedError' ? 'error: any, suppressed: any,' : ''} message: any, options: any
 ): ${name} {
   if (message === undefined) message = '';
     else message = ecma262.ToString(message);
@@ -29,6 +29,11 @@ export const ${name} = function (
   const errorsList: any[] = __Array_from(errors);
   // TODO: should not be enumerable
   obj.errors = errorsList;
+  ` : ''}
+  ${name === 'SuppressedError' ? `
+  // https://tc39.es/proposal-explicit-resource-management/#sec-suppressederror-constructor
+  obj.error = error;
+  obj.suppressed = suppressed;
   ` : ''}
 
   return obj;
@@ -67,9 +72,10 @@ export const __${name}_prototype_toString = function (this: any) {
   error('RangeError');
   error('EvalError');
   error('URIError');
+  error('SuppressedError');
 
   out += `
-export const __Error_isError = (x: unknown): boolean => Porffor.fastAnd(Porffor.type(x) >= Porffor.TYPES.error, Porffor.type(x) <= Porffor.TYPES.urierror);`;
+export const __Error_isError = (x: unknown): boolean => Porffor.fastAnd(Porffor.type(x) >= Porffor.TYPES.error, Porffor.type(x) <= Porffor.TYPES.suppressederror);`;
 
   return out;
 };

@@ -295,8 +295,9 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
   // Porffor.c markers (codegen): \u0001name\u0001 is a variable, \u0002index\u0002 a JS
   // function called from C through its jsval wrapper, `<sym>_c`
   const cCallables = funcs.filter(f => f?.cCallable);
+  // a local named in raw C is its frame field in a step (varName), else its C variable
   const resolveRawC = str => str
-    .replace(/\u0001([^\u0001]*)\u0001/g, (_, name) => sanitize(name))
+    .replace(/\u0001([^\u0001]*)\u0001/g, (_, name) => varName(name))
     .replace(/\u0002(\d+)\u0002/g, (_, index) => `${fnSym(funcs[Number(index)])}_c`);
   const cCallableProto = f => {
     const n = f.params.filter(p => !p.name.startsWith('#')).length;
@@ -332,14 +333,12 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
   // 6 stackless (runs as a step function over a heap frame, see stackless.js)
   const FN_CORO_INIT = 1 << 5;
   const FN_STACKLESS = 1 << 6;
-  // --stackless: the async functions that can run without a coroutine stack, and their
-  // bodies with every await lifted to a statement
+  // the coroutines that run without a stack of their own (all but a few: see stackless.js),
+  // and their bodies with every await and yield lifted to a statement
   const stackless = new Map();
-  if (prefs.stackless) {
-    for (const f of funcs) {
-      const plan = planStackless(f);
-      if (plan) stackless.set(f, plan);
-    }
+  for (const f of funcs) {
+    const plan = planStackless(f);
+    if (plan) stackless.set(f, plan);
   }
   const coroKind = f => f?.async && f?.generator ? FN_ASYNC_GENERATOR : (f?.async ? FN_ASYNC : 0) | (f?.generator ? FN_GENERATOR : 0);
   const coroFlags = f => coroKind(f) | (f?.coroInit ? FN_CORO_INIT : 0) | (stackless.has(f) ? FN_STACKLESS : 0);
@@ -354,6 +353,22 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
   let usesCoro = false;
   let usesSyncAsync = false;
   const gcEnabled = prefs.gc !== false;
+  const ropesOn = !!Prefs.ropes && gcEnabled;
+  // --ropes: the builtins that only store a value (a property, a Map entry) leave it a rope:
+  // flattening it there would copy the whole string on every o.s += x. Their keys are
+  // hashed, so those are flattened as any other argument
+  const ROPE_KEEPS = {
+    __Porffor_object_set: 'value', __Porffor_object_set_withHash: 'value',
+    __Porffor_object_setStrict: 'value', __Porffor_object_setStrict_withHash: 'value',
+    __Porffor_object_define: 'value', __Porffor_object_fastAdd: 'value', __Porffor_object_expr_init: 'value',
+    __Map_prototype_set: 'value', __WeakMap_prototype_set: 'value'
+  };
+  const ropeFlatten = f => {
+    if (!ropesOn || !f.internal) return '';
+    const keep = ROPE_KEEPS[f.name];
+    return f.params.filter(p => p.type === T.jsval && p.name !== keep)
+      .map(p => `  ${sanitize(p.name)} = porf_str_flat(${sanitize(p.name)});\n`).join('');
+  };
   for (const f of funcs) {
     if (needsCoro(f)) usesCoro = true;
     if (isSyncAsync(f)) usesSyncAsync = true;
@@ -548,6 +563,13 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
 
       case K.Convert: {
         const to = node[N_TYPE], from = node[N_A], v = node[N_B], flags = node[N_C];
+        // a 32-bit integer widened to f64 and narrowed back to the other signedness: ToInt32
+        // and ToUint32 of an exact 32-bit value wrap (a u32 of 2^31 or more is a negative i32,
+        // a negative i32 a large u32), so the bits carry over as they are, never saturated
+        if (from === T.f64 && v[N_KIND] === K.Convert && v[N_TYPE] === T.f64 &&
+            ((to === T.i32 && v[N_A] === T.u32) || (to === T.u32 && v[N_A] === T.i32))) {
+          return [`(${CT[to]})${rx(v[N_B], P_CAST)}`, P_CAST];
+        }
         // f64 -> int without range knowledge: saturate (JS ToInt semantics live above this)
         if (from === T.f64 && (to === T.i32 || to === T.u32 || to === T.ptr) && !(flags & CONVERT_RANGE_KNOWN)) {
           return [`${to === T.i32 ? 'porf_f64_to_i32' : 'porf_f64_to_u32'}(${rx(v, P_COMMA)})`, P_POSTFIX];
@@ -1042,6 +1064,8 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     emit(`  porf_coro_call* call = porf_sl_starting;\n  porf_sl_starting = 0;\n`);
     emit(`  if (!call) porf_unreachable("stackless async function called outside porf_coro_start");\n`);
     emit(`  ${frame}* fr = (${frame}*)calloc(1, sizeof(${frame}));\n  if (!fr) abort();\n`);
+    // --ropes: as for any builtin (see renderFunc), strings arrive flat, before the frame keeps them
+    emit(ropeFlatten(f));
     for (const [name, t] of fields) {
       if (f.params.some(p => p.name === name)) emit(`  fr->${sanitize(name)} = ${sanitize(name)};\n`);
       else if (t === T.jsval) emit(`  fr->${sanitize(name)} = JV_UNDEFINED;\n`);
@@ -1117,6 +1141,9 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     }
     // a no-op unless the program runs coroutines on wasm (see PORF_STACK_CHECK)
     emit(`  PORF_STACK_CHECK();\n`);
+    // --ropes: a builtin reads the strings it is given as characters, so a rope is
+    // flattened on the way in (once: the rope keeps its flat string)
+    emit(ropeFlatten(f));
     renderStmts(f.body);
     emit(`}\n\n`);
   };
@@ -2193,6 +2220,7 @@ static const u16 porf_gc_cls_slots[PORF_GC_NCLASSES] = { ${classes.map((c, i) =>
 static const u8 porf_gc_cls_lut[1025] = { ${lut.join(',')} };
 
 // kind bytes: 0 conservative, 1..195 type IDs, 248+ internal
+#define PORF_GC_KIND_ROPE 247u
 #define PORF_GC_KIND_OBJECT_ENTRIES 249u
 #define PORF_GC_KIND_ARRAY_ENTRIES 250u
 #define PORF_GC_KIND_FUNCTION 251u
@@ -3079,6 +3107,8 @@ static int porf_gc_should_rescan_marked_body(i32 body, i32 type) {
     case ${TYPES.__porffor_asyncgenerator}:
     case ${TYPES.symbol}:
     case ${TYPES.weakref}:
+    case ${TYPES.disposablestack}:
+    case ${TYPES.asyncdisposablestack}:
     case ${TYPES.proxy}:
     case ${TYPES.error}:
     case ${TYPES.aggregateerror}:
@@ -3088,6 +3118,7 @@ static int porf_gc_should_rescan_marked_body(i32 body, i32 type) {
     case ${TYPES.rangeerror}:
     case ${TYPES.evalerror}:
     case ${TYPES.urierror}:
+    case ${TYPES.suppressederror}:
     case ${TYPES.regexp}:
     case ${TYPES.dataview}:
     case ${TYPES.uint8clampedarray}:
@@ -3108,7 +3139,15 @@ static int porf_gc_should_rescan_marked_body(i32 body, i32 type) {
 
 static void porf_gc_scan_body(i32 body, i32 type) {
   switch (type) {
-    case ${TYPES.__porffor_closureenv}: {
+${Prefs.ropes ? `    case PORF_GC_KIND_ROPE: {
+      // [len][left][right][flat][left type][right type][type]
+      const u32 left = *(u32*)(MEM + body + 4), right = *(u32*)(MEM + body + 8), flat = *(u32*)(MEM + body + 12);
+      if (left != 0) porf_gc_mark_js((f64)left, *(u8*)(MEM + body + 16));
+      if (right != 0) porf_gc_mark_js((f64)right, *(u8*)(MEM + body + 17));
+      if (flat != 0) porf_gc_mark_js((f64)flat, *(u8*)(MEM + body + 18));
+      break;
+    }
+` : ''}    case ${TYPES.__porffor_closureenv}: {
       const u32 parent = *(u32*)(MEM + body);
       if (parent != 0) porf_gc_mark_js((f64)parent, ${TYPES.__porffor_closureenv});
       const u32 count = *(u32*)(MEM + body + 4);
@@ -3192,7 +3231,9 @@ weakmap_seen:
       break;
     }
     case ${TYPES.symbol}:
-    case ${TYPES.weakref}: {
+    case ${TYPES.weakref}:
+    case ${TYPES.disposablestack}:
+    case ${TYPES.asyncdisposablestack}: {
       const jsval v = porf_unpack(*(jsbits*)(MEM + body));
       porf_gc_mark_js(v.val, v.type);
       break;
@@ -3212,7 +3253,8 @@ weakmap_seen:
     case ${TYPES.syntaxerror}:
     case ${TYPES.rangeerror}:
     case ${TYPES.evalerror}:
-    case ${TYPES.urierror}: {
+    case ${TYPES.urierror}:
+    case ${TYPES.suppressederror}: {
       const jsval v = porf_unpack(*(jsbits*)(MEM + body));
       porf_gc_mark_js(v.val, v.type);
       break;
@@ -3265,7 +3307,9 @@ static void porf_gc_mark_js(f64 value, i32 type) {
   if (body == 0) return;
   // static strings hold no references and are never freed
   if ((u32)body < porf_heap_base && (type == ${TYPES.bytestring} || type == ${TYPES.string})) return;
-  if (porf_gc_is_block_start(body)) {
+${Prefs.ropes ? `  // a rope (--ropes) is a string value whose block holds its halves
+  if ((type == ${TYPES.bytestring} || type == ${TYPES.string}) && porf_gc_kinds[porf_gc_gran(body)] == PORF_GC_KIND_ROPE) type = PORF_GC_KIND_ROPE;
+` : ''}  if (porf_gc_is_block_start(body)) {
     if (type == ${TYPES.object} && !porf_gc_object_shape_valid(body)) return;
     if (!porf_gc_mark_body(body)) {
       if (porf_gc_minor_mode && porf_gc_bit(PORF_GC_B_YOUNG, porf_gc_gran(body)) == 0u) return;
@@ -3304,6 +3348,8 @@ static void porf_gc_mark_js(f64 value, i32 type) {
     case ${TYPES.weakmap}:
     case ${TYPES.weakset}:
     case ${TYPES.weakref}:
+    case ${TYPES.disposablestack}:
+    case ${TYPES.asyncdisposablestack}:
     case ${TYPES.proxy}:
     case ${TYPES.error}:
     case ${TYPES.aggregateerror}:
@@ -3313,6 +3359,7 @@ static void porf_gc_mark_js(f64 value, i32 type) {
     case ${TYPES.rangeerror}:
     case ${TYPES.evalerror}:
     case ${TYPES.urierror}:
+    case ${TYPES.suppressederror}:
       break;
     default:
       return;
@@ -3474,7 +3521,10 @@ static void porf_gc_scan_kind_block(i32 body) {
     case PORF_GC_KIND_PROMISE_REACTION:
       porf_gc_mark_promise_reaction((u32)body);
       break;
-    default:
+${Prefs.ropes ? `    case PORF_GC_KIND_ROPE:
+      porf_gc_scan_body(body, PORF_GC_KIND_ROPE);
+      break;
+` : ''}    default:
       if (kind >= 1u && kind <= 195u) porf_gc_scan_body(body, (i32)kind);
       break;
   }
@@ -4032,6 +4082,8 @@ ${st}void porf_gc_collect(int minor) {
 const RUNTIME_HEAD = (prefs, usesCoro = false, toStr = null, bigintUsed = true, stackful = false) => {
   const st = 'static ';
   const sti = 'static inline ';
+  // --ropes: string concatenation builds ropes (needs the GC to trace them)
+  const ropes = !!Prefs.ropes && prefs.gc !== false;
   return `// generated by porffor ${globalThis.version}
 // 1 when some coroutine runs on a stack of its own (on WASI P3, a component-model thread);
 // 0 when every one is stackless, and nothing needs a coroutine stack or a thread. An
@@ -4497,8 +4549,10 @@ ${sti}u32 porf_alloc(u32 bytes, u32 typeId);
 
 // s (a string or bytestring) in upper or lower case. An ASCII bytestring stays a
 // bytestring; anything else becomes a string (a Latin-1 letter's case can leave Latin-1).
-static jsval porf_case_convert(jsval s, i32 upper) {
-  const i32 wide = porf_jv_type(s) == ${TYPES.string};
+${ropes ? `static inline __attribute__((always_inline)) jsval porf_str_flat(jsval v);
+` : ''}static jsval porf_case_convert(jsval s, i32 upper) {
+${ropes ? `  s = porf_str_flat(s);
+` : ''}  const i32 wide = porf_jv_type(s) == ${TYPES.string};
   const u32 src = (u32)s.val;
   const u32 len = *(u32*)(MEM + src);
   const u32 chars = src + 4;
@@ -4601,7 +4655,7 @@ PORF_NORETURN ${st}void porf_throw(jsval v) {
     const i32 t = porf_jv_type(v);
     const char* text = "";
     i32 len = 0;
-    if (t >= ${TYPES.error} && t <= ${TYPES.urierror} && (u32)v.val) {
+    if (t >= ${TYPES.error} && t <= ${TYPES.suppressederror} && (u32)v.val) {
       const jsval m = porf_unpack(*(jsbits*)(MEM + (u32)v.val));
       if (porf_jv_type(m) == ${TYPES.bytestring} && (u32)m.val) { len = (i32)*(u32*)(MEM + (u32)m.val); text = (const char*)(MEM + (u32)m.val + 4); }
     }
@@ -4755,11 +4809,102 @@ ${st}u32 porf_bstr_new(u32 len) {
   return s;
 }
 
-${st}jsval porf_str_concat(jsval a, jsval b) {
+${ropes ? `// ropes (--ropes): a concatenation long enough is a node holding its two halves, flattened
+// into one string once something reads its characters, and cached (read again, it is O(1)).
+// The node is [u32 length][u32 left][u32 right][u32 flat][u8 left type][u8 right type]
+// [u8 type]: its length where a flat string's is, so a raw length load reads it right, and
+// its value's type the string type it flattens to. It is told apart by its block kind.
+#define PORF_ROPE_MIN 64u
+// (the kind table directly, as the allocator writes it: a freshly bumped block has its
+// kind before its allocation bit is published, which porf_gc_kind waits for)
+${sti}int porf_rope_is(u32 p) {
+  return p >= porf_heap_base && porf_gc_kinds[porf_gc_gran((i32)p)] == PORF_GC_KIND_ROPE;
+}
+${st}u32 porf_rope_flatten(u32 r) {
+  const u32 cached = *(u32*)(MEM + r + 12);
+  if (cached != 0) return cached;
+  volatile u32 keep = r;
+  const u32 len = *(u32*)(MEM + r);
+  const u8 type = *(u8*)(MEM + r + 18);
+  const int wide = type != ${TYPES.bytestring};
+  const u32 out = porf_alloc(4 + (wide ? len * 2 : len), type);
+  r = keep;
+  *(u32*)(MEM + out) = len;
+  // the leaves left to right: a stack of what is still to write, the left half on top
+  u32 cap = 64, sp = 1, pos = 0;
+  u32* stack = (u32*)malloc(cap * 2 * sizeof(u32));
+  if (!stack) abort();
+  stack[0] = r; stack[1] = type;
+  while (sp > 0) {
+    sp--;
+    u32 p = stack[sp * 2];
+    const u32 t = stack[sp * 2 + 1];
+    if (porf_rope_is(p)) {
+      const u32 flat = *(u32*)(MEM + p + 12);
+      if (flat == 0) {
+        if (sp + 2 > cap) {
+          cap *= 2;
+          stack = (u32*)realloc(stack, cap * 2 * sizeof(u32));
+          if (!stack) abort();
+        }
+        stack[sp * 2] = *(u32*)(MEM + p + 8); stack[sp * 2 + 1] = *(u8*)(MEM + p + 17); sp++;
+        stack[sp * 2] = *(u32*)(MEM + p + 4); stack[sp * 2 + 1] = *(u8*)(MEM + p + 16); sp++;
+        continue;
+      }
+      // flattened already: its flat string, of the same type
+      p = flat;
+    }
+    const u32 n = *(u32*)(MEM + p);
+    if (!wide) memcpy(MEM + out + 4 + pos, MEM + p + 4, n);
+    else if (t == ${TYPES.bytestring}) {
+      u16* dst = (u16*)(MEM + out + 4) + pos;
+      for (u32 i = 0; i < n; i++) dst[i] = MEM[p + 4 + i];
+    } else memcpy((u16*)(MEM + out + 4) + pos, MEM + p + 4, (size_t)n * 2);
+    pos += n;
+  }
+  free(stack);
+  // only the flat string is kept alive from now on, not the halves
+  *(u32*)(MEM + r + 12) = out;
+  *(u32*)(MEM + r + 4) = 0;
+  *(u32*)(MEM + r + 8) = 0;
+  porf_gc_barrier(r, PORF_GC_KIND_ROPE);
+  return out;
+}
+PORF_NOINLINE static jsval porf_str_flat_slow(jsval v) {
+  return porf_box((f64)porf_rope_flatten((u32)v.val), v.type);
+}
+// a string value readable as characters: a rope's flat string, anything else as it is.
+// Every builtin argument goes through this, so it is a few compares, inlined, for the
+// values that are not ropes
+static inline __attribute__((always_inline)) jsval porf_str_flat(jsval v) {
+  if (__builtin_expect((v.type == ${TYPES.bytestring} || v.type == ${TYPES.string}) && porf_rope_is((u32)v.val), 0))
+    return porf_str_flat_slow(v);
+  return v;
+}
+
+` : ''}${st}jsval porf_str_concat(jsval a, jsval b) {
   volatile u32 keep_a = (u32)a.val, keep_b = (u32)b.val;
   const u32 pa = keep_a, pb = keep_b;
   const u32 la = *(u32*)(MEM + pa), lb = *(u32*)(MEM + pb);
-  if (a.type == ${TYPES.bytestring} && b.type == ${TYPES.bytestring}) {
+${ropes ? `  if (la + lb >= PORF_ROPE_MIN && la != 0 && lb != 0) {
+    const u32 r = porf_alloc(20, 0);
+    porf_gc_kinds[porf_gc_gran((i32)r)] = (u8)PORF_GC_KIND_ROPE;
+    const u8 type = a.type == ${TYPES.bytestring} && b.type == ${TYPES.bytestring} ? ${TYPES.bytestring} : ${TYPES.string};
+    *(u32*)(MEM + r) = la + lb;
+    *(u32*)(MEM + r + 4) = keep_a;
+    *(u32*)(MEM + r + 8) = keep_b;
+    *(u32*)(MEM + r + 12) = 0;
+    *(u8*)(MEM + r + 16) = (u8)a.type;
+    *(u8*)(MEM + r + 17) = (u8)b.type;
+    *(u8*)(MEM + r + 18) = type;
+    return porf_box((f64)r, type);
+  }
+  // one side empty: the other, as it is (a string never changes); else below copies the
+  // characters of both, so a rope among them (too short to stay one) is read flat
+  if (la == 0) return b;
+  if (lb == 0) return a;
+  if (porf_rope_is(pa) || porf_rope_is(pb)) return porf_str_concat(porf_str_flat(a), porf_str_flat(b));
+` : ''}  if (a.type == ${TYPES.bytestring} && b.type == ${TYPES.bytestring}) {
     const u32 s = porf_bstr_new(la + lb);
     memcpy(MEM + s + 4, MEM + pa + 4, la);
     memcpy(MEM + s + 4 + la, MEM + pb + 4, lb);
@@ -4786,7 +4931,8 @@ ${st}jsval porf_str_concat(jsval a, jsval b) {
 ${st}i32 porf_str_eq(jsval a, jsval b) {
   const u32 pa = (u32)a.val, pb = (u32)b.val;
   if (pa == pb) return 1;
-  const u32 la = *(u32*)(MEM + pa);
+${ropes ? `  if (porf_rope_is(pa) || porf_rope_is(pb)) return porf_str_eq(porf_str_flat(a), porf_str_flat(b));
+` : ''}  const u32 la = *(u32*)(MEM + pa);
   if (la != *(u32*)(MEM + pb)) return 0;
   const i32 ta = porf_jv_type(a), tb = porf_jv_type(b);
   if (ta == tb) return memcmp(MEM + pa + 4, MEM + pb + 4, (size_t)la * (ta == ${TYPES.string} ? 2 : 1)) == 0;
@@ -5426,7 +5572,8 @@ static int porf_bn_is_space(u32 c) {
 // StringToBigInt (literal = 0), or a source literal's digits (literal = 1: a sign may come
 // before a radix prefix, nothing is trimmed): the BigInt, or undefined when s is not one
 ${st}jsval porf_bigint_parse(jsval s, i32 literal) {
-  const u32 p = (u32)s.val;
+${ropes ? `  s = porf_str_flat(s);
+` : ''}  const u32 p = (u32)s.val;
   const u32 len = *(u32*)(MEM + p);
   const int wide = porf_jv_type(s) == ${TYPES.string};
 #define PORF_BN_CH(i) (wide ? (u32)*(u16*)(MEM + p + 4 + ((i) << 1)) : (u32)*(u8*)(MEM + p + 4 + (i)))
@@ -5611,11 +5758,22 @@ ${bigintUsed ? `  if (ta == ${TYPES.bigint}) return porf_bigint_cmp_any(a, b);
   }
 ` : ''}\
   if ((ta == ${TYPES.bytestring} || ta == ${TYPES.string}) && (tb == ${TYPES.bytestring} || tb == ${TYPES.string})) {
-    const u32 pa = (u32)a.val, pb = (u32)b.val;
+${ropes ? `    a = porf_str_flat(a);
+    b = porf_str_flat(b);
+` : ''}    const u32 pa = (u32)a.val, pb = (u32)b.val;
     const u32 la = *(u32*)(MEM + pa), lb = *(u32*)(MEM + pb);
     const u32 n = la < lb ? la : lb;
-    const int c = memcmp(MEM + pa + 4, MEM + pb + 4, n);
-    if (c != 0) return c < 0 ? -1 : 1;
+    if (ta == ${TYPES.bytestring} && tb == ${TYPES.bytestring}) {
+      const int c = memcmp(MEM + pa + 4, MEM + pb + 4, n);
+      if (c != 0) return c < 0 ? -1 : 1;
+    } else {
+      // by UTF-16 code unit: a one-byte string's bytes are its code units
+      for (u32 i = 0; i < n; i++) {
+        const u32 x = ta == ${TYPES.bytestring} ? MEM[pa + 4 + i] : *(u16*)(MEM + pa + 4 + i * 2);
+        const u32 y = tb == ${TYPES.bytestring} ? MEM[pb + 4 + i] : *(u16*)(MEM + pb + 4 + i * 2);
+        if (x != y) return x < y ? -1 : 1;
+      }
+    }
     return la == lb ? 0 : la < lb ? -1 : 1;
   }
   const f64 x = porf_to_num(a), y = porf_to_num(b);

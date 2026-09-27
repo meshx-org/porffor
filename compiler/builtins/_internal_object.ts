@@ -296,6 +296,8 @@ export const __Porffor_object_underlying = (_obj: any): any => {
           __Porffor_object_fastAdd(underlying, 'prototype', proto, 0b1000);
           __Porffor_object_fastAdd(proto, 'constructor', _obj, 0b1010);
         }
+        // a built-in constructor's static methods (Object.keys read as O.keys)
+        __Porffor_object_builtinStatics(_obj, underlying);
       }
     }
 
@@ -561,6 +563,9 @@ export const __Porffor_object_get = (_obj: any, key: any): any => {
     }
   }
   if (trueType == Porffor.TYPES.array) {
+    // length by key (o[k], a proxy's target): the array's own, not the property store's copy
+    // (written once, when the store was made)
+    if (Porffor.type(key) != Porffor.TYPES.symbol) if (Porffor.strcmp(key, 'length')) return (_obj as any[]).length;
     const index: i32 = __Porffor_array_propertyKeyIndex(key);
     if (index != -1) {
       if (__Porffor_array_has(_obj as any[], index)) return (_obj as any[])[index];
@@ -725,6 +730,15 @@ export const __Porffor_object_set = (_obj: any, key: any, value: any): any => {
   key = ecma262.ToPropertyKey(key);
   const hash: i32 = __Porffor_object_hash(key);
   if (trueType == Porffor.TYPES.array) {
+    // length set by key (o[k] = v, Reflect.set, a proxy's target): ArraySetLength, the
+    // array's own length, as a.length = v sets it
+    if (Porffor.type(key) != Porffor.TYPES.symbol) if (Porffor.strcmp(key, 'length')) {
+      const numberLen: number = ecma262.ToNumber(value);
+      const newLen: number = numberLen >>> 0;
+      if (newLen != numberLen) throw new RangeError('Invalid array length');
+      __Porffor_array_setLength(_obj, newLen);
+      return value;
+    }
     const index: i32 = __Porffor_array_propertyKeyIndex(key);
     if (Porffor.fastAnd(index != -1, __Porffor_object_lookup(obj, key, hash) == 0)) {
       let arr: i32 = Porffor.IR.ptr(_obj);
@@ -930,6 +944,15 @@ export const __Porffor_object_setStrict = (_obj: any, key: any, value: any): any
   key = ecma262.ToPropertyKey(key);
   const hash: i32 = __Porffor_object_hash(key);
   if (trueType == Porffor.TYPES.array) {
+    // length set by key (o[k] = v, Reflect.set, a proxy's target): ArraySetLength, the
+    // array's own length, as a.length = v sets it
+    if (Porffor.type(key) != Porffor.TYPES.symbol) if (Porffor.strcmp(key, 'length')) {
+      const numberLen: number = ecma262.ToNumber(value);
+      const newLen: number = numberLen >>> 0;
+      if (newLen != numberLen) throw new RangeError('Invalid array length');
+      __Porffor_array_setLength(_obj, newLen);
+      return value;
+    }
     const index: i32 = __Porffor_array_propertyKeyIndex(key);
     if (Porffor.fastAnd(index != -1, __Porffor_object_lookup(obj, key, hash) == 0)) {
       let arr: i32 = Porffor.IR.ptr(_obj);
