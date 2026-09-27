@@ -290,6 +290,13 @@ export const __Porffor_json_serialize = (off: i32, holder: any, value: any, key:
     }
   }
 
+  // the replacer function, on what toJSON gave
+  if (__Porffor_json_replacer !== undefined) {
+    if (Porffor.type(key) == Porffor.TYPES.number) key = Porffor.callThis(__Number_prototype_toString, key, 10);
+    value = Porffor.callThis(__Porffor_json_replacer, holder, key, value);
+    t = Porffor.type(value);
+  }
+
   // boxed primitives are their primitive
   if (t == Porffor.TYPES.numberobject) {
     value = ecma262.ToNumber(value);
@@ -339,7 +346,8 @@ export const __Porffor_json_serialize = (off: i32, holder: any, value: any, key:
   // kind (a Map, a RegExp, a Date without toJSON...) has them in its side table, if it has
   // any. Typed arrays (indexed elements) and proxies (traps) go through for-in
   let entries: any = null;
-  if (t == Porffor.TYPES.object) entries = value;
+  if (__Porffor_json_allow !== undefined) entries = undefined;
+    else if (t == Porffor.TYPES.object) entries = value;
     else if (Porffor.fastAnd(t != Porffor.TYPES.proxy, Porffor.fastOr(t < Porffor.TYPES.uint8clampedarray, t > Porffor.TYPES.float64array))) {
       entries = __Porffor_object_underlyingFind(value);
       if (Porffor.IR.ptr(entries) == 0) return __Porffor_json_putBytes(off, '{}');
@@ -347,7 +355,14 @@ export const __Porffor_json_serialize = (off: i32, holder: any, value: any, key:
 
   off = __Porffor_json_putChar(off, 123); // {
   let empty: boolean = true;
-  if (entries != null) {
+  if (entries === undefined) {
+    const n: i32 = __Porffor_json_allow.length;
+    for (let i: i32 = 0; i < n; i++) {
+      const k: any = __Porffor_json_allow[i];
+      off = __Porffor_json_putProperty(off, value, k, value[k], depth + 1, space, empty);
+      if (!__Porffor_json_skipped) empty = false;
+    }
+  } else if (entries != null) {
     off = __Porffor_json_putEntries(off, value, entries, depth + 1, space);
     empty = __Porffor_json_skipped;
   } else {
@@ -365,7 +380,24 @@ export const __Porffor_json_serialize = (off: i32, holder: any, value: any, key:
 };
 
 export const __JSON_stringify = (value: any, replacer: any, space: any) => {
-  // todo: replacer
+  // a function, or an array's keys: strings, numbers and their objects, each once
+  let replacerFn: any = undefined;
+  let allow: any = undefined;
+  if (Porffor.type(replacer) == Porffor.TYPES.function) replacerFn = replacer;
+    else if (Porffor.type(replacer) == Porffor.TYPES.array) {
+      allow = Porffor.array.new(4);
+      const n: i32 = (replacer as any[]).length;
+      for (let i: i32 = 0; i < n; i++) {
+        const v: any = (replacer as any[])[i];
+        const vt: i32 = Porffor.type(v);
+        if (Porffor.fastOr((vt | 0b10000000) == Porffor.TYPES.bytestring, vt == Porffor.TYPES.number, vt == Porffor.TYPES.stringobject, vt == Porffor.TYPES.numberobject)) {
+          const k: any = ecma262.ToString(v);
+          let seen: boolean = false;
+          for (let j: i32 = 0; j < allow.length; j++) if (allow[j] === k) seen = true;
+          if (!seen) Porffor.array.fastPush(allow, k);
+        }
+      }
+    }
 
   if (space !== undefined) {
     if (Porffor.fastOr(
@@ -404,11 +436,20 @@ export const __JSON_stringify = (value: any, replacer: any, space: any) => {
   const outerBuf: i32 = __Porffor_json_buf;
   const outerCap: i32 = __Porffor_json_cap;
   const outerWide: boolean = __Porffor_json_wide;
+  const outerReplacer: any = __Porffor_json_replacer;
+  const outerAllow: any = __Porffor_json_allow;
 
   __Porffor_json_cap = 4096;
   __Porffor_json_buf = Porffor.malloc(8 + __Porffor_json_cap);
   __Porffor_json_wide = false;
-  const root: any = undefined;
+  __Porffor_json_replacer = replacerFn;
+  __Porffor_json_allow = allow;
+  // the root's holder, a replacer's this for it: { '': value }
+  let root: any = undefined;
+  if (replacerFn !== undefined) {
+    root = {};
+    __Porffor_object_fastAdd(root, '', value, 0b1110);
+  }
   const len: i32 = __Porffor_json_serialize(0, root, value, '', 0, space);
   const buffer: bytestring = __Porffor_json_buf as bytestring;
   const wideOut: boolean = __Porffor_json_wide;
@@ -416,7 +457,8 @@ export const __JSON_stringify = (value: any, replacer: any, space: any) => {
   __Porffor_json_buf = outerBuf;
   __Porffor_json_cap = outerCap;
   __Porffor_json_wide = outerWide;
-
+  __Porffor_json_replacer = outerReplacer;
+  __Porffor_json_allow = outerAllow;
   if (len == -1) return undefined;
 
   Porffor.IR.storeI32(buffer, 0, len);
