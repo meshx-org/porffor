@@ -55,7 +55,7 @@ const help = () => {
       'fast-length': 'Non-compliant optimization to make .length faster',
       'ropes': 'Build long string concatenations as ropes, flattened when read (s += x in a loop is linear)',
       'switch-hash': 'Switch over string cases by hash: a case that does not match is an integer compare',
-      'dtoa': 'How numbers become their shortest digits: dragonbox (default) or libc',
+      'dtoa': 'How numbers become their shortest digits: dragonbox (default), ryu, grisu3 or libc',
       'profile-compiler': 'Log general compiler performance (on by default when compiling to a file)',
       'jN': 'Parallel C compile jobs for module builds (default: CPU count)',
     })) {

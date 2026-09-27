@@ -1,4 +1,8 @@
-// Dragonbox, ported to C for Porffor's number-to-string (--dtoa=dragonbox, the default):
+// How a non-integer number becomes its shortest digits, one algorithm per --dtoa (DTOA
+// below, compiled in alone): dragonbox (the default), ryu and grisu3. Each is a C function
+// taking a finite, positive binary64 and giving the digits as an integer and a power of ten.
+//
+// Dragonbox, ported to C for Porffor's number-to-string (--dtoa=dragonbox):
 // the shortest decimal that round-trips to a binary64, and the closest such when there are
 // several, as Number::toString wants it. From https://github.com/jk-jeon/dragonbox
 // (include/dragonbox/dragonbox.h and subproject/simple/include/simple_dragonbox.h),
@@ -7,7 +11,8 @@
 // tables, not 9.9 KB).
 //
 // Copyright 2020-2025 Junekey Jeon; simple_dragonbox.h copyright 2024-2025 Junekey Jeon,
-// Toby Bell. Used under the Boost Software License, Version 1.0:
+// Toby Bell. Ryu (below) copyright 2018 Ulf Adams. Both used under the Boost Software
+// License, Version 1.0:
 //
 // Boost Software License - Version 1.0 - August 17th, 2003
 //
@@ -231,3 +236,394 @@ static void porf_dragonbox(uint64_t bits, uint64_t* out_sig, int* out_exp) {
   *out_exp = minus_k + 2;
 }
 `;
+
+// Ryu (--dtoa=ryu), from https://github.com/ulfjack/ryu (ryu/d2s.c with its small tables).
+// Boost Software License 1.0, above
+export const RYU_C = `// Ryu (Ulf Adams): the shortest decimal that round-trips to a binary64, and the closest
+// such when there are several. Ported to C from https://github.com/ulfjack/ryu (d2s.c,
+// Boost Software License 1.0) with its small tables (RYU_OPTIMIZE_SIZE: every 26th power
+// of 5 stored, the rest recovered with a multiplication) and no 128-bit integer type.
+static const uint64_t porf_ryu_inv_split[15][2] = {
+  { 1u, 2305843009213693952u }, { 5955668970331000884u, 1784059615882449851u },
+  { 8982663654677661702u, 1380349269358112757u }, { 7286864317269821294u, 2135987035920910082u },
+  { 7005857020398200553u, 1652639921975621497u }, { 17965325103354776697u, 1278668206209430417u },
+  { 8928596168509315048u, 1978643211784836272u }, { 10075671573058298858u, 1530901034580419511u },
+  { 597001226353042382u, 1184477304306571148u }, { 1527430471115325346u, 1832889850782397517u },
+  { 12533209867169019542u, 1418129833677084982u }, { 5577825024675947042u, 2194449627517475473u },
+  { 11006974540203867551u, 1697873161311732311u }, { 10313493231639821582u, 1313665730009899186u },
+  { 12701016819766672773u, 2032799256770390445u }
+};
+static const uint32_t porf_ryu_inv_offsets[22] = {
+  0x54544554, 0x04055545, 0x10041000, 0x00400414, 0x40010000, 0x41155555, 0x00000454, 0x00010044,
+  0x40000000, 0x44000041, 0x50454450, 0x55550054, 0x51655554, 0x40004000, 0x01000001, 0x00010500,
+  0x51515411, 0x05555554, 0x50411500, 0x40040000, 0x05040110, 0x00000000
+};
+static const uint64_t porf_ryu_split[13][2] = {
+  { 0u, 1152921504606846976u }, { 0u, 1490116119384765625u },
+  { 1032610780636961552u, 1925929944387235853u }, { 7910200175544436838u, 1244603055572228341u },
+  { 16941905809032713930u, 1608611746708759036u }, { 13024893955298202172u, 2079081953128979843u },
+  { 6607496772837067824u, 1343575221513417750u }, { 17332926989895652603u, 1736530273035216783u },
+  { 13037379183483547984u, 2244412773384604712u }, { 1605989338741628675u, 1450417759929778918u },
+  { 9630225068416591280u, 1874621017369538693u }, { 665883850346957067u, 1211445438634777304u },
+  { 14931890668723713708u, 1565756531257009982u }
+};
+static const uint32_t porf_ryu_offsets[21] = {
+  0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x40000000, 0x59695995, 0x55545555, 0x56555515,
+  0x41150504, 0x40555410, 0x44555145, 0x44504540, 0x45555550, 0x40004000, 0x96440440, 0x55565565,
+  0x54454045, 0x40154151, 0x55559155, 0x51405555, 0x00000105
+};
+
+static inline uint64_t porf_ryu_umul128(uint64_t a, uint64_t b, uint64_t* hi) {
+  const uint64_t a0 = (uint32_t)a, a1 = a >> 32, b0 = (uint32_t)b, b1 = b >> 32;
+  const uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
+  const uint64_t mid1 = p10 + (p00 >> 32);
+  const uint64_t mid2 = p01 + (uint32_t)mid1;
+  *hi = p11 + (mid1 >> 32) + (mid2 >> 32);
+  return (mid2 << 32) | (uint32_t)p00;
+}
+// dist in 1..63
+static inline uint64_t porf_ryu_shr128(uint64_t lo, uint64_t hi, uint32_t dist) { return (hi << (64 - dist)) | (lo >> dist); }
+static inline int32_t porf_ryu_pow5bits(int32_t e) { return (int32_t)((((uint32_t)e) * 1217359) >> 19) + 1; }
+
+static inline uint32_t porf_ryu_pow5_factor(uint64_t v) {
+  uint32_t n = 0;
+  for (;;) {
+    v *= 14757395258967641293u; // the inverse of 5 mod 2^64
+    if (v > 3689348814741910323u) return n; // 2^64 / 5
+    n++;
+  }
+}
+
+// 5^i (0 <= i < 326), 128 bits, from the stored every-26th power
+static void porf_ryu_pow5(uint32_t i, uint64_t* out) {
+  const uint32_t base = i / 26, base2 = base * 26, offset = i - base2;
+  const uint64_t* mul = porf_ryu_split[base];
+  if (offset == 0) { out[0] = mul[0]; out[1] = mul[1]; return; }
+  uint64_t m = 1;
+  for (uint32_t j = 0; j < offset; j++) m *= 5;
+  uint64_t high1, high0;
+  const uint64_t low1 = porf_ryu_umul128(m, mul[1], &high1);
+  const uint64_t low0 = porf_ryu_umul128(m, mul[0], &high0);
+  const uint64_t sum = high0 + low1;
+  high1 += sum < high0;
+  const uint32_t delta = (uint32_t)(porf_ryu_pow5bits((int32_t)i) - porf_ryu_pow5bits((int32_t)base2));
+  out[0] = porf_ryu_shr128(low0, sum, delta) + ((porf_ryu_offsets[i / 16] >> ((i % 16) << 1)) & 3);
+  out[1] = porf_ryu_shr128(sum, high1, delta);
+}
+
+// 1 / 5^i (0 <= i < 342), 128 bits, from the stored every-26th inverse
+static void porf_ryu_inv_pow5(uint32_t i, uint64_t* out) {
+  const uint32_t base = (i + 25) / 26, base2 = base * 26, offset = base2 - i;
+  const uint64_t* mul = porf_ryu_inv_split[base];
+  if (offset == 0) { out[0] = mul[0]; out[1] = mul[1]; return; }
+  uint64_t m = 1;
+  for (uint32_t j = 0; j < offset; j++) m *= 5;
+  uint64_t high1, high0;
+  const uint64_t low1 = porf_ryu_umul128(m, mul[1], &high1);
+  const uint64_t low0 = porf_ryu_umul128(m, mul[0] - 1, &high0);
+  const uint64_t sum = high0 + low1;
+  high1 += sum < high0;
+  const uint32_t delta = (uint32_t)(porf_ryu_pow5bits((int32_t)base2) - porf_ryu_pow5bits((int32_t)i));
+  out[0] = porf_ryu_shr128(low0, sum, delta) + 1 + ((porf_ryu_inv_offsets[i / 16] >> ((i % 16) << 1)) & 3);
+  out[1] = porf_ryu_shr128(sum, high1, delta);
+}
+
+// 4m, 4m + 2 and 4m - 1 - mm_shift, each times mul and shifted right by j
+static uint64_t porf_ryu_mul_shift_all(uint64_t m, const uint64_t* mul, int32_t j, uint64_t* vp, uint64_t* vm, uint32_t mm_shift) {
+  m <<= 1;
+  uint64_t tmp, hi;
+  const uint64_t lo = porf_ryu_umul128(m, mul[0], &tmp);
+  const uint64_t mid = tmp + porf_ryu_umul128(m, mul[1], &hi);
+  hi += mid < tmp;
+  const uint64_t lo2 = lo + mul[0];
+  const uint64_t mid2 = mid + mul[1] + (lo2 < lo);
+  const uint64_t hi2 = hi + (mid2 < mid);
+  *vp = porf_ryu_shr128(mid2, hi2, (uint32_t)(j - 64 - 1));
+  if (mm_shift == 1) {
+    const uint64_t lo3 = lo - mul[0];
+    const uint64_t mid3 = mid - mul[1] - (lo3 > lo);
+    const uint64_t hi3 = hi - (mid3 > mid);
+    *vm = porf_ryu_shr128(mid3, hi3, (uint32_t)(j - 64 - 1));
+  } else {
+    const uint64_t lo3 = lo + lo;
+    const uint64_t mid3 = mid + mid + (lo3 < lo);
+    const uint64_t hi3 = hi + hi + (mid3 < mid);
+    const uint64_t lo4 = lo3 - mul[0];
+    const uint64_t mid4 = mid3 - mul[1] - (lo4 > lo3);
+    const uint64_t hi4 = hi3 - (mid4 > mid3);
+    *vm = porf_ryu_shr128(mid4, hi4, (uint32_t)(j - 64));
+  }
+  return porf_ryu_shr128(mid, hi, (uint32_t)(j - 64 - 1));
+}
+
+// bits: a finite, nonzero binary64. Its shortest decimal is *out_sig * 10^*out_exp
+static void porf_ryu(uint64_t bits, uint64_t* out_sig, int* out_exp) {
+  const uint64_t ieee_m = bits & ((1ull << 52) - 1);
+  const uint32_t ieee_e = (uint32_t)((bits >> 52) & 0x7ff);
+  int32_t e2;
+  uint64_t m2;
+  if (ieee_e == 0) {
+    e2 = 1 - 1023 - 52 - 2; // 2 bits more for the bounds
+    m2 = ieee_m;
+  } else {
+    e2 = (int32_t)ieee_e - 1023 - 52 - 2;
+    m2 = (1ull << 52) | ieee_m;
+  }
+  const int accept_bounds = (m2 & 1) == 0;
+
+  // the interval of decimals that round to this double, in a power of ten
+  const uint64_t mv = 4 * m2;
+  const uint32_t mm_shift = ieee_m != 0 || ieee_e <= 1;
+  uint64_t vr, vp, vm, pow5[2];
+  int32_t e10;
+  int vm_trailing_zeros = 0, vr_trailing_zeros = 0;
+  if (e2 >= 0) {
+    const uint32_t q = ((((uint32_t)e2) * 78913) >> 18) - (e2 > 3); // log10(2^e2), less one
+    e10 = (int32_t)q;
+    const int32_t k = 125 + porf_ryu_pow5bits((int32_t)q) - 1;
+    const int32_t i = -e2 + (int32_t)q + k;
+    porf_ryu_inv_pow5(q, pow5);
+    vr = porf_ryu_mul_shift_all(m2, pow5, i, &vp, &vm, mm_shift);
+    if (q <= 21) {
+      // only one of mp, mv and mm can be a multiple of 5, if any
+      if (mv % 5 == 0) vr_trailing_zeros = porf_ryu_pow5_factor(mv) >= q;
+        else if (accept_bounds) vm_trailing_zeros = porf_ryu_pow5_factor(mv - 1 - mm_shift) >= q;
+        else vp -= porf_ryu_pow5_factor(mv + 2) >= q;
+    }
+  } else {
+    const uint32_t q = ((((uint32_t)-e2) * 732923) >> 20) - (-e2 > 1); // log10(5^-e2), less one
+    e10 = (int32_t)q + e2;
+    const int32_t i = -e2 - (int32_t)q;
+    const int32_t k = porf_ryu_pow5bits(i) - 125;
+    const int32_t j = (int32_t)q - k;
+    porf_ryu_pow5((uint32_t)i, pow5);
+    vr = porf_ryu_mul_shift_all(m2, pow5, j, &vp, &vm, mm_shift);
+    if (q <= 1) {
+      // mv = 4 * m2 has at least two trailing zero bits
+      vr_trailing_zeros = 1;
+      if (accept_bounds) vm_trailing_zeros = mm_shift == 1;
+        else --vp;
+    } else if (q < 63) {
+      vr_trailing_zeros = (mv & ((1ull << q) - 1)) == 0;
+    }
+  }
+
+  // the shortest decimal in the interval
+  int32_t removed = 0;
+  uint64_t output;
+  if (vm_trailing_zeros || vr_trailing_zeros) {
+    // the general case (rare)
+    uint32_t last = 0;
+    for (;;) {
+      const uint64_t vp10 = vp / 10, vm10 = vm / 10;
+      if (vp10 <= vm10) break;
+      const uint64_t vr10 = vr / 10;
+      vm_trailing_zeros &= vm - vm10 * 10 == 0;
+      vr_trailing_zeros &= last == 0;
+      last = (uint32_t)(vr - vr10 * 10);
+      vr = vr10; vp = vp10; vm = vm10;
+      removed++;
+    }
+    if (vm_trailing_zeros) {
+      for (;;) {
+        const uint64_t vm10 = vm / 10;
+        if (vm - vm10 * 10 != 0) break;
+        const uint64_t vr10 = vr / 10;
+        vr_trailing_zeros &= last == 0;
+        last = (uint32_t)(vr - vr10 * 10);
+        vr = vr10; vp = vp / 10; vm = vm10;
+        removed++;
+      }
+    }
+    if (vr_trailing_zeros && last == 5 && vr % 2 == 0) last = 4; // exactly ...50..0: round to even
+    output = vr + ((vr == vm && (!accept_bounds || !vm_trailing_zeros)) || last >= 5);
+  } else {
+    // the common case
+    int round_up = 0;
+    const uint64_t vp100 = vp / 100, vm100 = vm / 100;
+    if (vp100 > vm100) {
+      const uint64_t vr100 = vr / 100;
+      round_up = vr - vr100 * 100 >= 50;
+      vr = vr100; vp = vp100; vm = vm100;
+      removed += 2;
+    }
+    for (;;) {
+      const uint64_t vp10 = vp / 10, vm10 = vm / 10;
+      if (vp10 <= vm10) break;
+      const uint64_t vr10 = vr / 10;
+      round_up = vr - vr10 * 10 >= 5;
+      vr = vr10; vp = vp10; vm = vm10;
+      removed++;
+    }
+    output = vr + (vr == vm || round_up);
+  }
+  *out_sig = output;
+  *out_exp = e10 + removed;
+}
+`;
+
+// Grisu3 (--dtoa=grisu3), from https://github.com/google/double-conversion (fast-dtoa.cc,
+// cached-powers.cc). Its license asks for the notice in source redistributions, and the C
+// below lands in every generated program, so the notice goes with it
+export const GRISU3_C = `// Grisu3 (Florian Loitsch): the shortest decimal that round-trips to a binary64, and the
+// closest such, for the ~99.7% of doubles it can prove it for. Ported to C from
+// double-conversion (fast-dtoa.cc, cached-powers.cc), shortest mode only.
+// For the rest it keeps to Grisu2's narrower interval: the digits still round-trip, but
+// may be a digit longer, or one off in the last place, than the shortest closest ones.
+//
+// Copyright 2006-2011, the V8 project authors. All rights reserved.
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+//
+//     * Redistributions of source code must retain the above copyright
+//       notice, this list of conditions and the following disclaimer.
+//     * Redistributions in binary form must reproduce the above
+//       copyright notice, this list of conditions and the following
+//       disclaimer in the documentation and/or other materials provided
+//       with the distribution.
+//     * Neither the name of Google Inc. nor the names of its
+//       contributors may be used to endorse or promote products derived
+//       from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+// 10^k for k = -348, -340, ..., 340, normalized to 64 bits
+static const uint64_t porf_grisu_powers[87] = {
+  0xfa8fd5a0081c0288ull, 0xbaaee17fa23ebf76ull, 0x8b16fb203055ac76ull, 0xcf42894a5dce35eaull, 0x9a6bb0aa55653b2dull,
+  0xe61acf033d1a45dfull, 0xab70fe17c79ac6caull, 0xff77b1fcbebcdc4full, 0xbe5691ef416bd60cull, 0x8dd01fad907ffc3cull,
+  0xd3515c2831559a83ull, 0x9d71ac8fada6c9b5ull, 0xea9c227723ee8bcbull, 0xaecc49914078536dull, 0x823c12795db6ce57ull,
+  0xc21094364dfb5637ull, 0x9096ea6f3848984full, 0xd77485cb25823ac7ull, 0xa086cfcd97bf97f4ull, 0xef340a98172aace5ull,
+  0xb23867fb2a35b28eull, 0x84c8d4dfd2c63f3bull, 0xc5dd44271ad3cdbaull, 0x936b9fcebb25c996ull, 0xdbac6c247d62a584ull,
+  0xa3ab66580d5fdaf6ull, 0xf3e2f893dec3f126ull, 0xb5b5ada8aaff80b8ull, 0x87625f056c7c4a8bull, 0xc9bcff6034c13053ull,
+  0x964e858c91ba2655ull, 0xdff9772470297ebdull, 0xa6dfbd9fb8e5b88full, 0xf8a95fcf88747d94ull, 0xb94470938fa89bcfull,
+  0x8a08f0f8bf0f156bull, 0xcdb02555653131b6ull, 0x993fe2c6d07b7facull, 0xe45c10c42a2b3b06ull, 0xaa242499697392d3ull,
+  0xfd87b5f28300ca0eull, 0xbce5086492111aebull, 0x8cbccc096f5088ccull, 0xd1b71758e219652cull, 0x9c40000000000000ull,
+  0xe8d4a51000000000ull, 0xad78ebc5ac620000ull, 0x813f3978f8940984ull, 0xc097ce7bc90715b3ull, 0x8f7e32ce7bea5c70ull,
+  0xd5d238a4abe98068ull, 0x9f4f2726179a2245ull, 0xed63a231d4c4fb27ull, 0xb0de65388cc8ada8ull, 0x83c7088e1aab65dbull,
+  0xc45d1df942711d9aull, 0x924d692ca61be758ull, 0xda01ee641a708deaull, 0xa26da3999aef774aull, 0xf209787bb47d6b85ull,
+  0xb454e4a179dd1877ull, 0x865b86925b9bc5c2ull, 0xc83553c5c8965d3dull, 0x952ab45cfa97a0b3ull, 0xde469fbd99a05fe3ull,
+  0xa59bc234db398c25ull, 0xf6c69a72a3989f5cull, 0xb7dcbf5354e9beceull, 0x88fcf317f22241e2ull, 0xcc20ce9bd35c78a5ull,
+  0x98165af37b2153dfull, 0xe2a0b5dc971f303aull, 0xa8d9d1535ce3b396ull, 0xfb9b7cd9a4a7443cull, 0xbb764c4ca7a44410ull,
+  0x8bab8eefb6409c1aull, 0xd01fef10a657842cull, 0x9b10a4e5e9913129ull, 0xe7109bfba19c0c9dull, 0xac2820d9623bf429ull,
+  0x80444b5e7aa7cf85ull, 0xbf21e44003acdd2dull, 0x8e679c2f5e44ff8full, 0xd433179d9c8cb841ull, 0x9e19db92b4e31ba9ull,
+  0xeb96bf6ebadf77d9ull, 0xaf87023b9bf0ee6bull
+};
+
+// the upper 64 bits of x * y, rounded
+static inline uint64_t porf_grisu_mul(uint64_t x, uint64_t y) {
+  const uint64_t a = x >> 32, b = (uint32_t)x, c = y >> 32, d = (uint32_t)y;
+  const uint64_t ac = a * c, bc = b * c, ad = a * d, bd = b * d;
+  const uint64_t tmp = (bd >> 32) + (uint32_t)ad + (uint32_t)bc + (1u << 31);
+  return ac + (ad >> 32) + (bc >> 32) + (tmp >> 32);
+}
+
+// Grisu3's check: moves the last digit toward w, then 1 when it is provably the closest
+// shortest decimal
+static int porf_grisu_round_weed(uint64_t* digits, uint64_t distance_too_high_w, uint64_t unsafe_interval, uint64_t rest, uint64_t ten_kappa, uint64_t unit) {
+  const uint64_t small_distance = distance_too_high_w - unit;
+  const uint64_t big_distance = distance_too_high_w + unit;
+  while (rest < small_distance && unsafe_interval - rest >= ten_kappa &&
+         (rest + ten_kappa < small_distance || small_distance - rest >= rest + ten_kappa - small_distance)) {
+    (*digits)--;
+    rest += ten_kappa;
+  }
+  if (rest < big_distance && unsafe_interval - rest >= ten_kappa &&
+      (rest + ten_kappa < big_distance || big_distance - rest > rest + ten_kappa - big_distance)) return 0;
+  return 2 * unit <= rest && rest <= unsafe_interval - 4 * unit;
+}
+
+// digits for the scaled boundaries low < w < high (exponent e, -60 <= e <= -32). With
+// safe set the interval shrinks by a unit on each side instead of growing (Grisu2): every
+// digit string it can end on then rounds to the double
+static int porf_grisu_digit_gen(uint64_t low, uint64_t w, uint64_t high, int e, int safe, uint64_t* out, int* kappa) {
+  uint64_t unit = 1;
+  const uint64_t too_low = safe ? low + unit : low - unit;
+  const uint64_t too_high = safe ? high - unit : high + unit;
+  uint64_t unsafe_interval = too_high - too_low;
+  const int shift = -e;
+  const uint64_t one = 1ull << shift;
+  uint32_t integrals = (uint32_t)(too_high >> shift);
+  uint64_t fractionals = too_high & (one - 1);
+  uint64_t digits = 0;
+
+  uint32_t divisor = 1;
+  *kappa = 0;
+  while (*kappa < 10 && divisor <= integrals / 10) { divisor *= 10; (*kappa)++; }
+  if (integrals) (*kappa)++; else divisor = 0;
+
+  for (; *kappa > 0; divisor /= 10) {
+    digits = digits * 10 + integrals / divisor;
+    integrals %= divisor;
+    (*kappa)--;
+    const uint64_t rest = ((uint64_t)integrals << shift) + fractionals;
+    if (rest < unsafe_interval) {
+      *out = digits;
+      return safe ? 1 : porf_grisu_round_weed(out, too_high - w, unsafe_interval, rest, (uint64_t)divisor << shift, unit);
+    }
+  }
+  for (;;) {
+    fractionals *= 10;
+    unit *= 10;
+    unsafe_interval *= 10;
+    digits = digits * 10 + (fractionals >> shift);
+    fractionals &= one - 1;
+    (*kappa)--;
+    if (fractionals < unsafe_interval) {
+      *out = digits;
+      return safe ? 1 : porf_grisu_round_weed(out, (too_high - w) * unit, unsafe_interval, fractionals, one, unit);
+    }
+  }
+}
+
+// bits: a finite, nonzero binary64. Its shortest decimal is *out_sig * 10^*out_exp
+static void porf_grisu3(uint64_t bits, uint64_t* out_sig, int* out_exp) {
+  const uint64_t frac = bits & ((1ull << 52) - 1);
+  const int biased = (int)((bits >> 52) & 0x7ff);
+  const uint64_t f = biased ? frac | (1ull << 52) : frac;
+  const int e = biased ? biased - 1075 : -1074;
+
+  // the boundaries halfway to the neighbours, at the upper one's normalized exponent
+  uint64_t plus = (f << 1) + 1;
+  int plus_e = e - 1;
+  while (!(plus >> 63)) { plus <<= 1; plus_e--; }
+  uint64_t minus;
+  int minus_e;
+  if (frac == 0 && biased > 1) { minus = (f << 2) - 1; minus_e = e - 2; } // the lower neighbour is closer
+    else { minus = (f << 1) - 1; minus_e = e - 1; }
+  minus <<= minus_e - plus_e;
+  uint64_t wf = f;
+  int we = e;
+  while (!(wf >> 63)) { wf <<= 1; we--; }
+
+  // a cached 10^-k bringing the exponent into -60..-32
+  const int min_exp = -60 - (we + 64);
+  int k = (int)ceil((min_exp + 63) * 0.30102999566398114);
+  const int index = (348 + k - 1) / 8 + 1;
+  const int mk = -348 + index * 8;
+  const int pow_e = ((mk * 1741647) >> 19) - 63; // floor(log2(10^mk)) - 63
+  const uint64_t pow_f = porf_grisu_powers[index];
+  const int scaled_e = we + pow_e + 64;
+
+  const uint64_t sw = porf_grisu_mul(wf, pow_f), sm = porf_grisu_mul(minus, pow_f), sp = porf_grisu_mul(plus, pow_f);
+  int kappa;
+  if (!porf_grisu_digit_gen(sm, sw, sp, scaled_e, 0, out_sig, &kappa)) porf_grisu_digit_gen(sm, sw, sp, scaled_e, 1, out_sig, &kappa);
+  *out_exp = -mk + kappa;
+}
+`;
+
+// --dtoa: each algorithm's C and the function it defines
+export const DTOA = {
+  dragonbox: { c: DRAGONBOX_C, fn: 'porf_dragonbox' },
+  ryu: { c: RYU_C, fn: 'porf_ryu' },
+  grisu3: { c: GRISU3_C, fn: 'porf_grisu3' }
+};
