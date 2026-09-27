@@ -612,6 +612,23 @@ return porf_box_num(pow(baseNum, exponentNum));`, false)
     body: [ Return(Bin('*', T.f64, Convert(T.f64, Bin('>>', T.u64, Call('__Porffor_prng', [], T.u64), Const(T.u64, 11)), 0), Const(T.f64, 2 ** -53))) ]
   };
 
+  // round(x * 10^k) as decimal digits, exactly, for toFixed, toPrecision and
+  // toExponential: porf_round_scaled in the C runtime
+  _.__Porffor_number_roundScaled = {
+    params: [ { name: 'x', type: T.jsval }, { name: 'k', type: T.i32 } ],
+    retType: T.jsval,
+    returnType: TYPES.bytestring,
+    body: [ Return(Call('porf_round_scaled', [ JvNum(Local('x', T.jsval)), Local('k', T.i32) ], T.jsval)) ]
+  };
+
+  // toExponential() with no digit count: porf_num_to_exp in the C runtime
+  _.__Porffor_number_toExponentialShortest = {
+    params: [ { name: 'x', type: T.jsval } ],
+    retType: T.jsval,
+    returnType: TYPES.bytestring,
+    body: [ Return(Call('porf_num_to_exp', [ JvNum(Local('x', T.jsval)) ], T.jsval)) ]
+  };
+
   _.__performance_now = {
     params: [],
     retType: T.jsval,

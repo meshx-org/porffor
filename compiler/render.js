@@ -4991,6 +4991,33 @@ ${ropes ? `  if (porf_rope_is(pa) || porf_rope_is(pb)) return porf_str_eq(porf_s
 }
 
 ${dtoa === 'libc' ? '' : DTOA[dtoa].c}
+// the shortest digits that round-trip to d (finite, > 0), as --dtoa finds them: into digs,
+// their count returned and *pt the decimal point's position (n in Number::toString)
+static int porf_shortest(f64 d, char* digs, int* pt) {
+  int k = 0;
+${dtoa !== 'libc' ? `  uint64_t bits;
+  memcpy(&bits, &d, 8);
+  uint64_t sig;
+  int exp10;
+  ${DTOA[dtoa].fn}(bits, &sig, &exp10);
+  char rev[24];
+  int m = 0;
+  do { rev[m++] = (char)('0' + sig % 10u); sig /= 10u; } while (sig);
+  while (m) digs[k++] = rev[--m];
+  *pt = exp10 + k;` : `  // from %e (%g differs: exponent below 1e-4 instead of 1e-6, "e-07" not "e-7", and
+  // exponent form for long non-integers that JS writes out in full up to 1e21)
+  char e[40];
+  for (int prec = isnormal(d) ? 15 : 1;; prec++) {
+    snprintf(e, sizeof e, "%.*e", prec - 1, d);
+    if (strtod(e, NULL) == d || prec == 17) break;
+  }
+  const char* q = e;
+  for (; *q && *q != 'e'; q++) if (*q >= '0' && *q <= '9') digs[k++] = *q;
+  while (k > 1 && digs[k - 1] == '0') k--; // %e pads with trailing zeros
+  *pt = atoi(q + 1) + 1;`}
+  return k;
+}
+
 ${st}jsval porf_num_to_str(f64 d) {
   char buf[32];
   int n;
@@ -5009,32 +5036,9 @@ ${st}jsval porf_num_to_str(f64 d) {
     } else {
       // the shortest round-tripping digits, then laid out by Number::toString's rules
       char digs[24];
-      int k = 0;
-${dtoa !== 'libc' ? `      uint64_t bits;
-      memcpy(&bits, &d, 8);
-      const int neg = (bits >> 63) != 0;
-      uint64_t sig;
-      int exp10;
-      ${DTOA[dtoa].fn}(bits & ~(1ull << 63), &sig, &exp10);
-      {
-        char rev[24];
-        int m = 0;
-        do { rev[m++] = (char)('0' + sig % 10u); sig /= 10u; } while (sig);
-        while (m) digs[k++] = rev[--m];
-      }
-      const int pt = exp10 + k; // the decimal point's position, n in the spec` : `      // from %e (%g differs: exponent below 1e-4 instead of 1e-6, "e-07" not "e-7", and
-      // exponent form for long non-integers that JS writes out in full up to 1e21)
-      char e[40];
-      for (int prec = isnormal(d) ? 15 : 1;; prec++) {
-        snprintf(e, sizeof e, "%.*e", prec - 1, d);
-        if (strtod(e, NULL) == d || prec == 17) break;
-      }
-      const char* q = e;
-      const int neg = *q == '-';
-      if (neg) q++;
-      for (; *q && *q != 'e'; q++) if (*q >= '0' && *q <= '9') digs[k++] = *q;
-      while (k > 1 && digs[k - 1] == '0') k--; // %e pads with trailing zeros
-      const int pt = atoi(q + 1) + 1; // the decimal point's position, n in the spec`}
+      int pt;
+      const int neg = d < 0;
+      const int k = porf_shortest(fabs(d), digs, &pt);
       char* o = buf;
       if (neg) *o++ = '-';
       if (k <= pt && pt <= 21) {
@@ -5058,6 +5062,107 @@ ${dtoa !== 'libc' ? `      uint64_t bits;
   const u32 s = porf_bstr_new((u32)n);
   memcpy(MEM + s + 4, buf, (size_t)n);
   return porf_box((f64)s, ${TYPES.bytestring});
+}
+
+// Number.prototype.toExponential() with no digit count: the shortest round-tripping
+// digits, as d.ddde+n (finite d)
+${st}jsval porf_num_to_exp(f64 d) {
+  char digs[24] = "0", buf[40];
+  char* o = buf;
+  int k = 1, pt = 1;
+  if (d < 0) { *o++ = '-'; d = -d; }
+  if (d != 0) k = porf_shortest(d, digs, &pt);
+  *o++ = digs[0];
+  if (k > 1) { *o++ = '.'; memcpy(o, digs + 1, (size_t)(k - 1)); o += k - 1; }
+  o += snprintf(o, 8, "e%c%d", pt - 1 >= 0 ? '+' : '-', pt - 1 >= 0 ? pt - 1 : 1 - pt);
+  const int n = (int)(o - buf);
+  const u32 s = porf_bstr_new((u32)n);
+  memcpy(MEM + s + 4, buf, (size_t)n);
+  return porf_box((f64)s, ${TYPES.bytestring});
+}
+
+// round(x * 10^k) for a finite x >= 0 and an integer k, as decimal digits ("0" for zero),
+// from x's exact value and the larger integer on a tie: what toFixed, toPrecision and
+// toExponential ask for (builtins/number.ts). x = m / 2^e exactly, so m * 10^k is built
+// in 32-bit limbs, the powers of ten below one divided out (keeping the last digit out),
+// then 2^e, rounding on the last bit shifted out. With the callers' k (-400 to 450) the
+// product stays under 2^1600, 50 limbs
+${st}jsval porf_round_scaled(f64 x, i32 k) {
+  u64 bits;
+  memcpy(&bits, &x, 8);
+  const i32 be = (i32)((bits >> 52) & 0x7ff);
+  u64 m = bits & ((1ull << 52) - 1);
+  i32 e = be ? 1075 - be : 1074;
+  if (be) m |= 1ull << 52;
+  u32 d[56];
+  i32 n = 0;
+  if (m != 0) {
+    while (e > 0 && !(m & 1)) { m >>= 1; e--; }
+    d[0] = (u32)m;
+    d[1] = (u32)(m >> 32);
+    n = d[1] ? 2 : 1;
+  }
+
+  // e < 0: an integer, times 2^-e
+  if (n && e < 0) {
+    const i32 limbs = -e / 32, r = -e % 32;
+    d[n] = 0;
+    for (i32 i = n; i >= 0; i--) d[i + limbs] = r ? (d[i] << r) | (i ? d[i - 1] >> (32 - r) : 0) : d[i];
+    for (i32 i = 0; i < limbs; i++) d[i] = 0;
+    n += limbs + 1;
+    while (n && !d[n - 1]) n--;
+    e = 0;
+  }
+
+  // * 10^k, nine digits at a time
+  static const u32 pow10[10] = { 1u, 10u, 100u, 1000u, 10000u, 100000u, 1000000u, 10000000u, 100000000u, 1000000000u };
+  for (i32 j = k; n && j > 0; j -= 9) {
+    const u32 f = pow10[j >= 9 ? 9 : j];
+    u64 carry = 0;
+    for (i32 i = 0; i < n; i++) { carry += (u64)d[i] * f; d[i] = (u32)carry; carry >>= 32; }
+    if (carry) d[n++] = (u32)carry;
+  }
+
+  // / 10^-k, keeping the last (most significant) digit divided out
+  u32 last = 0;
+  for (i32 j = 0; n && j < -k; j++) {
+    u64 rem = 0;
+    for (i32 i = n - 1; i >= 0; i--) { const u64 cur = (rem << 32) | d[i]; d[i] = (u32)(cur / 10u); rem = cur % 10u; }
+    last = (u32)rem;
+    while (n && !d[n - 1]) n--;
+  }
+
+  // / 2^e, rounding half up: on the digit divided out last when there is no binary
+  // fraction, else on bit e-1 (a remainder below it never reaches half)
+  int up = e == 0 && k < 0 && last >= 5;
+  if (n && e > 0) {
+    const i32 bit = e - 1;
+    up = bit / 32 < n && ((d[bit / 32] >> (bit % 32)) & 1);
+    const i32 whole = e / 32, part = e % 32;
+    i32 o = 0;
+    for (i32 i = whole; i < n; i++) d[o++] = part ? (d[i] >> part) | (i + 1 < n ? d[i + 1] << (32 - part) : 0) : d[i];
+    n = o;
+    while (n && !d[n - 1]) n--;
+  }
+  if (up) {
+    i32 i = 0;
+    while (i < n && ++d[i] == 0) i++;
+    if (i == n) d[n++] = 1;
+  }
+
+  // to decimal, nine digits at a time, least significant first
+  char rev[560];
+  i32 len = 0;
+  while (n) {
+    u64 rem = 0;
+    for (i32 i = n - 1; i >= 0; i--) { const u64 cur = (rem << 32) | d[i]; d[i] = (u32)(cur / 1000000000u); rem = cur % 1000000000u; }
+    while (n && !d[n - 1]) n--;
+    for (i32 t = 0; t < 9 && (n || rem); t++) { rev[len++] = (char)('0' + rem % 10u); rem /= 10u; }
+  }
+  if (len == 0) rev[len++] = '0';
+  const u32 out = porf_bstr_new((u32)len);
+  for (i32 i = 0; i < len; i++) MEM[out + 4 + i] = (u8)rev[len - 1 - i];
+  return porf_box((f64)out, ${TYPES.bytestring});
 }
 
 // ToString for + and template literals
