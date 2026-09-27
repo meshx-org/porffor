@@ -716,6 +716,9 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
         return [`porf_yield(${rx(node[N_A], P_COMMA)})`, P_POSTFIX];
 
       case K.Alloc: return [`porf_alloc(${rx(node[N_A], P_COMMA)}, ${node[N_B]}u)`, P_POSTFIX];
+      case K.ArrAlloc: return [`porf_arr_alloc(${rx(node[N_A], P_COMMA)})`, P_POSTFIX];
+      case K.EnvAlloc: return [`porf_env_alloc(${rx(node[N_A], P_COMMA)}, ${rx(node[N_B], P_COMMA)})`, P_POSTFIX];
+      case K.FnAlloc: return [`porf_fn_alloc(${rx(node[N_A], P_COMMA)}, ${rx(node[N_B], P_COMMA)})`, P_POSTFIX];
 
       case K.ArrGet: return [`porf_arr_get(${rx(node[N_A], P_COMMA)}, ${rx(node[N_B], P_COMMA)})`, P_POSTFIX];
       case K.LenGet: return [`*(i32*)(MEM + ${rx(node[N_A], P_ADD)})`, P_UNARY];
@@ -4846,6 +4849,35 @@ ${prefs.gc === false ? PORF_BUMP_ALLOC() : PORF_GC_ALLOC(prefs)}
 #define PORF_ARR_LEN(a) (*(i32*)(MEM + (a)))
 #define PORF_ARR_ENT(a) (*(u32*)(MEM + (a) + 4))
 #define PORF_ARR_CAP(a) (*(i32*)(MEM + (a) + 8))
+
+// an array literal's storage: exactly cap slots, zeroed, no elements yet (K.ArrAlloc)
+${st}u32 porf_arr_alloc(i32 cap) {
+  const u32 a = porf_alloc(16 + ((u32)cap << 3), ${TYPES.array});
+  PORF_ARR_LEN(a) = 0; PORF_ARR_ENT(a) = a + 16; PORF_ARR_CAP(a) = cap;
+  memset(MEM + a + 16, 0, (size_t)cap << 3);
+  return a;
+}
+
+// a closure env, [parent u32][count u32] then count slots of [payload f64, type u8, pad x7],
+// every slot undefined (K.EnvAlloc)
+${st}u32 porf_env_alloc(u32 parent, i32 count) {
+  const u32 e = porf_alloc(8 + ((u32)count << 4), ${TYPES.__porffor_closureenv});
+  *(u32*)(MEM + e) = parent;
+  *(u32*)(MEM + e + 4) = (u32)count;
+  for (i32 i = 0; i < count; i++) {
+    *(f64*)(MEM + e + 8 + (i << 4)) = 0.0;
+    *(u8*)(MEM + e + 16 + (i << 4)) = ${TYPES.undefined};
+  }
+  return e;
+}
+
+// a function value's record: [func link index u32][env u32] (K.FnAlloc)
+${st}u32 porf_fn_alloc(u32 idx, u32 env) {
+  const u32 r = porf_alloc(8, ${TYPES.function});
+  *(u32*)(MEM + r) = idx;
+  *(u32*)(MEM + r + 4) = env;
+  return r;
+}
 
 ${st}u32 porf_arr_new(i32 len, i32 cap) {
   if (cap < len) cap = len;

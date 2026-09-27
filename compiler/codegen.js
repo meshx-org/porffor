@@ -6,7 +6,7 @@ import {
   Load, Store, MemCopy, MemFill,
   If, Loop, Break, Continue, BlockStmt, TypeSwitch, Return, Unreachable,
   Call, CallDynamic, Try, Throw, ThrowNew, Await, Yield,
-  Alloc, GcBarrier, ArrGet, ArrSet, ArrLenSet, LenGet, LenSet, RawC, FuncIdx, FuncRec
+  Alloc, GcBarrier, ArrGet, ArrSet, ArrLenSet, LenGet, LenSet, RawC, FuncIdx, FuncRec, ArrAlloc, EnvAlloc, FnAlloc
 } from './ir.js';
 import { BuiltinFuncs, BuiltinVars, fullPrototypes } from './builtins.js';
 import { memberIndex, TYPED_ARRAY_KINDS } from './builtinDescriptors.js';
@@ -435,24 +435,15 @@ const currentClosureEnv = scope => {
 
 // [parent u32][count u32][payload f64, type u8, padding x7]...
 const makeClosureEnv = (scope, parent, count, values = null) => {
-  const pointer = reuse(scope, Alloc(Const(T.i32, 8 + count * 16), TYPES.__porffor_closureenv));
+  // parent and count filled in, every slot undefined (porf_env_alloc)
+  const pointer = reuse(scope, EnvAlloc(JvPtr(parent), Const(T.i32, count)));
   const allocated = freshMark(scope);
-  stmt(scope, Store('u32', pointer, 0, JvPtr(parent)));
   if (values) {
     for (let i = 0; i < values.length; i++) {
       stmt(scope, Store('f64', pointer, 8 + i * 16, JvNum(values[i])));
       stmt(scope, Store('u8', pointer, 16 + i * 16, JvType(values[i])));
     }
-  } else {
-    const index = tmp(scope, T.i32, Const(T.i32, 0));
-    const slot = Bin('+', T.u32, pointer, Bin('*', T.i32, index, Const(T.i32, 16)));
-    stmt(scope, Loop(Bin('<', T.i32, index, Const(T.i32, count)), null, [
-      Store('f64', slot, 8, Const(T.f64, 0)),
-      Store('u8', slot, 16, Const(T.i32, TYPES.undefined)),
-      Assign(index, Bin('+', T.i32, index, Const(T.i32, 1)))
-    ], fresh(scope)));
   }
-  stmt(scope, Store('u32', pointer, 4, Const(T.i32, count)));
   if (!stillFresh(scope, allocated)) stmt(scope, GcBarrier(pointer, Const(T.i32, TYPES.__porffor_closureenv)));
   typeUsed(scope, TYPES.__porffor_closureenv);
   return valOf(pointer, TYPES.__porffor_closureenv);
@@ -473,9 +464,7 @@ const makeClosureRecord = (scope, func, markReferenced = true) => {
     env = reuse(scope, makeClosureEnv(scope, parent, values.length, values));
   }
 
-  const rec = reuse(scope, Alloc(Const(T.i32, 8), TYPES.function));
-  stmt(scope, Store('u32', rec, 0, FuncIdx(func.index)));
-  stmt(scope, Store('u32', rec, 4, JvPtr(env)));
+  const rec = reuse(scope, FnAlloc(FuncIdx(func.index), JvPtr(env)));
   return valOf(rec, TYPES.function);
 };
 
@@ -486,9 +475,7 @@ const staticFuncIdentity = func =>
 // non-capturing nested funcs still mint a fresh record per evaluation for identity
 const makeFreshFuncRecord = (scope, func, markReferenced = true) => {
   useFunctionValue(func, markReferenced);
-  const rec = reuse(scope, Alloc(Const(T.i32, 8), TYPES.function));
-  stmt(scope, Store('u32', rec, 0, FuncIdx(func.index)));
-  stmt(scope, Store('u32', rec, 4, Const(T.u32, 0)));
+  const rec = reuse(scope, FnAlloc(FuncIdx(func.index), Const(T.u32, 0)));
   return valOf(rec, TYPES.function);
 };
 
@@ -1963,11 +1950,8 @@ const getLastNode = body => {
 
 const makeArrayFromValues = (scope, values) => {
   const capacity = Math.max(values.length, 2);
-  const pointer = reuse(scope, Alloc(Const(T.i32, 16 + capacity * 8), TYPES.array));
+  const pointer = reuse(scope, ArrAlloc(Const(T.i32, capacity)));
   const allocated = freshMark(scope);
-  stmt(scope, LenSet(pointer, Const(T.i32, 0)));
-  stmt(scope, Store('u32', pointer, 4, Bin('+', T.u32, pointer, Const(T.u32, 16))));
-  stmt(scope, Store('i32', pointer, 8, Const(T.i32, capacity)));
   for (let i = 0; i < values.length; i++) stmt(scope, ArrSet(pointer, Const(T.u32, i), values[i]));
   stmt(scope, LenSet(pointer, Const(T.i32, values.length)));
   if (values.some(v => v[N_TYPE] === T.jsval || v[N_TYPE] === T.ptr) && !stillFresh(scope, allocated))
@@ -4489,14 +4473,16 @@ const generateArray = (scope, decl, name = '$undeclared', staticAlloc = false) =
     const uniqueName = name === '$undeclared' ? name + uniqId(scope) : name;
     pointer = dataRef(unitOf(scope), `#staticarr:${uniqueName}`, new Array(allocSize).fill(0));
   } else {
-    pointer = reuse(scope, Alloc(Const(T.i32, allocSize), TYPES.array));
+    // header filled in and slots zeroed by one call (porf_arr_alloc)
+    pointer = reuse(scope, ArrAlloc(Const(T.i32, capacity)));
   }
   const allocated = isStatic ? null : freshMark(scope);
 
-  stmt(scope, LenSet(pointer, Const(T.i32, 0)));
-  stmt(scope, Store('u32', pointer, 4, Bin('+', T.u32, pointer, Const(T.u32, 16))));
-  stmt(scope, Store('i32', pointer, 8, Const(T.i32, capacity)));
-  if (!isStatic) stmt(scope, MemFill(Bin('+', T.u32, pointer, Const(T.u32, 16)), Const(T.i32, 0), Const(T.i32, capacity * 8)));
+  if (isStatic) {
+    stmt(scope, LenSet(pointer, Const(T.i32, 0)));
+    stmt(scope, Store('u32', pointer, 4, Bin('+', T.u32, pointer, Const(T.u32, 16))));
+    stmt(scope, Store('i32', pointer, 8, Const(T.i32, capacity)));
+  }
 
   // fast path: store leading non-spread elements straight into their slots (a jsval each)
   let i = 0;
