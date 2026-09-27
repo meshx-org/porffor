@@ -43,7 +43,7 @@ export default ({ TYPES, TYPE_NAMES, TYPED_ARRAY_KINDS }) => {
 
 export const __Porffor_object_builtinPrototype = (f: any): any => {`;
 
-  const ctors = new Set([ 'Object', 'Function', 'Symbol', 'BigInt' ]);
+  const ctors = new Set([ 'Object', 'Function', 'Symbol', 'BigInt', 'Iterator' ]);
   for (const x in TYPES) {
     if (x === 'object' || x === 'undefined' || x.startsWith('__')) continue;
     ctors.add(TYPE_NAMES[TYPES[x]].replace('Object', ''));

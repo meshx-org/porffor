@@ -442,7 +442,6 @@ export const BuiltinVars = ({ builtinFuncs }) => {
     'console',
     'performance',
     'crypto',
-    'Iterator',
   ]) {
     object(x, props({
       writable: true,
@@ -451,7 +450,7 @@ export const BuiltinVars = ({ builtinFuncs }) => {
     }, autoFuncKeys(x).slice(0, 12)));
   }
 
-  for (const x of [ 'Array', 'ArrayBuffer', 'Atomics', 'Date', 'Error', 'JSON', 'Object', 'Promise', 'Reflect', 'String', 'Symbol', 'Uint8Array', 'Int8Array', 'Uint8ClampedArray', 'Uint16Array', 'Int16Array', 'Uint32Array', 'Int32Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array', 'SharedArrayBuffer', 'BigInt', 'Boolean', 'DataView', 'AggregateError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError', 'SuppressedError', 'DisposableStack', 'AsyncDisposableStack', 'Function', 'Map', 'RegExp', 'Set', 'WeakMap', 'WeakRef', 'WeakSet', 'TextEncoder', 'TextDecoder' ]) {
+  for (const x of [ 'Array', 'ArrayBuffer', 'Atomics', 'Date', 'Error', 'JSON', 'Object', 'Promise', 'Reflect', 'String', 'Symbol', 'Uint8Array', 'Int8Array', 'Uint8ClampedArray', 'Uint16Array', 'Int16Array', 'Uint32Array', 'Int32Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array', 'SharedArrayBuffer', 'BigInt', 'Boolean', 'DataView', 'AggregateError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError', 'SuppressedError', 'DisposableStack', 'AsyncDisposableStack', 'Function', 'Map', 'RegExp', 'Set', 'WeakMap', 'WeakRef', 'WeakSet', 'TextEncoder', 'TextDecoder', 'Iterator' ]) {
     object(x, {
       ...(typedArrayBytesPerElement[x] == null ? {} : props({
         writable: false,

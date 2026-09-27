@@ -4650,7 +4650,13 @@ const onMemberDemanded = propName => {
     // Porffor's own types are named with __ (__Porffor_Generator_prototype_next is
     // TYPES.__porffor_generator's): without it their methods are never readable
     const t = TYPES[tn.toLowerCase()] ?? TYPES['__' + tn.toLowerCase()];
-    if (t == null) continue;
+    // a prototype that is no type's (Iterator.prototype, reached through its constructor or
+    // a subclass): once the object is in the program
+    if (t == null) {
+      const getter = '#get___' + tn + '_prototype';
+      if (getter in builtinFuncs) whenFact([ [ 'hasFunc', getter ] ], include);
+      continue;
+    }
     const types = [ [ 'hasType', t ] ];
     if (primObjAlias[t] != null) types.push([ 'hasType', primObjAlias[t] ]);
     whenFact(types, include);

@@ -461,6 +461,13 @@ export const __Porffor_iter_proto = (): object => {
   return p;
 };
 
+// 27.1.3.1 Iterator (): an abstract class, for subclassing (class It extends Iterator):
+// constructed as itself, or called, it throws; super() from a subclass makes nothing (the
+// subclass's this is the instance)
+export const Iterator = function (): any {
+  if (Porffor.fastOr(!new.target, new.target === Iterator)) throw new TypeError('Abstract class Iterator not directly constructable');
+};
+
 // ---- Iterator.prototype: the helpers, for every iterator (ours inherit them; native
 // generators forward to them from generator.ts) ----
 
