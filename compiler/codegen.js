@@ -4584,6 +4584,9 @@ let calledMembers;
 let usesIterProtocol = true;
 // the program can hold BigInts (parse.js): arithmetic on unknown types checks for them
 let usesBigInt = false;
+// the program names a script property escape, a \q{} or a property of strings (parse.js):
+// regexes carry the script tables, strings in classes, the emoji data
+let regexScripts = false, regexStrings = false, regexEmoji = false;
 
 // the program reads a property of this name (x.name, x['name']): a fact (member), and the
 // builtins it can reach wait on the types that have them
@@ -5358,7 +5361,7 @@ const giveUpFact = () => {
   return true;
 };
 
-const programFlagValue = name => name === 'usesIterProtocol' ? usesIterProtocol : name === 'typedArrayCtorValue' ? typedArrayCtorValue : false;
+const programFlagValue = name => name === 'usesIterProtocol' ? usesIterProtocol : name === 'typedArrayCtorValue' ? typedArrayCtorValue : name === 'regexScripts' ? regexScripts : name === 'regexStrings' ? regexStrings : name === 'regexEmoji' ? regexEmoji : false;
 
 const generateFunc = (scope, decl, forceNoExpr = false) => {
   doNotMarkFuncRef = false;
@@ -5865,6 +5868,9 @@ export default (program, opts = {}) => {
   usesIterProtocol = !!program._usesIterProtocol;
   // builtins are typed: a BigInt reaches their arithmetic only where they say so
   usesBigInt = !globalThis.precompile && !!program._usesBigInt;
+  regexScripts = !globalThis.precompile && !!program._regexScripts;
+  regexStrings = !globalThis.precompile && !!program._regexStrings;
+  regexEmoji = !globalThis.precompile && !!program._regexEmoji;
   fullPrototypes.clear();
   topLevelFunc = null;
   factWaiters = new Map();

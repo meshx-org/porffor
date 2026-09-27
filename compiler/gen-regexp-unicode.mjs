@@ -1,4 +1,5 @@
-// generates the unicode table section of compiler/builtins/regexp.ts from node's own ICU
+// generates the unicode table section of compiler/builtins/regexp.ts from node's own ICU (and
+// the emoji sequence files of its unicode version, fetched from unicode.org, as candidates)
 // usage: node compiler/gen-regexp-unicode.mjs <output.ts>, then splice into regexp.ts
 
 const MAX = 0x110000;
@@ -35,9 +36,15 @@ const xorRangesSimple = (a, b) => { // symmetric difference (one-off, bitset is 
 
 // scan a \p property via node's regex engine
 
-const scanProp = expr => {
-  const re = new RegExp(`\\p{${expr}}`, 'gu');
-  const reSingle = new RegExp(`\\p{${expr}}`, 'u');
+const scanProp = (expr, flag = 'u') => {
+  if (flag === 'v') { // strings could swallow neighbours in a chunk, so cp by cp
+    const re = new RegExp(`^\\p{${expr}}$`, 'v');
+    const ranges = [];
+    for (let cp = 0; cp < MAX; cp++) if (re.test(String.fromCodePoint(cp))) ranges.push([ cp, cp ]);
+    return normalize(ranges);
+  }
+  const re = new RegExp(`\\p{${expr}}`, 'g' + flag);
+  const reSingle = new RegExp(`\\p{${expr}}`, flag);
   const ranges = [];
   let rs = -1, rePrev = -2;
   const push = cp => {
@@ -189,6 +196,172 @@ for (const [name, baseMask] of BINPROPS) {
 propOffsets.push(propBytes.length);
 console.error(`binary props total: ${propBytes.length} bytes`);
 
+// Script and Script_Extensions: every cp has one (sc, scx) combo, stored as runs of combo index.
+// [canonical name, aliases...], index 0 is Unknown (the default for unlisted cps)
+const SCRIPTS = [
+  ['Unknown', 'Zzzz'], ['Adlam', 'Adlm'], ['Ahom'], ['Anatolian_Hieroglyphs', 'Hluw'], ['Arabic', 'Arab'],
+  ['Armenian', 'Armn'], ['Avestan', 'Avst'], ['Balinese', 'Bali'], ['Bamum', 'Bamu'], ['Bassa_Vah', 'Bass'],
+  ['Batak', 'Batk'], ['Bengali', 'Beng'], ['Beria_Erfe', 'Berf'], ['Bhaiksuki', 'Bhks'],
+  ['Bopomofo', 'Bopo'], ['Brahmi', 'Brah'], ['Braille', 'Brai'], ['Buginese', 'Bugi'], ['Buhid', 'Buhd'],
+  ['Canadian_Aboriginal', 'Cans'], ['Carian', 'Cari'], ['Caucasian_Albanian', 'Aghb'], ['Chakma', 'Cakm'],
+  ['Cham'], ['Cherokee', 'Cher'], ['Chorasmian', 'Chrs'], ['Common', 'Zyyy'], ['Coptic', 'Copt', 'Qaac'],
+  ['Cuneiform', 'Xsux'], ['Cypriot', 'Cprt'], ['Cypro_Minoan', 'Cpmn'], ['Cyrillic', 'Cyrl'],
+  ['Deseret', 'Dsrt'], ['Devanagari', 'Deva'], ['Dives_Akuru', 'Diak'], ['Dogra', 'Dogr'],
+  ['Duployan', 'Dupl'], ['Egyptian_Hieroglyphs', 'Egyp'], ['Elbasan', 'Elba'], ['Elymaic', 'Elym'],
+  ['Ethiopic', 'Ethi'], ['Garay', 'Gara'], ['Georgian', 'Geor'], ['Glagolitic', 'Glag'], ['Gothic', 'Goth'],
+  ['Grantha', 'Gran'], ['Greek', 'Grek'], ['Gujarati', 'Gujr'], ['Gunjala_Gondi', 'Gong'],
+  ['Gurmukhi', 'Guru'], ['Gurung_Khema', 'Gukh'], ['Han', 'Hani'], ['Hangul', 'Hang'],
+  ['Hanifi_Rohingya', 'Rohg'], ['Hanunoo', 'Hano'], ['Hatran', 'Hatr'], ['Hebrew', 'Hebr'],
+  ['Hiragana', 'Hira'], ['Imperial_Aramaic', 'Armi'], ['Inherited', 'Qaai', 'Zinh'],
+  ['Inscriptional_Pahlavi', 'Phli'], ['Inscriptional_Parthian', 'Prti'], ['Javanese', 'Java'],
+  ['Kaithi', 'Kthi'], ['Kannada', 'Knda'], ['Katakana', 'Kana'], ['Kawi'], ['Kayah_Li', 'Kali'],
+  ['Kharoshthi', 'Khar'], ['Khitan_Small_Script', 'Kits'], ['Khmer', 'Khmr'], ['Khojki', 'Khoj'],
+  ['Khudawadi', 'Sind'], ['Kirat_Rai', 'Krai'], ['Lao', 'Laoo'], ['Latin', 'Latn'], ['Lepcha', 'Lepc'],
+  ['Limbu', 'Limb'], ['Linear_A', 'Lina'], ['Linear_B', 'Linb'], ['Lisu'], ['Lycian', 'Lyci'],
+  ['Lydian', 'Lydi'], ['Mahajani', 'Mahj'], ['Makasar', 'Maka'], ['Malayalam', 'Mlym'], ['Mandaic', 'Mand'],
+  ['Manichaean', 'Mani'], ['Marchen', 'Marc'], ['Masaram_Gondi', 'Gonm'], ['Medefaidrin', 'Medf'],
+  ['Meetei_Mayek', 'Mtei'], ['Mende_Kikakui', 'Mend'], ['Meroitic_Cursive', 'Merc'],
+  ['Meroitic_Hieroglyphs', 'Mero'], ['Miao', 'Plrd'], ['Modi'], ['Mongolian', 'Mong'], ['Mro', 'Mroo'],
+  ['Multani', 'Mult'], ['Myanmar', 'Mymr'], ['Nabataean', 'Nbat'], ['Nag_Mundari', 'Nagm'],
+  ['Nandinagari', 'Nand'], ['New_Tai_Lue', 'Talu'], ['Newa'], ['Nko', 'Nkoo'], ['Nushu', 'Nshu'],
+  ['Nyiakeng_Puachue_Hmong', 'Hmnp'], ['Ogham', 'Ogam'], ['Ol_Chiki', 'Olck'], ['Ol_Onal', 'Onao'],
+  ['Old_Hungarian', 'Hung'], ['Old_Italic', 'Ital'], ['Old_North_Arabian', 'Narb'], ['Old_Permic', 'Perm'],
+  ['Old_Persian', 'Xpeo'], ['Old_Sogdian', 'Sogo'], ['Old_South_Arabian', 'Sarb'], ['Old_Turkic', 'Orkh'],
+  ['Old_Uyghur', 'Ougr'], ['Oriya', 'Orya'], ['Osage', 'Osge'], ['Osmanya', 'Osma'],
+  ['Pahawh_Hmong', 'Hmng'], ['Palmyrene', 'Palm'], ['Pau_Cin_Hau', 'Pauc'], ['Phags_Pa', 'Phag'],
+  ['Phoenician', 'Phnx'], ['Psalter_Pahlavi', 'Phlp'], ['Rejang', 'Rjng'], ['Runic', 'Runr'],
+  ['Samaritan', 'Samr'], ['Saurashtra', 'Saur'], ['Sharada', 'Shrd'], ['Shavian', 'Shaw'],
+  ['Siddham', 'Sidd'], ['Sidetic', 'Sidt'], ['SignWriting', 'Sgnw'], ['Sinhala', 'Sinh'],
+  ['Sogdian', 'Sogd'], ['Sora_Sompeng', 'Sora'], ['Soyombo', 'Soyo'], ['Sundanese', 'Sund'],
+  ['Sunuwar', 'Sunu'], ['Syloti_Nagri', 'Sylo'], ['Syriac', 'Syrc'], ['Tagalog', 'Tglg'],
+  ['Tagbanwa', 'Tagb'], ['Tai_Le', 'Tale'], ['Tai_Tham', 'Lana'], ['Tai_Viet', 'Tavt'], ['Tai_Yo', 'Tayo'],
+  ['Takri', 'Takr'], ['Tamil', 'Taml'], ['Tangsa', 'Tnsa'], ['Tangut', 'Tang'], ['Telugu', 'Telu'],
+  ['Thaana', 'Thaa'], ['Thai'], ['Tibetan', 'Tibt'], ['Tifinagh', 'Tfng'], ['Tirhuta', 'Tirh'],
+  ['Todhri', 'Todr'], ['Tolong_Siki', 'Tols'], ['Toto'], ['Tulu_Tigalari', 'Tutg'], ['Ugaritic', 'Ugar'],
+  ['Vai', 'Vaii'], ['Vithkuqi', 'Vith'], ['Wancho', 'Wcho'], ['Warang_Citi', 'Wara'],
+  ['Yezidi', 'Yezi'], ['Yi', 'Yiii'], ['Zanabazar_Square', 'Zanb'],
+];
+
+console.error('scanning scripts...');
+const scOf = new Uint8Array(MAX);
+const scxOf = new Array(MAX); // only set where scx is not just {sc}
+{
+  const scxLists = new Map();
+  for (let i = 1; i < SCRIPTS.length; i++) {
+    for (const [s, e] of scanProp(`Script=${SCRIPTS[i][0]}`)) scOf.fill(i, s, e + 1);
+    for (const [s, e] of scanProp(`Script_Extensions=${SCRIPTS[i][0]}`)) {
+      for (let cp = s; cp <= e; cp++) {
+        let l = scxLists.get(cp);
+        if (!l) scxLists.set(cp, l = []);
+        l.push(i);
+      }
+    }
+  }
+  for (let cp = 0; cp < MAX; cp++) {
+    const l = scxLists.get(cp) ?? [ 0 ];
+    if (l.length !== 1 || l[0] !== scOf[cp]) scxOf[cp] = l;
+  }
+}
+
+// combos are (sc, scx list), scx list empty when it is just {sc}
+const scriptBytes = [];
+{
+  const comboIdx = new Map();
+  const combos = [];
+  const comboAt = cp => {
+    const key = scOf[cp] + (scxOf[cp] ? ':' + scxOf[cp].join(',') : '');
+    let idx = comboIdx.get(key);
+    if (idx === undefined) {
+      comboIdx.set(key, idx = combos.length);
+      combos.push([ scOf[cp], scxOf[cp] ?? [] ]);
+    }
+    return idx;
+  };
+  const runs = [];
+  let runStart = 0, runCombo = comboAt(0);
+  for (let i = 1; i <= MAX; i++) {
+    const c = i === MAX ? -1 : comboAt(i);
+    if (c !== runCombo) { runs.push([ i - runStart, runCombo ]); runStart = i; runCombo = c; }
+  }
+  varint(scriptBytes, combos.length);
+  for (const [ sc, scx ] of combos) {
+    varint(scriptBytes, sc);
+    varint(scriptBytes, scx.length);
+    for (const x of scx) varint(scriptBytes, x);
+  }
+  varint(scriptBytes, runs.length);
+  for (const [ len, c ] of runs) { varint(scriptBytes, len); varint(scriptBytes, c); }
+  console.error(`scripts: ${combos.length} combos, ${runs.length} runs, ${scriptBytes.length} bytes`);
+}
+const scriptDirStr = SCRIPTS.flatMap((names, i) => names.map(n => `${n}=${i}`)).join(';');
+
+// properties of strings (v flag): the emoji sequence files of node's unicode version are the
+// candidates, node's own \p{...}/v the judge. RGI_Emoji is the union of the other six, so not stored
+const STRING_PROPS = [ 'Basic_Emoji', 'Emoji_Keycap_Sequence', 'RGI_Emoji_Modifier_Sequence', 'RGI_Emoji_Flag_Sequence', 'RGI_Emoji_Tag_Sequence', 'RGI_Emoji_ZWJ_Sequence' ];
+console.error('fetching emoji sequences...');
+const emojiSeqs = new Map(STRING_PROPS.map(x => [ x, [] ]));
+for (const file of [ 'emoji-sequences.txt', 'emoji-zwj-sequences.txt' ]) {
+  const url = `https://www.unicode.org/Public/${process.versions.unicode}.0/emoji/${file}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url}: ${res.status}`);
+  for (const line of (await res.text()).split('\n')) {
+    const l = line.replace(/#.*/, '').trim();
+    if (!l) continue;
+    const [ cps, type ] = l.split(';').map(x => x.trim());
+    const list = emojiSeqs.get(type);
+    if (!list) continue;
+    if (cps.includes('..')) {
+      const [ a, b ] = cps.split('..').map(x => parseInt(x, 16));
+      for (let c = a; c <= b; c++) list.push([ c ]);
+    } else list.push(cps.split(/\s+/).map(x => parseInt(x, 16)));
+  }
+}
+
+// per property: varint range count, ranges as (gap, length) varints, varint string count, then
+// the strings sorted, each as shared prefix length with the one before, suffix length, and the
+// suffix cps as zigzag deltas (from the cp above in the string before, else the cp before)
+const stringPropBytes = [];
+const stringPropOffsets = [];
+const cmpCps = (a, b) => {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] !== b[i]) return a[i] - b[i];
+  return a.length - b.length;
+};
+for (const name of STRING_PROPS) {
+  const list = emojiSeqs.get(name);
+  const re = new RegExp(`^\\p{${name}}$`, 'v');
+  for (const s of list) if (!re.test(String.fromCodePoint(...s))) throw new Error(`${name}: node disagrees on ${s.map(x => x.toString(16))}`);
+  const singles = normalize(list.filter(s => s.length === 1).map(s => [ s[0], s[0] ]));
+  const scanned = scanProp(name, 'v');
+  if (JSON.stringify(singles) !== JSON.stringify(scanned)) throw new Error(`${name}: single code points differ from node`);
+  const multi = list.filter(s => s.length > 1).sort(cmpCps);
+
+  stringPropOffsets.push(stringPropBytes.length);
+  varint(stringPropBytes, singles.length);
+  let last = 0;
+  for (const [ s, e ] of singles) { varint(stringPropBytes, s - last); varint(stringPropBytes, e - s); last = e + 1; }
+  varint(stringPropBytes, multi.length);
+  let prev = [];
+  for (const s of multi) {
+    let p = 0;
+    while (p < s.length && p < prev.length && s[p] === prev[p]) p++;
+    varint(stringPropBytes, p);
+    varint(stringPropBytes, s.length - p);
+    for (let i = p; i < s.length; i++) varint(stringPropBytes, zigzag(s[i] - (i < prev.length ? prev[i] : i > 0 ? s[i - 1] : 0)));
+    prev = s;
+  }
+  console.error(`  ${name}: ${singles.length} ranges, ${multi.length} strings`);
+}
+{
+  // RGI_Emoji must be exactly the union
+  const re = new RegExp('^\\p{RGI_Emoji}$', 'v');
+  const all = [ ...emojiSeqs.values() ].flat();
+  for (const s of all) if (!re.test(String.fromCodePoint(...s))) throw new Error('RGI_Emoji is not the union');
+  const singles = normalize(all.filter(s => s.length === 1).map(s => [ s[0], s[0] ]));
+  if (JSON.stringify(singles) !== JSON.stringify(scanProp('RGI_Emoji', 'v'))) throw new Error('RGI_Emoji single code points differ');
+}
+console.error(`string props: ${stringPropBytes.length} bytes`);
+const stringPropDirStr = [ ...STRING_PROPS, 'RGI_Emoji' ].map((n, i) => `${n}=${i}`).join(';');
+
 const cpLower = cp => { const s = String.fromCodePoint(cp).toLowerCase(); return [...s].length === 1 ? s.codePointAt(0) : cp; };
 const cpUpper = cp => { const s = String.fromCodePoint(cp).toUpperCase(); return [...s].length === 1 ? s.codePointAt(0) : cp; };
 
@@ -332,9 +505,19 @@ export const __Porffor_regex_ucdDir = (): bytestring => ${wrap(dirStr.replace(/\
 export const __Porffor_regex_ucdFold = (): bytestring => ${wrap(escStr(foldEnc.bytes))};
 
 export const __Porffor_regex_ucdCanon = (): bytestring => ${wrap(escStr(canonEnc.bytes))};
+
+export const __Porffor_regex_ucdScripts = (): bytestring => ${wrap(escStr(scriptBytes))};
+
+export const __Porffor_regex_ucdScriptDir = (): bytestring => ${wrap(scriptDirStr)};
+
+export const __Porffor_regex_ucdStringProps = (): bytestring => ${wrap(escStr(stringPropBytes))};
+
+export const __Porffor_regex_ucdStringPropOffsets = (): bytestring => ${wrap(escStr(stringPropOffsets.flatMap(o => { const b = []; varint(b, o); return b; })))};
+
+export const __Porffor_regex_ucdStringPropDir = (): bytestring => ${wrap(stringPropDirStr)};
 `;
 
-const total = gcBytes.length + propBytes.length + propOffsetsBytes.length + dirStr.length + foldEnc.bytes.length + canonEnc.bytes.length;
+const total = stringPropBytes.length + scriptBytes.length + scriptDirStr.length + gcBytes.length + propBytes.length + propOffsetsBytes.length + dirStr.length + foldEnc.bytes.length + canonEnc.bytes.length;
 console.error(`total data: ${total} bytes (${(total / 1024).toFixed(1)}KB)`);
 
 import fs from 'node:fs';

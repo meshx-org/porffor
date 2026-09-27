@@ -48,6 +48,32 @@ const usesBigInt = node => {
   return false;
 };
 
+// which regex tables and ops the program can need, from the property escapes and \q{} it names
+// in a regex or in a string it could build one from: scripts (\p{sc=...}), strings in classes,
+// and the emoji data of the properties of strings
+const REGEX_FEATURES = [
+  [ '_regexScripts', /[pP]\{(?:sc|scx|Script|Script_Extensions)=/ ],
+  [ '_regexStrings', /\\q\{|[pP]\{(?:Basic_Emoji|Emoji_Keycap_Sequence|RGI_Emoji)/ ],
+  [ '_regexEmoji', /[pP]\{(?:Basic_Emoji|Emoji_Keycap_Sequence|RGI_Emoji)/ ]
+];
+const markRegexFeatures = (node, ast) => {
+  if (node == null || typeof node !== 'object') return;
+  if (Array.isArray(node)) return node.forEach(x => markRegexFeatures(x, ast));
+
+  let text = null;
+  if (node.type === 'Literal') text = node.regex ? node.regex.pattern : typeof node.value === 'string' ? node.value : null;
+  if (node.type === 'TemplateElement') text = node.value.cooked ?? node.value.raw;
+  if (text != null) {
+    if (text.includes('{')) for (const [ key, re ] of REGEX_FEATURES) if (re.test(text)) ast[key] = true;
+    return;
+  }
+
+  for (const key in node) {
+    if (key[0] === '_' || key === 'start' || key === 'end' || key === 'loc' || key === 'range') continue;
+    markRegexFeatures(node[key], ast);
+  }
+};
+
 const usesTemporal = node => {
   if (node == null || typeof node !== 'object') return false;
   if (Array.isArray(node)) return node.some(usesTemporal);
@@ -364,5 +390,6 @@ export default (input, entry = null) => {
   if (usesTemporal(ast)) ast._usesTemporal = true;
   if (usesIterProtocol(ast)) ast._usesIterProtocol = true;
   if (usesBigInt(ast)) ast._usesBigInt = true;
+  markRegexFeatures(ast, ast);
   return ast;
 };
