@@ -366,7 +366,12 @@ const walk = (node, h) => {
   // a throwable error type is usable: its accessors/toString must survive type gating
   else if (kind === K_ThrowNew) h.typeUsed(node[3]);
   else if (kind === K_DataRef) node[3] = h.remapData(node[3]);
-  else if (kind === K_Alloc && Array.isArray(node[5])) node[5][0] = h.remapAllocSite(node[5][0]);
+  else if (kind === K_Alloc) {
+    // a value the builtin makes (Proxy.revocable's proxy) is a type in use, for the
+    // hasType flags, though no return type names it
+    if (typeof node[4] === 'number' && node[4] !== 0) h.typeUsed(node[4]);
+    if (Array.isArray(node[5])) node[5][0] = h.remapAllocSite(node[5][0]);
+  }
   else if (kind === K_FuncIdx || kind === K_FuncRec) {
     const func = h.includeBuiltin(node[3]);
     func.indirect = true;
