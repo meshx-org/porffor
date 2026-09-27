@@ -87,6 +87,7 @@ const coerceReturnValue = (scope, v) => {
 const initBuilder = scope => {
   scope.body = [];
   scope.blockStack = [ scope.body ];
+  scope.thisDefaulted = false;
   scope.locals ??= Object.create(null);
   scope.tmpPool = Object.create(null);
   scope.tmpBusy = [];
@@ -2293,14 +2294,18 @@ const generateThis = (scope, decl) => {
     decl._noGlobalThis // this generation known to not be globalThis
   ) return Local('#this', T.jsval);
 
-  const block = curBlock(scope);
+  // once, at the function's entry: the block `this` is read in may be a temporary one whose
+  // statements are copied (into both arms of a fast path) before the marker is resolved
+  if (scope.thisDefaulted) return Local('#this', T.jsval);
+  scope.thisDefaulted = true;
+  const block = scope.body;
   const marker = Symbol('this default');
-  stmt(scope, marker);
+  block.unshift(marker);
   onFinalize(() => {
     const i = block.indexOf(marker);
     if (i === -1) return;
     block.splice(i, 1, ...(scope.onlyNew !== false && !scope.referenced ? [] : [
-      If(Bin('==', T.i32, JvType(Local('#this', T.jsval)), Const(T.i32, TYPES.undefined)),
+      If(JvNullish(Local('#this', T.jsval)),
         [ Assign(Local('#this', T.jsval), generate(scope, { type: 'Identifier', name: 'globalThis' })) ], null)
     ]));
   });
