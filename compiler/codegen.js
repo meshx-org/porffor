@@ -1281,7 +1281,8 @@ const generateBinaryExp = (scope, decl) => {
     const rightName = decl.right.name;
     if (rightName) {
       let checkType = TYPES[rightName.toLowerCase()];
-      if (checkType != null && rightName === TYPE_NAMES[checkType] && !rightName.endsWith('Error')) {
+      // not Object: every object is one, not only the object type (functions, arrays, maps)
+      if (checkType != null && rightName === TYPE_NAMES[checkType] && !rightName.endsWith('Error') && checkType !== TYPES.object) {
         if (checkType === TYPES.number) checkType = TYPES.numberobject;
         else if (checkType === TYPES.boolean) checkType = TYPES.booleanobject;
         else if (checkType === TYPES.string) checkType = TYPES.stringobject;
@@ -1289,11 +1290,14 @@ const generateBinaryExp = (scope, decl) => {
       }
     }
 
-    return generate(scope, {
-      type: 'CallExpression',
-      callee: { type: 'Identifier', name: '__Porffor_object_instanceof' },
-      arguments: [ decl.left, decl.right, getObjProp(decl.right, 'prototype') ]
-    });
+    // each side once, left first: (o = 0, C) as the right may change what the left reads
+    const leftValue = generate(scope, decl.left);
+    const left = decl.right.type === 'Identifier' ? reuse(scope, leftValue) : tmp(scope, leftValue[N_TYPE], leftValue);
+    const right = reuse(scope, generate(scope, decl.right));
+    // a builtin's prototype by name (objectHack), else read off the right's value
+    const protoNode = getObjProp(decl.right, 'prototype');
+    const proto = protoNode.type === 'MemberExpression' ? generateMember(scope, protoNode, right) : generate(scope, protoNode);
+    return builtinCall(scope, '__Porffor_object_instanceof', [ left, right, proto ]);
   }
 
   if (decl.operator === 'in') {
@@ -2351,10 +2355,22 @@ const generateThis = (scope, decl) => {
   onFinalize(() => {
     const i = block.indexOf(marker);
     if (i === -1) return;
-    block.splice(i, 1, ...(scope.onlyNew !== false && !scope.referenced ? [] : [
-      If(JvNullish(Local('#this', T.jsval)),
-        [ Assign(Local('#this', T.jsval), generate(scope, { type: 'Identifier', name: 'globalThis' })) ], null)
-    ]));
+    if (scope.onlyNew !== false && !scope.referenced) return void block.splice(i, 1);
+    const thisVal = Local('#this', T.jsval);
+    // a primitive this is boxed (ToObject): only a program with call, apply or bind can
+    // give one (a method called on a primitive is a builtin's)
+    const demanded = x => memberDemands.has(x) || calledMembers.has(x);
+    let box = null;
+    if ((demanded('call') || demanded('apply') || demanded('bind')) && '__ecma262_ToObject' in builtinFuncs) {
+      const t = JvType(thisVal);
+      box = [ If(Bin('|', T.i32, Bin('|', T.i32,
+        Bin('==', T.i32, t, Const(T.i32, TYPES.number)),
+        Bin('==', T.i32, t, Const(T.i32, TYPES.boolean))),
+        Bin('==', T.i32, Bin('|', T.i32, t, Const(T.i32, 0b10000000)), Const(T.i32, TYPES.bytestring))),
+        [ Assign(thisVal, builtinCall(scope, '__ecma262_ToObject', [ thisVal ])) ], null) ];
+    }
+    block.splice(i, 1, If(JvNullish(thisVal),
+      [ Assign(thisVal, generate(scope, { type: 'Identifier', name: 'globalThis' })) ], box));
   });
   return Local('#this', T.jsval);
 };

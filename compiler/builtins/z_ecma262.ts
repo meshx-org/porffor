@@ -242,6 +242,17 @@ export const __ecma262_ToPropertyKey = (argument: any): any => {
   return __ecma262_ToString(key);
 };
 
+// 7.1.18 ToObject, for the primitives with a wrapper (a Symbol or BigInt has none here).
+// The wrappers are retagged primitives, as the constructors make them: not through the
+// constructors, which would bring them into the program late (after the prototype lookup
+// that maps a constructor to its prototype has been settled without them)
+export const __ecma262_ToObject = (argument: any): any => {
+  if (Porffor.type(argument) == Porffor.TYPES.number) return argument as NumberObject;
+  if (Porffor.type(argument) == Porffor.TYPES.boolean) return argument as BooleanObject;
+  if ((Porffor.type(argument) | 0b10000000) == Porffor.TYPES.bytestring) return argument as StringObject;
+  return argument;
+};
+
 export const __ecma262_IsConstructor = (argument: any): boolean => {
   if (Porffor.type(argument) != Porffor.TYPES.function) return false;
   return (__Porffor_funcLut_flags(argument) & 0b10) == 2;

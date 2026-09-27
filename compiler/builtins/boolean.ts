@@ -14,10 +14,10 @@ export const Boolean = function (value: any): boolean|any {
 
 // 20.3.3.2 Boolean.prototype.toString ()
 // https://tc39.es/ecma262/#sec-boolean.prototype.tostring
-export const __Boolean_prototype_toString = function (this: boolean) {
-  // 1. Let b be ? ThisBooleanValue(this value).
+export const __Boolean_prototype_toString = function (this: any) {
+  // 1. Let b be ? ThisBooleanValue(this value): a TypeError for anything else
   // 2. If b is true, return "true"; else return "false".
-  if (this) return 'true';
+  if (Porffor.callThis(__Boolean_prototype_valueOf, this)) return 'true';
   return 'false';
 };
 

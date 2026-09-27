@@ -175,6 +175,9 @@ export const __Porffor_object_instanceof = (obj: any, constr: any, checkProto: a
     throw new TypeError('instanceof right-hand side is not a function');
   }
 
+  // a primitive is no instance (its prototype chain is only for member lookups)
+  if (!Porffor.object.isObject(obj)) return false;
+
   if (!Porffor.object.isObject(checkProto)) {
     return false;
   }
