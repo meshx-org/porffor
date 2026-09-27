@@ -134,8 +134,6 @@ const cCollisionProne = name => /^[A-Z][A-Z0-9_]*$/.test(name) || /_t$/.test(nam
 // inlining these has little perf benefit and significantly increases binary size
 const NEVER_INLINE = new Set([
   '__Porffor_object_get_ic', '__Porffor_object_get_icMiss', '__Porffor_object_get_withHash',
-  // every %TypedArray%.prototype dispatcher tail-calls it
-  '__Porffor_typedArray_call',
   // each built-in prototype's getters are added through it (inlined, one per prototype)
   '__Porffor_object_fastAddAccessor',
   // every RegExp getter's guard path

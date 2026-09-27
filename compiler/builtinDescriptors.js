@@ -16,12 +16,15 @@
 //   { key: 'constructor', kind: 'data', func: 'Map' }       (a builtin function's value)
 //   { symbol: 'toStringTag', kind: 'data', value: 'Map', demand: 'toStringTag' }
 //   { symbol: 'dispose', kind: 'method', func: '...', always: true }
+//   { key: 'map', kind: 'method', func: '...', unless: 'typedArrayCtorValue' } (only in a
+//     program without that program flag)
 // with attrs { writable, enumerable, configurable } (an accessor has no writable). A method or
 // accessor is on the object only when its function is in the program (or the whole object is
 // asked for); demand: only in a program that reads a property of that name; always: whenever
 // the object is made.
 
 export const NATIVE_ERRORS = [ 'AggregateError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError', 'SuppressedError' ];
+export const ERRORS = [ 'Error', ...NATIVE_ERRORS ];
 export const TYPED_ARRAY_KINDS = [ 'Uint8', 'Int8', 'Uint8Clamped', 'Uint16', 'Int16', 'Uint32', 'Int32', 'Float32', 'Float64', 'BigInt64', 'BigUint64' ].map(x => x + 'Array');
 
 // the prototypes whose [Symbol.toStringTag] is a plain string (Object.prototype.toString
@@ -86,6 +89,10 @@ export const prototypeDescriptors = (funcNames, isConstructor) => {
         // (a typed array kind's are %TypedArray%.prototype's, inherited)
         if (own.has(prop) || isTypedArrayKind) continue;
         props.push({ key: prop, kind: 'accessor', get: func, attrs: ACCESSOR_ATTRS });
+      } else if (isTypedArrayKind) {
+        // a typed array kind's methods are %TypedArray%.prototype's (inherited), in a program
+        // that can reach it; else its own
+        props.push({ key, kind: 'method', func, attrs: METHOD_ATTRS, unless: 'typedArrayCtorValue' });
       } else {
         props.push({ key, kind: 'method', func, attrs: METHOD_ATTRS });
       }
@@ -114,3 +121,32 @@ export const prototypeDescriptors = (funcNames, isConstructor) => {
 
 // the namespaces whose [Symbol.toStringTag] is a plain string
 export const NAMESPACE_TO_STRING_TAGS = [ 'Math', 'JSON', 'Reflect', 'Atomics' ];
+
+// the builtins by the property they implement, for codegen's typed paths (which call a type's
+// own without reading its prototype): a type's methods and getters (__Map_prototype_get is
+// get for a Map), each prototype object's builder (#get___Map_prototype) and the constructors'
+// statics (__Object_keys is keys, read off Object used as a value)
+export const memberIndex = (funcNames, isBuiltin) => {
+  const methods = new Map(), getters = new Map(), prototypeObjects = new Map(), statics = new Map();
+  const add = (map, key, x) => {
+    const entries = map.get(key);
+    if (entries) entries.push(x);
+      else map.set(key, [ x ]);
+  };
+
+  for (const x of funcNames) {
+    const ind = x.indexOf('_prototype_');
+    if (x.startsWith('__') && ind !== -1) {
+      const name = x.slice(ind + '_prototype_'.length);
+      if (name.endsWith('$get')) add(getters, name.slice(0, -'$get'.length), x);
+        else add(methods, name, x);
+    } else if (x.startsWith('#get___') && x.endsWith('_prototype')) {
+      prototypeObjects.set(x.slice(7, -'_prototype'.length), x);
+    } else {
+      const found = /^__([A-Z][A-Za-z0-9]*)_([a-zA-Z][a-zA-Z0-9]*)$/.exec(x);
+      if (found && found[2] !== 'prototype' && isBuiltin(found[1])) add(statics, found[2], [ found[1], x ]);
+    }
+  }
+
+  return { methods, getters, prototypeObjects, statics };
+};

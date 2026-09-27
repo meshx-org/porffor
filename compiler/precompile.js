@@ -1,5 +1,6 @@
 
 import { TYPES, TYPE_NAMES } from './types.js';
+import { TYPED_ARRAY_KINDS, ERRORS } from './builtinDescriptors.js';
 import { K } from './ir.js';
 import { ieee754_binary64 } from './encoding.js';
 
@@ -23,7 +24,7 @@ const compile = async (file, _funcs) => {
   let first = source.slice(0, source.indexOf('\n'));
 
   if (first.startsWith('export default')) {
-    source = await (await import('file://' + file)).default({ TYPES, TYPE_NAMES });
+    source = await (await import('file://' + file)).default({ TYPES, TYPE_NAMES, TYPED_ARRAY_KINDS, ERRORS });
     first = source.slice(0, source.indexOf('\n'));
   }
 
@@ -309,33 +310,30 @@ const K_DataRef = ${K.DataRef}, K_Global = ${K.Global}, K_TypeSwitch = ${K.TypeS
 // rare collision (e.g. a 6-long type-id list whose [0] equals a kind number).
 const isNode = v => Array.isArray(v) && v.length === 6 && typeof v[0] === 'number' && typeof v[1] === 'number' && typeof v[2] === 'number';
 const isComptimeFlag = v => v && typeof v === 'object' && !Array.isArray(v) && v.__porfComptimeFlag;
-// hasFunc.<builtin>, hasType.<type>, program.<flag> (a whole-program fact from parse.js),
-// member.<name> (the program reads a property of that name dynamically)
-const resolveComptimeFlag = (h, kind, value) => kind === 'hasFunc' ? h.hasFunc(value)
-  : kind === 'program' ? h.programFlag(value)
-  : kind === 'member' ? h.memberDemanded(value)
-  : h.usesAnyType([ value ]);
 
 // the dynamic resolution pass walks the reconstructed IR tree, threading the codegen helpers \`h\`:
 //   - live Call to a builtin       -> h.includeBuiltin(name)   (so it gets compiled + emitted)
 //   - DataRef / Alloc / Global     -> h.remap* / h.global      (rebind to the user compile's arena)
-//   - TypeSwitch case              -> deferred to h.onFinalize, gated on h.usesAnyType(typeIds)
-//     when usedTypes is final, so a dead case's subtree is never walked (its builtins/strings are
-//     never included -> never emitted), while a type first used by a later builtin still activates.
-// a comptime flag x in the list node: resolved when the program is known, its branch put in
-// its place and walked (a flag directly in that branch is deferred the same way: walk()
-// passes a flag by, so one nested in another's branch was never resolved)
-const deferFlag = (node, x, h) => h.onFinalize(() => {
-  const pos = node.indexOf(x);
-  if (pos === -1) return;
+//   - TypeSwitch case              -> waits on its types (h.whenFact): walked once one is used,
+//     so a dead case's subtree is never walked (its builtins/strings never included -> never
+//     emitted), whenever in putting the program together its type turns up.
+// a comptime flag x in the list node (hasFunc.<builtin>, hasType.<type>, program.<flag>,
+// member.<name>: facts, codegen's whenFact) waits on its fact: its branch goes in its place
+// and is walked once the fact holds, the other only when it cannot any more (a flag directly
+// in that branch waits the same way)
+const deferFlag = (node, x, h) => {
   const [ kind, value, thenBranch, elseBranch ] = x.__porfComptimeFlag;
-  const selected = resolveComptimeFlag(h, kind, value) ? thenBranch : elseBranch;
-  node.splice(pos, 1, ...selected);
-  for (let j = pos; j < pos + selected.length; j++) {
-    if (isComptimeFlag(node[j])) deferFlag(node, node[j], h);
-      else node[j] = walk(node[j], h);
-  }
-});
+  const choose = selected => () => {
+    const pos = node.indexOf(x);
+    if (pos === -1) return;
+    node.splice(pos, 1, ...selected);
+    for (let j = pos; j < pos + selected.length; j++) {
+      if (isComptimeFlag(node[j])) deferFlag(node, node[j], h);
+        else node[j] = walk(node[j], h);
+    }
+  };
+  h.whenFact([ [ kind, value ] ], choose(thenBranch), choose(elseBranch), elseBranch.length === 0);
+};
 
 const walk = (node, h) => {
   if (isComptimeFlag(node)) return node;
@@ -355,10 +353,7 @@ const walk = (node, h) => {
     walk(node[3], h); // subject is always live
     for (const c of node[4]) {
       const typeIds = c[0];
-      let walkedCase = false;
-      h.onFinalize(() => {
-        if (walkedCase || !h.usesAnyType(typeIds)) return;
-        walkedCase = true;
+      h.whenFact(typeIds.map(t => [ 'hasType', t ]), () => {
         for (let j = 1; j < c.length; j++) walk(c[j], h);
       });
     }

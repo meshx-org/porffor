@@ -1,4 +1,4 @@
-export default ({ TYPES, TYPE_NAMES }) => {
+export default ({ TYPES, TYPE_NAMES, TYPED_ARRAY_KINDS }) => {
   // no imports above: precompile knows a generator by its first line (export default)
   const { readdirSync, readFileSync } = process.getBuiltinModule('node:fs');
   const { dirname, join } = process.getBuiltinModule('node:path');
@@ -57,7 +57,7 @@ export const __Porffor_object_builtinPrototype = (f: any): any => {`;
 
   // %TypedArray% is reached only through a kind (its own prototype): gated on the kinds, as
   // __Porffor_object_builtinParent is (it is brought in there, after these flags are settled)
-  const typedArrayKinds = [ 'Uint8', 'Int8', 'Uint8Clamped', 'Uint16', 'Int16', 'Uint32', 'Int32', 'Float32', 'Float64', 'BigInt64', 'BigUint64' ];
+  const typedArrayKinds = TYPED_ARRAY_KINDS.map(x => x.slice(0, -5));
   // (only a program using a kind's constructor as a value reaches either)
   out += `
   if (Porffor.comptime.flag\`program.typedArrayCtorValue\`) {`;
@@ -103,8 +103,7 @@ export const __Porffor_object_builtinParent = (f: any): any => {
   }
 
   // typedarray.js makes the typed arrays' (not a .ts file this reads)
-  const typedArrays = [ 'Uint8', 'Int8', 'Uint8Clamped', 'Uint16', 'Int16', 'Uint32', 'Int32', 'Float32', 'Float64', 'BigInt64', 'BigUint64' ].map(x => x + 'Array');
-  for (const ctor of typedArrays) {
+  for (const ctor of TYPED_ARRAY_KINDS) {
     if (!ctors.has(ctor)) continue;
     if (!statics.has(ctor)) statics.set(ctor, new Set());
     statics.get(ctor).add('from').add('of');
@@ -115,7 +114,7 @@ export const __Porffor_object_builtinParent = (f: any): any => {
   // Symbol's well-known symbols: a builtin reading one does not bring in its initialiser
   const staticValues = new Map([
     [ 'Number', [ 'NaN', 'POSITIVE_INFINITY', 'NEGATIVE_INFINITY', 'MAX_VALUE', 'MIN_VALUE', 'MAX_SAFE_INTEGER', 'MIN_SAFE_INTEGER', 'EPSILON' ] ],
-    ...typedArrays.map(x => [ x, [ 'BYTES_PER_ELEMENT' ] ])
+    ...TYPED_ARRAY_KINDS.map(x => [ x, [ 'BYTES_PER_ELEMENT' ] ])
   ]);
 
   out += `

@@ -1,4 +1,4 @@
-export default () => {
+export default ({ ERRORS }) => {
   let out = '';
 
   const errors = [];
@@ -64,15 +64,7 @@ export const __${name}_prototype_toString = function (this: any) {
 };\n`;
   };
 
-  error('Error');
-  error('AggregateError');
-  error('TypeError');
-  error('ReferenceError');
-  error('SyntaxError');
-  error('RangeError');
-  error('EvalError');
-  error('URIError');
-  error('SuppressedError');
+  for (const x of ERRORS) error(x);
 
   out += `
 export const __Error_isError = (x: unknown): boolean => Porffor.fastAnd(Porffor.type(x) >= Porffor.TYPES.error, Porffor.type(x) <= Porffor.TYPES.suppressederror);`;

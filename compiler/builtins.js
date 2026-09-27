@@ -58,7 +58,7 @@ export const BuiltinVars = ({ builtinFuncs }) => {
       localTypes: [ T.jsval ],
       retType: T.ptr,
       returnType: TYPES.object,
-      body: ({ includeBuiltin, funcRefPtr, global, makeString, globalThisUserSync, onFinalize, hasFunc, memberDemanded, programFlag }) => {
+      body: ({ includeBuiltin, funcRefPtr, global, makeString, globalThisUserSync, whenFact }) => {
         if (globalThis.precompile) return [ Return(Const(T.ptr, 0)) ];
 
         includeBuiltin('__Porffor_object_new');
@@ -91,7 +91,7 @@ export const BuiltinVars = ({ builtinFuncs }) => {
           }
           if ('value' in d) {
             const value = d.value;
-            if (typeof value === 'function') return value(_, { includeBuiltin, funcRefPtr, makeString, programFlag });
+            if (typeof value === 'function') return value(_, { includeBuiltin, funcRefPtr, makeString });
             if (typeof value === 'number') return Box(Const(T.f64, value), Const(T.i32, TYPES.number));
             if (typeof value === 'string') return makeString(value);
             if (value === null) return JvConst(TYPES.object, 0);
@@ -120,19 +120,22 @@ export const BuiltinVars = ({ builtinFuncs }) => {
         };
 
         if (lazyKind && Prefs.lazyObjects) {
-          // globalThis: entries only for included globals
+          // globalThis: entries only for the globals in the program (each in its place)
+          const keys = Object.keys(props);
+          const slots = keys.map(() => null);
           const adds = [];
-          onFinalize(() => {
-            adds.length = 0;
-            for (const x in props) {
-              const key = prefix + x;
-              if (key in builtinFuncs) {
-                if (!hasFunc(key)) continue;
-              } else if (('#get_' + key) in builtinFuncs) {
-                if (!hasFunc('#get_' + key)) continue;
-              }
-              emitProp(adds, x, props[x]);
-            }
+          keys.forEach((x, i) => {
+            const key = prefix + x;
+            const emit = () => {
+              const one = [];
+              emitProp(one, x, props[x]);
+              slots[i] = BlockStmt(one);
+              adds.length = 0;
+              for (const y of slots) if (y) adds.push(y);
+            };
+            if (key in builtinFuncs) whenFact([ [ 'hasFunc', key ] ], emit);
+              else if (('#get_' + key) in builtinFuncs) whenFact([ [ 'hasFunc', '#get_' + key ] ], emit);
+              else emit();
           });
           out.push(BlockStmt(adds));
         } else {
@@ -142,9 +145,7 @@ export const BuiltinVars = ({ builtinFuncs }) => {
         // only a program that names .toStringTag can read one
         if (NAMESPACE_TO_STRING_TAGS.includes(name)) {
           const tagAdd = [];
-          onFinalize(() => {
-            tagAdd.length = 0;
-            if (!memberDemanded('toStringTag')) return;
+          whenFact([ [ 'member', 'toStringTag' ] ], () => {
             tagAdd.push(Call('__Porffor_object_fastAdd', [ obj, wellKnownSymbol(includeBuiltin, global, makeString, 'toStringTag'), makeString(name), Const(T.i32, 0b0010) ], T.none));
           });
           out.push(BlockStmt(tagAdd));
@@ -306,7 +307,7 @@ export const BuiltinVars = ({ builtinFuncs }) => {
       localTypes: [ T.jsval ],
       retType: T.ptr,
       returnType: TYPES.object,
-      body: ({ includeBuiltin, funcRefPtr, global, makeString, onFinalize, hasFunc, memberDemanded, programFlag }) => {
+      body: ({ includeBuiltin, funcRefPtr, global, makeString, whenFact }) => {
         if (globalThis.precompile) return [ Return(Const(T.ptr, 0)) ];
 
         includeBuiltin('__Porffor_object_new');
@@ -329,35 +330,42 @@ export const BuiltinVars = ({ builtinFuncs }) => {
           : typeof p.value === 'string' ? makeString(p.value)
           : JvConst(TYPES.object, 0);
 
+        // each part in its place, however the facts come: the parent, then the properties
+        const slots = [ null, ...desc.props.map(() => null) ];
         const adds = [];
-        onFinalize(() => {
+        const place = (i, node) => {
+          slots[i] = node;
           adds.length = 0;
-          const full = !Prefs.lazyObjects || fullPrototypes.has(getName);
+          for (const x of slots) if (x) adds.push(x);
+        };
 
-          // its parent (a new object's is Object.prototype already)
-          let parent = desc.parent;
-          if (parent?.flag && !programFlag(parent.flag)) parent = parent.otherwise ? { object: parent.otherwise } : undefined;
-          if (parent !== undefined) {
-            includeBuiltin('__Porffor_object_setPrototype');
-            adds.push(Call('__Porffor_object_setPrototype', [ obj, parent === null ? JvConst(TYPES.object, 0) : objectValue(parent.object) ], T.none));
-          }
+        // its parent (a new object's is Object.prototype already)
+        const setParent = parent => () => {
+          includeBuiltin('__Porffor_object_setPrototype');
+          place(0, Call('__Porffor_object_setPrototype', [ obj, parent === null ? JvConst(TYPES.object, 0) : objectValue(parent) ], T.none));
+        };
+        const parent = desc.parent;
+        if (parent?.flag) whenFact([ [ 'program', parent.flag ] ], setParent(parent.object), parent.otherwise ? setParent(parent.otherwise) : null);
+          else if (parent !== undefined) setParent(parent === null ? null : parent.object)();
 
-          for (const p of desc.props) {
-            if (p.demand && !memberDemanded(p.demand)) continue;
-            const f = p.func ?? p.get;
-            if (f && !p.always) {
-              if (full) includeBuiltin(f);
-                else if (!hasFunc(f)) continue;
-            }
-
+        desc.props.forEach((p, i) => {
+          const emit = () => {
             if (p.kind === 'accessor') {
               includeBuiltin('__Porffor_object_fastAddAccessor');
-              adds.push(Call('__Porffor_object_fastAddAccessor', [ obj, keyValue(p), funcValue(p.get), Const(T.i32, attrFlags(p.attrs)) ], T.none));
+              place(i + 1, Call('__Porffor_object_fastAddAccessor', [ obj, keyValue(p), funcValue(p.get), Const(T.i32, attrFlags(p.attrs)) ], T.none));
             } else {
               includeBuiltin('__Porffor_object_fastAdd');
-              adds.push(Call('__Porffor_object_fastAdd', [ obj, keyValue(p), p.kind === 'method' ? funcValue(p.func) : dataValue(p), Const(T.i32, attrFlags(p.attrs)) ], T.none));
+              place(i + 1, Call('__Porffor_object_fastAdd', [ obj, keyValue(p), p.kind === 'method' ? funcValue(p.func) : dataValue(p), Const(T.i32, attrFlags(p.attrs)) ], T.none));
             }
-          }
+          };
+
+          // a method or accessor once its function is in the program, or the object is read
+          // whole (X.prototype: then it brings the function in)
+          const f = p.func ?? p.get;
+          const gated = f && !p.always && Prefs.lazyObjects ? () => whenFact([ [ 'hasFunc', f ], [ 'full', getName ] ], emit) : emit;
+          if (p.demand) whenFact([ [ 'member', p.demand ] ], gated);
+            else if (p.unless) whenFact([ [ 'program', p.unless ] ], () => {}, gated);
+            else gated();
         });
 
         out.push(BlockStmt(adds));
@@ -367,8 +375,9 @@ export const BuiltinVars = ({ builtinFuncs }) => {
     };
 
     // the object read as a value (X.prototype): all of it
-    _[name] = (_scope, { includeBuiltin }) => {
+    _[name] = (_scope, { includeBuiltin, fact }) => {
       fullPrototypes.add(getName);
+      fact('full', getName);
       includeBuiltin(getName);
       return Box(Call(getName, [], T.ptr), Const(T.i32, TYPES.object));
     };

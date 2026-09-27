@@ -9,6 +9,7 @@ import {
   Alloc, GcBarrier, ArrGet, ArrSet, ArrLenSet, LenGet, LenSet, RawC, FuncIdx, FuncRec
 } from './ir.js';
 import { BuiltinFuncs, BuiltinVars, fullPrototypes } from './builtins.js';
+import { memberIndex, TYPED_ARRAY_KINDS } from './builtinDescriptors.js';
 import { TYPES, TYPE_FLAGS, TYPE_NAMES } from './types.js';
 import semantic, { knownValue, unknownValue } from './semantic.js';
 import parse from './parse.js';
@@ -235,13 +236,16 @@ let doNotMarkFuncRef = false;
 // used so prototype dispatch (.next/.then) is included, mirroring generateCall's direct path
 const coroTypeUsed = func => {
   if (!func.generator && !func.async) return;
-  usedTypes.add(func.async ? (func.generator ? TYPES.__porffor_asyncgenerator : TYPES.promise) : TYPES.__porffor_generator);
-  if (func.async && func.generator) usedTypes.add(TYPES.promise);
+  useType(func.async ? (func.generator ? TYPES.__porffor_asyncgenerator : TYPES.promise) : TYPES.__porffor_generator);
+  if (func.async && func.generator) useType(TYPES.promise);
 };
 
 const useFunctionValue = (func, markReferenced = true) => {
   if (markReferenced && !doNotMarkFuncRef) func.referenced = true;
-  func.indirect = true;
+  if (!func.indirect) {
+    func.indirect = true;
+    factSet('indirect', func.name);
+  }
   coroTypeUsed(func);
   if (markReferenced) func.generate?.();
 };
@@ -815,7 +819,7 @@ const lookup = (scope, name, allowImplicitArguments = true, markFunctionReferenc
   if (name in builtinVars) {
     // Symbol.toPrimitive arrives here as __Symbol_toPrimitive: a read of that member, for the
     // member.<name> comptime flags (a builtin checks for one only in a program that names it)
-    if (!globalThis.precompile && name.startsWith('__Symbol_')) memberDemands.add(name.slice(9));
+    if (!globalThis.precompile && name.startsWith('__Symbol_')) demandMember(name.slice(9));
     const v = builtinVars[name];
     return typeof v === 'function' ? v(scope, irBuiltinHelpers(scope, name, {})) : v;
   }
@@ -843,8 +847,11 @@ const generateIdent = (scope, decl) => {
   // TDZ: read before its let/const initializer (static flag from binding resolver)
   if (decl._tdz) return internalThrow(scope, 'ReferenceError', `Cannot access '${unhackName(decl.name)}' before initialization`);
 
-  // a typed array's constructor as a value can lead to %TypedArray% (resolveMemberDemandsOnce)
-  if (!globalThis.precompile && TYPED_ARRAY_CTORS.includes(decl.name)) typedArrayCtorValue = true;
+  // a typed array's constructor as a value can lead to %TypedArray% (whenTypedArrayReachable)
+  if (!globalThis.precompile && TYPED_ARRAY_KINDS.includes(decl.name) && !typedArrayCtorValue) {
+    typedArrayCtorValue = true;
+    factSet('program', 'typedArrayCtorValue');
+  }
 
   if (decl.name === '#closure_env') {
     if (!scope.closureAware) throw new Error(`missing closure env in ${scope.name}`);
@@ -1340,8 +1347,8 @@ const irBuiltinHelpers = (scope, name, def) => ({
   makeString: str => makeString(scope, str),
   usesAnyType,
   hasFunc: name => funcIndex[name] != null,
-  programFlag: name => name === 'usesIterProtocol' ? usesIterProtocol : name === 'typedArrayCtorValue' ? typedArrayCtorValue : false,
-  memberDemanded: name => memberDemands.has(name) || calledMembers.has(name),
+  whenFact,
+  fact: factSet,
   onFinalize,
   remapData: id => {
     if (!def.data || !Object.hasOwn(def.data, id)) throw new Error(`${name}: missing precompiled data segment ${id}`);
@@ -2022,7 +2029,7 @@ const generateCall = (scope, decl) => {
     const propName = callee.computed
       ? (callee.property.type === 'Literal' && typeof callee.property.value === 'string' ? callee.property.value : null)
       : callee.property.name;
-    if (propName) calledMembers.add(propName);
+    if (propName) callMember(propName);
   }
 
   let name = decl.callee.name;
@@ -2362,16 +2369,15 @@ const generateThis = (scope, decl) => {
     const thisVal = Local('#this', T.jsval);
     // a primitive this is boxed (ToObject): only a program with call, apply or bind can
     // give one (a method called on a primitive is a builtin's)
-    const demanded = x => memberDemands.has(x) || calledMembers.has(x);
-    let box = null;
-    if ((demanded('call') || demanded('apply') || demanded('bind')) && '__ecma262_ToObject' in builtinFuncs) {
+    const box = [];
+    if ('__ecma262_ToObject' in builtinFuncs) whenFact([ [ 'member', 'call' ], [ 'member', 'apply' ], [ 'member', 'bind' ] ], () => {
       const t = JvType(thisVal);
-      box = [ If(Bin('|', T.i32, Bin('|', T.i32,
+      box.push(If(Bin('|', T.i32, Bin('|', T.i32,
         Bin('==', T.i32, t, Const(T.i32, TYPES.number)),
         Bin('==', T.i32, t, Const(T.i32, TYPES.boolean))),
         Bin('==', T.i32, Bin('|', T.i32, t, Const(T.i32, 0b10000000)), Const(T.i32, TYPES.bytestring))),
-        [ Assign(thisVal, builtinCall(scope, '__ecma262_ToObject', [ thisVal ])) ], null) ];
-    }
+        [ Assign(thisVal, builtinCall(scope, '__ecma262_ToObject', [ thisVal ])) ], null));
+    });
     block.splice(i, 1, If(JvNullish(thisVal),
       [ Assign(thisVal, generate(scope, { type: 'Identifier', name: 'globalThis' })) ], box));
   });
@@ -2407,9 +2413,16 @@ const unhackName = name => {
 
 const knownType = (scope, type) => typeof type === 'number' ? type : null;
 
+// a type is in the program: a fact (hasType)
+const useType = x => {
+  if (usedTypes.has(x)) return;
+  usedTypes.add(x);
+  factSet('hasType', x);
+};
+
 const typeUsed = (scope, x) => {
   if (x == null) return;
-  usedTypes.add(x);
+  useType(x);
 
   scope.usedTypes ??= new Set();
   scope.usedTypes.add(x);
@@ -3127,7 +3140,6 @@ const isIdentAssignable = (scope, name, op = '=') => {
 };
 
 // todo: generate this array procedurally
-const builtinPrototypeGets = ['size', 'description', 'byteLength', 'byteOffset', 'buffer', 'detached', 'resizable', 'growable', 'maxByteLength', 'name', 'message', 'constructor', 'source', 'flags', 'global', 'ignoreCase', 'multiline', 'dotAll', 'unicode', 'sticky', 'hasIndices', 'unicodeSets', 'lastIndex', 'encoding', 'fatal', 'ignoreBOM', 'disposed'];
 
 const ctHash = prop => {
   if (!Prefs.ctHash || !prop ||
@@ -4569,11 +4581,30 @@ let usesIterProtocol = true;
 // the program can hold BigInts (parse.js): arithmetic on unknown types checks for them
 let usesBigInt = false;
 
+// the program reads a property of this name (x.name, x['name']): a fact (member), and the
+// builtins it can reach wait on the types that have them
+const demandMember = name => {
+  if (memberDemands.has(name)) return;
+  memberDemands.add(name);
+  if (calledMembers.has(name)) return;
+  factSet('member', name);
+  onMemberDemanded(name);
+};
+
+// it calls a method of this name (x.name(...)): the same fact, for the member.<name> flags
+const callMember = name => {
+  if (calledMembers.has(name)) return;
+  calledMembers.add(name);
+  if (memberDemands.has(name)) return;
+  factSet('member', name);
+  onMemberDemanded(name);
+};
+
 const demandMemberRead = decl => {
   const propName = decl.computed
     ? (decl.property.type === 'Literal' && typeof decl.property.value === 'string' ? decl.property.value : null)
     : decl.property.name;
-  if (propName && propName !== '__proto__') memberDemands.add(propName);
+  if (propName && propName !== '__proto__') demandMember(propName);
 };
 
 const primObjAlias = {
@@ -4590,62 +4621,54 @@ const RUNTIME_METHOD_LOOKUPS = {
   __ecma262_ToPrimitive_String: [ 'toString', 'valueOf' ]
 };
 
-const resolveMemberDemands = scope => {
-  // including a method can include a runtime lookup (and so demand more): until nothing new
-  let before;
-  do {
-    before = memberDemands.size;
-    for (const name in RUNTIME_METHOD_LOOKUPS)
-      if (funcIndex[name] != null) for (const method of RUNTIME_METHOD_LOOKUPS[name]) memberDemands.add(method);
-    resolveMemberDemandsOnce(scope);
-  } while (memberDemands.size !== before);
-};
-
-const TYPED_ARRAY_CTORS = [ 'Uint8', 'Int8', 'Uint8Clamped', 'Uint16', 'Int16', 'Uint32', 'Int32', 'Float32', 'Float64', 'BigInt64', 'BigUint64' ].map(x => x + 'Array');
-
 // %TypedArray%.prototype can be reached: through a prototype read of a kind's constructor used
 // as a value (each kind's prototype has its own methods)
-const typedArrayReachable = () => typedArrayCtorValue &&
-  (funcIndex.__Object_getPrototypeOf != null || funcIndex.__Reflect_getPrototypeOf != null || memberDemands.has('__proto__'));
+const whenTypedArrayReachable = fn => whenFact([ [ 'program', 'typedArrayCtorValue' ] ], () =>
+  whenFact([ [ 'hasFunc', '__Object_getPrototypeOf' ], [ 'hasFunc', '__Reflect_getPrototypeOf' ], [ 'member', '__proto__' ] ], fn));
 
-const resolveMemberDemandsOnce = scope => {
-  // %TypedArray%.prototype's getters are its accessors (buffer, byteLength, byteOffset, length):
-  // all there once it can be reached (a read by a computed key names none)
-  if (typedArrayReachable()) for (const x of [ 'buffer', 'byteLength', 'byteOffset', 'length' ]) includeBuiltin(scope, `__Porffor_TypedArray_prototype_${x}$get`);
-
-  for (const propName of memberDemands) {
-    const getterOnly = propName === 'constructor';
-    for (const x of getterOnly ? builtinPrototypeObjectGetters.values() : (builtinPrototypeFuncs.get(propName) ?? [])) {
-      let tn;
-      if (getterOnly) {
-        tn = x.slice(7, -'_prototype'.length);
-      } else {
-        tn = x.slice(2, x.indexOf('_prototype_'));
-      }
-
-      // %TypedArray%.prototype's, in a program that can reach it (typedArrayReachable)
-      if (tn === 'Porffor_TypedArray') {
-        if (!typedArrayReachable()) continue;
-      } else {
-        // Porffor's own types are named with __ (__Porffor_Generator_prototype_next is
-        // TYPES.__porffor_generator's): without it their methods are never readable
-        const t = TYPES[tn.toLowerCase()] ?? TYPES['__' + tn.toLowerCase()];
-        if (t == null || !usesAnyType([ t, primObjAlias[t] ])) continue;
-      }
-      includeBuiltin(scope, x);
+// what a property name read can reach: each builtin method (or getter, for constructor)
+// of that name, once its type is in the program; a constructor's static of that name, once the
+// constructor is used as a value (const O = Object; O.keys: __Porffor_object_builtinStatics)
+const onMemberDemanded = propName => {
+  const getterOnly = propName === 'constructor';
+  for (const x of getterOnly ? builtinPrototypeObjectGetters.values() : (builtinPrototypeFuncs.get(propName) ?? [])) {
+    const tn = getterOnly ? x.slice(7, -'_prototype'.length) : x.slice(2, x.indexOf('_prototype_'));
+    const include = () => {
+      includeBuiltin(topLevelFunc, x);
       if (!getterOnly) {
         const getter = '#get___' + tn + '_prototype';
-        if (getter in builtinFuncs) includeBuiltin(scope, getter);
+        if (getter in builtinFuncs) includeBuiltin(topLevelFunc, getter);
       }
+    };
+
+    // %TypedArray%.prototype's, in a program that can reach it
+    if (tn === 'Porffor_TypedArray') {
+      whenTypedArrayReachable(include);
+      continue;
     }
 
-    // a constructor used as a value (const O = Object) may have its static methods read
-    // through it: those named like the property (__Porffor_object_builtinStatics adds them)
-    for (const [ ctor, x ] of builtinStaticFuncs.get(propName) ?? []) {
-      if (!(ctor in funcIndex) || !funcByName(ctor).indirect) continue;
-      includeBuiltin(scope, x);
-    }
+    // Porffor's own types are named with __ (__Porffor_Generator_prototype_next is
+    // TYPES.__porffor_generator's): without it their methods are never readable
+    const t = TYPES[tn.toLowerCase()] ?? TYPES['__' + tn.toLowerCase()];
+    if (t == null) continue;
+    const types = [ [ 'hasType', t ] ];
+    if (primObjAlias[t] != null) types.push([ 'hasType', primObjAlias[t] ]);
+    whenFact(types, include);
   }
+
+  for (const [ ctor, x ] of builtinStaticFuncs.get(propName) ?? [])
+    whenFact([ [ 'indirect', ctor ] ], () => includeBuiltin(topLevelFunc, x));
+};
+
+// the member facts' waiting that does not start at a read: the builtins that look methods up
+// by name, and %TypedArray%.prototype's getters (its accessors: a read by a computed key
+// names none)
+const startMemberDemands = () => {
+  for (const name in RUNTIME_METHOD_LOOKUPS)
+    whenFact([ [ 'hasFunc', name ] ], () => { for (const method of RUNTIME_METHOD_LOOKUPS[name]) demandMember(method); });
+  whenTypedArrayReachable(() => {
+    for (const x of [ 'buffer', 'byteLength', 'byteOffset', 'length' ]) includeBuiltin(topLevelFunc, `__Porffor_TypedArray_prototype_${x}$get`);
+  });
 };
 
 let icSites;
@@ -4689,7 +4712,7 @@ const generateMember = (scope, decl, objValue = null) => {
 
   // builtin prototype getters dispatch to __X_prototype_NAME$get by the object's runtime type
   let extraBC = [];
-  if (builtinPrototypeGets.includes(decl.property.name)) {
+  if (builtinPrototypeGetters.has(decl.property.name)) {
     const bc = [];
     const cands = builtinPrototypeGetters.get(decl.property.name) ?? [];
     for (const x of cands) {
@@ -5215,6 +5238,7 @@ const setFuncIndex = (name, index) => {
   }
 
   funcIndex[name] = index;
+  factSet('hasFunc', name);
 };
 const bindNamedFunction = (scope, name, func) => {
   if (!scope || !name || !func) return;
@@ -5240,6 +5264,90 @@ const builtinFuncByName = name => {
 };
 let irFinalizers;
 const onFinalize = fn => { (irFinalizers ??= []).push(fn); };
+
+// Facts: what the program has, each only ever becoming true as it grows: a function in it
+// (hasFunc), a type used (hasType), a property name read (member), a program flag (program),
+// a built-in prototype read whole (full). What a builtin keeps waits on them (whenFact): its
+// choice for a fact is taken as soon as the fact holds; the other only once nothing more can
+// become true (settleFacts), one at a time. So nothing is left out for a fact that holds in
+// the end, whatever order the program was put together in
+let factWaiters, factQueue, factPending;
+const factKey = (kind, value) => `${kind}:${value}`;
+const factHolds = (kind, value) => {
+  switch (kind) {
+    case 'hasFunc': return funcIndex[value] != null;
+    case 'hasType': return usedTypes.has(value);
+    case 'member': return memberDemands.has(value) || calledMembers.has(value);
+    case 'program': return programFlagValue(value);
+    case 'full': return fullPrototypes.has(value);
+    case 'indirect': return funcIndex[value] != null && !!funcByName(value).indirect;
+  }
+  throw new Error(`unknown fact kind ${kind}`);
+};
+
+// when any of facts ([ kind, value ] each) holds, then(); else(), if any, once none can. A
+// pure else adds nothing to the program (a flag's empty branch): those give up together
+const whenFact = (facts, then, els = null, pure = false) => {
+  const waiter = { facts, then, els, pure, state: 0 }; // 0 waiting, 1 taken, 2 given up (else)
+  if (facts.some(([ kind, value ]) => factHolds(kind, value))) {
+    waiter.state = 1;
+    factQueue.push(then);
+    return;
+  }
+
+  for (const [ kind, value ] of facts) {
+    const key = factKey(kind, value);
+    let list = factWaiters.get(key);
+    if (!list) factWaiters.set(key, list = []);
+    list.push(waiter);
+  }
+  // (one with no else never gives up: taken late, it has left nothing out)
+  if (els) factPending.push(waiter);
+};
+
+// a fact became true: its waiters' choices are taken (queued: run where the IR is settled)
+const factSet = (kind, value) => {
+  if (!factWaiters) return;
+  const key = factKey(kind, value);
+  const list = factWaiters.get(key);
+  if (!list) return;
+  factWaiters.delete(key);
+  for (const waiter of list) {
+    if (waiter.state === 1) continue;
+    if (waiter.state === 2) throw new Error(`porffor: ${key} became true after a builtin was built without it`);
+    waiter.state = 1;
+    factQueue.push(waiter.then);
+  }
+};
+
+const drainFacts = () => {
+  let ran = false;
+  while (factQueue.length !== 0) {
+    ran = true;
+    factQueue.shift()();
+  }
+  return ran;
+};
+
+// nothing more is coming from the program: the waiters still waiting give up. First those
+// whose else adds to the program, one at a time (what it adds may make a fact true, and its
+// waiters are taken before the next gives up), then the pure ones, all at once (they add
+// nothing: giving up cannot change another's fact). false once none is left
+const giveUpFact = () => {
+  factPending = factPending.filter(x => x.state === 0);
+  if (factPending.length === 0) return false;
+
+  const impure = factPending.find(x => !x.pure);
+  const giving = impure ? [ impure ] : factPending;
+  for (const waiter of giving) {
+    waiter.state = 2;
+    factQueue.push(waiter.els);
+  }
+  factPending = factPending.filter(x => x.state === 0);
+  return true;
+};
+
+const programFlagValue = name => name === 'usesIterProtocol' ? usesIterProtocol : name === 'typedArrayCtorValue' ? typedArrayCtorValue : false;
 
 const generateFunc = (scope, decl, forceNoExpr = false) => {
   doNotMarkFuncRef = false;
@@ -5748,7 +5856,9 @@ export default (program, opts = {}) => {
   usesBigInt = !globalThis.precompile && !!program._usesBigInt;
   fullPrototypes.clear();
   topLevelFunc = null;
-  onFinalize(() => resolveMemberDemands(topLevelFunc));
+  factWaiters = new Map();
+  factQueue = [];
+  factPending = [];
   currentFuncIndex = 0;
   icSites = Object.create(null);
   usedTypes = new Set([ TYPES.undefined, TYPES.number, TYPES.boolean, TYPES.function ]);
@@ -5758,37 +5868,15 @@ export default (program, opts = {}) => {
     builtinFuncs = BuiltinFuncs();
     builtinVars = BuiltinVars({ builtinFuncs });
 
-    builtinPrototypeFuncs = new Map();
-    // method name -> [ constructor, builtin ]: a constructor's static methods (__Object_keys)
-    builtinStaticFuncs = new Map();
-    builtinPrototypeGetters = new Map();
-    builtinPrototypeObjectGetters = new Map();
-    for (const x in builtinFuncs) {
-      const ind = x.indexOf('_prototype_');
-      if (x.startsWith('__') && ind !== -1) {
-        let name = x.slice(ind + '_prototype_'.length);
-        const getters = name.endsWith('$get');
-        if (getters) name = name.slice(0, -'$get'.length);
-        const map = getters ? builtinPrototypeGetters : builtinPrototypeFuncs;
-        const entries = map.get(name);
-        if (entries) entries.push(x);
-        else map.set(name, [ x ]);
-      } else if (x.startsWith('#get___') && x.endsWith('_prototype')) {
-        builtinPrototypeObjectGetters.set(x.slice(7, -'_prototype'.length), x);
-      } else {
-        const found = /^__([A-Z][A-Za-z0-9]*)_([a-zA-Z][a-zA-Z0-9]*)$/.exec(x);
-        if (found && found[2] !== 'prototype' && found[1] in builtinFuncs) {
-          const entries = builtinStaticFuncs.get(found[2]);
-          if (entries) entries.push([ found[1], x ]);
-          else builtinStaticFuncs.set(found[2], [ [ found[1], x ] ]);
-        }
-      }
-    }
+    ({ methods: builtinPrototypeFuncs, getters: builtinPrototypeGetters, prototypeObjects: builtinPrototypeObjectGetters, statics: builtinStaticFuncs } =
+      memberIndex(Object.keys(builtinFuncs), x => x in builtinFuncs));
 
     const getObjectName = x => x.startsWith('__') && x.slice(2, x.indexOf('_', 2));
     allObjectHackers = [ ...new Set(Object.keys(builtinFuncs).map(getObjectName).concat(Object.keys(builtinVars).map(getObjectName)).filter(x => x)) ];
     semantic.objectHack = objectHack;
   }
+
+  if (!globalThis.precompile) startMemberDemands();
 
   // a user top-level decl shadowing a builtin name disables the object hack for it:
   // its member accesses are real property accesses
@@ -5882,16 +5970,22 @@ export default (program, opts = {}) => {
 
   for (const f of funcs.slice()) if (f.referenced || f.export) f.generate?.();
 
-  for (let pass = 0; pass < 16; pass++) {
+  // until nothing changes: the finalizers, the functions they bring in, and the choices taken
+  // for facts that came to hold; then the next of those waiting on a fact gives up (settled
+  // program-wide only once nothing more can come)
+  for (let pass = 0, steady = 0; ; pass++) {
     const beforeFinalizers = irFinalizers.length;
     const beforeFuncs = funcs.length;
     const beforeTypes = usedTypes.size;
 
     for (let i = 0; i < irFinalizers.length; i++) irFinalizers[i]();
     for (const f of funcs.slice()) if (f.referenced || f.export) f.generate?.();
+    const ranFacts = drainFacts();
 
-    if (irFinalizers.length === beforeFinalizers && funcs.length === beforeFuncs && usedTypes.size === beforeTypes) break;
-    if (pass === 15) throw new Error('IR finalizers did not converge');
+    if (!ranFacts && irFinalizers.length === beforeFinalizers && funcs.length === beforeFuncs && usedTypes.size === beforeTypes) {
+      steady = 0;
+      if (!giveUpFact()) break;
+    } else if (++steady > 64) throw new Error('IR finalizers did not converge');
   }
   irFinalizers.length = 0;
 

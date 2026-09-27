@@ -1,4 +1,4 @@
-export default async () => {
+export default async ({ TYPED_ARRAY_KINDS }) => {
   let out = '';
 
   // An Array method as a typed array's: Array and any[] read as the typed array, except a
@@ -25,7 +25,7 @@ export default async () => {
 
   // typedarray layout: length (i32), bufferPtr (i32, buffer + byteOffset), byteOffset (i32, getter only)
 
-  for (const x of [ 'Uint8', 'Int8', 'Uint8Clamped', 'Uint16', 'Int16', 'Uint32', 'Int32', 'Float32', 'Float64', 'BigInt64', 'BigUint64' ]) {
+  for (const x of TYPED_ARRAY_KINDS.map(x => x.slice(0, -5))) {
     const name = x + 'Array';
     out += `export const ${name} = function (arg: any, byteOffset: any, length: any): ${name} {
   if (!new.target) throw new TypeError("Constructor ${name} requires 'new'");
@@ -302,26 +302,14 @@ export const __Porffor_typedArray_validate = (ta: any): void => {
 };`;
 
   // %TypedArray%: the typed arrays' abstract parent (not a global: its name is the last
-  // segment). Its prototype has the methods every kind shares, each one calling the kind's
-  // own, read off the kind's prototype object by name (so no dispatcher names a kind)
+  // segment). Its prototype has the methods every kind shares, each one calling the kind's own
+  // by this's type (a type switch: only the kinds in the program); a kind's prototype has
+  // none of its own then (builtinDescriptors.js)
   out += `
 export const __Porffor_TypedArray = function (): any {
   throw new TypeError('Abstract class TypedArray not directly constructable');
 };
 
-// this's kind's own method called name (an own property of its prototype object: the
-// chain would lead back to %TypedArray%.prototype) called on it, a TypeError for anything
-// else. One for all the dispatchers: none takes more than three arguments
-export const __Porffor_typedArray_call = (ta: any, name: any, a: any, b: any, c: any): any => {
-  const t: i32 = Porffor.type(ta);
-  if (Porffor.fastOr(t < Porffor.TYPES.uint8clampedarray, t > Porffor.TYPES.float64array))
-    throw new TypeError('%TypedArray%.prototype method called on a non-TypedArray');
-  const proto: any = __Porffor_object_getHiddenPrototype(t);
-  const entry: i32 = __Porffor_object_lookup(proto, name, __Porffor_object_hash(name));
-  if (entry == 0) throw new TypeError('%TypedArray%.prototype method called on a non-TypedArray');
-  const method: any = __Porffor_object_readValue(entry);
-  return Porffor.callThis(method, ta, a, b, c);
-};
 `;
   // %TypedArray%.prototype's getters read the view itself (length, pointer, offset: the same
   // for every kind), a TypeError for anything else; 0 for a view of a detached buffer
@@ -348,11 +336,14 @@ ${body}
   const notShared = new Set([ 'concat', 'valueOf' ]);
   for (const [ , method, params ] of out.matchAll(/export const __Uint8Array_prototype_([A-Za-z]+(?:\$get)?) = function \(this: Uint8Array,? ?([^)]*)\)/g)) {
     if (notShared.has(method) || params.includes('...') || method.endsWith('$get')) continue;
-    if (params.split(',').filter(x => x.trim()).length > 3) throw new Error(`%TypedArray%.prototype.${method} takes more than __Porffor_typedArray_call passes`);
     const names = params.split(',').map(x => x.trim()).filter(Boolean).map(x => x.split(':')[0].trim());
+    const args = names.map(x => ', ' + x).join('');
     out += `
 export const __Porffor_TypedArray_prototype_${method} = function (this: any${names.map(x => `, ${x}: any`).join('')}) {
-  return __Porffor_typedArray_call(this, '${method}'${[ 0, 1, 2 ].map(i => ', ' + (names[i] ?? 'undefined')).join('')});
+  switch (Porffor.type(this)) {
+${TYPED_ARRAY_KINDS.map(k => `    case Porffor.TYPES.${k.toLowerCase()}: return Porffor.callThis(__${k}_prototype_${method}, this${args});`).join('\n')}
+  }
+  throw new TypeError('%TypedArray%.prototype.${method} called on a non-TypedArray');
 };
 `;
   }
