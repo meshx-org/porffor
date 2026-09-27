@@ -63,15 +63,21 @@ export default async ({ TYPED_ARRAY_KINDS }) => {
 
     byteLength = len * ${name}.BYTES_PER_ELEMENT;
   } else {
+    // the elements: an array's or a typed array's own; any other object's through its
+    // iterator, or as an array-like (Array.from's rules); a primitive is the length (ToIndex:
+    // '3' is 3 elements, a symbol throws)
+    let src: any = undefined;
     if (Porffor.fastOr(
       Porffor.type(arg) == Porffor.TYPES.array,
-      (Porffor.type(arg) | 0b10000000) == Porffor.TYPES.bytestring,
-      Porffor.type(arg) == Porffor.TYPES.set,
       Porffor.fastAnd(Porffor.type(arg) >= Porffor.TYPES.uint8clampedarray, Porffor.type(arg) <= Porffor.TYPES.float64array)
     )) {
+      src = arg;
       len = arg.length;
-    } else if (Porffor.type(arg) == Porffor.TYPES.number) {
-      len = Math.trunc(arg);
+    } else if (Porffor.object.isObject(arg)) {
+      src = __Array_from(arg);
+      len = src.length;
+    } else if (Porffor.type(arg) != Porffor.TYPES.undefined) {
+      len = ecma262.ToIndex(arg);
     }
 
     byteLength = len * ${name}.BYTES_PER_ELEMENT;
@@ -84,16 +90,8 @@ export default async ({ TYPED_ARRAY_KINDS }) => {
     Porffor.IR.storeI32(bufferPtr, 0, byteLength);
     Porffor.IR.fill(bufferPtr + 4, 0, byteLength);
 
-    if (Porffor.fastOr(
-      Porffor.type(arg) == Porffor.TYPES.array,
-      (Porffor.type(arg) | 0b10000000) == Porffor.TYPES.bytestring,
-      Porffor.type(arg) == Porffor.TYPES.set,
-      Porffor.fastAnd(Porffor.type(arg) >= Porffor.TYPES.uint8clampedarray, Porffor.type(arg) <= Porffor.TYPES.float64array)
-    )) {
-      let i: i32 = 0;
-      for (const x of arg) {
-        out[i++] = x;
-      }
+    if (src !== undefined) {
+      for (let i: i32 = 0; i < len; i++) out[i] = src[i];
     }
   }
 
