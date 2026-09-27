@@ -617,7 +617,12 @@ const annotate = (node, parent = null, key = null) => {
           if (variable.node.type !== 'ClassExpression') variable.node._selfAware = true;
           node._selfBinding = variable.node;
         }
-        if (variable.node.type === 'ClassExpression' && variable.scope?.type === 'ClassExpression') {
+        // a class's own name inside the class (heritage, keys, body) is its inner binding,
+        // read-only for a declaration too; by position, a class not being a function scope
+        const insideClass = variable.node.type === 'ClassDeclaration' && variable.node.id &&
+          node.start > variable.node.id.end && node.end <= variable.node.end;
+        if ((variable.node.type === 'ClassExpression' && variable.scope?.type === 'ClassExpression') ||
+            (variable.node.type === 'ClassDeclaration' && (variable.node._fromExpression || insideClass))) {
           node._selfBinding = variable.node;
           node._classBinding = true;
         }

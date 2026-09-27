@@ -2198,7 +2198,25 @@ const generateCall = (scope, decl) => {
 
   let calleeVal, thisVal = null;
   const callee = decl.callee.expression ?? decl.callee;
-  if (!decl._new && (callee.type === 'MemberExpression')) {
+  if (!decl._new && callee.type === 'MemberExpression' && decl.callee.type === 'ChainExpression' && !decl.optional) {
+    // (a?.b)(): the parenthesised chain short-circuits on its own (to an undefined callee,
+    // which the call then throws on) and still calls with a as this: its own chain context,
+    // the object generated inside it too for (a?.b.c)()
+    const label = fresh(scope);
+    const res = tmp(scope, T.jsval), objTmp = tmp(scope, T.jsval);
+    const prevLabel = scope.chainLabel, prevRes = scope.chainRes;
+    scope.chainLabel = label;
+    scope.chainRes = res;
+    const body = collect(scope, () => {
+      assign(scope, objTmp, coerceValue(generate(scope, callee.object), T.jsval));
+      assign(scope, res, coerceValue(generateMember(scope, callee, objTmp), T.jsval));
+    });
+    scope.chainLabel = prevLabel;
+    scope.chainRes = prevRes;
+    stmt(scope, BlockStmt(body, label));
+    calleeVal = res;
+    thisVal = objTmp;
+  } else if (!decl._new && (callee.type === 'MemberExpression')) {
     const objVal = reuse(scope, generate(scope, callee.object));
     calleeVal = generateMember(scope, callee, objVal);
     // super.m(): m is looked up on the parent's prototype, and called on this, unchanged
@@ -3052,9 +3070,11 @@ const hashString = prop => {
 
 
 const generateAssign = (scope, decl, valueUnused = false) => {
-  // a function or class expression's own name, inside it, is read-only; a function
+  // a function or class expression's own name, inside it, is read-only (parse.js scopes a
+  // named expression as a declaration in a wrapper, marked _fromExpression); a function
   // declaration's name is an ordinary binding (babel's _extends reassigns its own)
-  if (decl.left.type === 'Identifier' && decl.left._selfBinding && decl.left._selfBinding.type !== 'FunctionDeclaration') {
+  const self = decl.left.type === 'Identifier' ? decl.left._selfBinding : null;
+  if (self && (self.type !== 'FunctionDeclaration' || self._fromExpression)) {
     if (scope.strict || decl.left._classBinding) return internalThrow(scope, 'TypeError', `Cannot assign to constant variable ${decl.left.name}`);
 
     const v = generate(scope, decl.right);
@@ -3627,6 +3647,9 @@ const generateConditional = (scope, decl) => {
   return resType === T.f64 ? valNumber(res) : res;
 };
 
+const CLAUSE_UNSAFE = new Set([ K.Block, K.If, K.Loop, K.Switch, K.TypeSwitch, K.Try, K.Return,
+  K.Break, K.Continue, K.Throw, K.ThrowNew, K.Unreachable ]);
+
 const genLoop = (scope, decl, type) => {
   if (type === 'for' && decl.init) genStmt(scope, decl.init);
 
@@ -3640,8 +3663,11 @@ const genLoop = (scope, decl, type) => {
 
   const updateStmts = type === 'for' && decl.update ? collect(scope, () => genStmt(scope, decl.update)) : [];
   const testInBody = condStmts.length > 0 || type === 'dowhile';
-  const updateInClause = type === 'for' && updateStmts.length <= 1;
-  const bodyUpdate = type === 'for' && updateStmts.length > 1;
+  // the for (;; update) clause takes one expression: a statement (an optional chain's
+  // labelled block, an if) runs at the end of the body instead
+  const updateInClause = type === 'for' && (updateStmts.length === 0 ||
+    (updateStmts.length === 1 && !CLAUSE_UNSAFE.has(updateStmts[0][N_KIND])));
+  const bodyUpdate = type === 'for' && !updateInClause;
 
   const L = fresh(scope);
   const C = bodyUpdate || type === 'dowhile' ? fresh(scope) : null;
@@ -4785,7 +4811,9 @@ const generateClass = (scope, decl) => {
   func.knownThisSlots = getKnownThisSlots(decl);
   func.generate();
 
-  const classRoot = reuseNamed(scope, decl._writes ? generate(scope, root) : materializeFunctionValue(scope, func));
+  // the class being defined is its constructor, whatever its binding later holds (read
+  // through the binding, a class whose name is assigned somewhere saw it uninitialised)
+  const classRoot = reuseNamed(scope, materializeFunctionValue(scope, func));
   const rootIdent = { type: 'Identifier', name: classRoot[N_A] };
 
   const classProto = reuse(scope, generate(scope, getObjProp(rootIdent, 'prototype')));
@@ -4873,7 +4901,9 @@ const generateClass = (scope, decl) => {
   else func.body.unshift(...fieldInits);
   func.body.unshift(...guard);
 
-  if (!expr && scope.closureOwnLocals?.[name]) mirrorToClosureEnv(scope, name);
+  // the class itself, not a read of its name: an outer binding of the same name (var C;
+  // class C {} in parse.js's wrapper) would answer that
+  if (!expr && scope.closureOwnLocals?.[name]) mirrorToClosureEnv(scope, name, rootIdent);
 
   return expr ? classRoot : valUndefined();
 };

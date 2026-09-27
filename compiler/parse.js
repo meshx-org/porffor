@@ -134,7 +134,8 @@ const bindOwnNames = node => {
           type: 'BlockStatement',
           ...at,
           body: [
-            { ...node, type: node.type === 'ClassExpression' ? 'ClassDeclaration' : 'FunctionDeclaration' },
+            // still an expression's own name to semantic/codegen: read-only inside itself
+            { ...node, type: node.type === 'ClassExpression' ? 'ClassDeclaration' : 'FunctionDeclaration', _fromExpression: true },
             { type: 'ReturnStatement', ...at, argument: { type: 'Identifier', ...at, name: node.id.name } }
           ]
         }
