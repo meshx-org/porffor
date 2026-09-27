@@ -2137,7 +2137,8 @@ const generateCall = (scope, decl) => {
     return res;
   }
 
-  if (name && name in builtinFuncs && builtinFuncs[name].comptime && !decl._noComptime) {
+  // not for new: no comptime builtin is a constructor, and the normal path throws for that
+  if (name && name in builtinFuncs && builtinFuncs[name].comptime && !decl._noComptime && !decl._new) {
     return builtinFuncs[name].comptime(scope, decl, { generate, getNodeType, knownType, makeString, printStaticStr, createThisArg, exprStmt });
   }
 
@@ -3137,7 +3138,8 @@ const generateAssign = (scope, decl, valueUnused = false) => {
       } else {
         stmt(scope, LenSet(ptr, lenValue));
       }
-      return newVal;
+      // the assignment's value, as a jsval: a typed right side (an i32 in a builtin) is not one
+      return coerceValue(newVal, T.jsval);
     };
 
     if (known != null && (known & TYPE_FLAGS.length) !== 0) {

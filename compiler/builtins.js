@@ -828,7 +828,9 @@ return sign * (i64)((((u64)*(u32*)(MEM + ptr + 4)) << 32) + (u64)*(u32*)(MEM + p
     });
   };
 
-  comptime('__Array_of', TYPES.array, (scope, decl, { generate }) => generate(scope, {
+  // no return type: Array.of.call(C, ...) (array.ts) makes a C, not an array; a direct call's
+  // literal carries its own
+  comptime('__Array_of', undefined, (scope, decl, { generate }) => generate(scope, {
     type: 'ArrayExpression',
     elements: decl.arguments
   }));

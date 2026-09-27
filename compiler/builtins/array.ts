@@ -35,6 +35,24 @@ export const Array = function (...args: any[]): any[] {
 export const __Array_isArray = (x: unknown): boolean =>
   Porffor.type(x) == Porffor.TYPES.array;
 
+// Array.of as a value (Array.of.call(C, ...), a reference to it): the arguments as elements
+// of a new C(length) when this is a constructor, else of a plain array. A direct Array.of(...)
+// call never gets here: it compiles to an array literal (builtins.js)
+export const __Array_of = function (this: any, ...items: any[]): any {
+  if (!__ecma262_IsConstructor(this)) return items;
+
+  const len: i32 = items.length;
+  const args: any[] = Porffor.array.new(1);
+  args[0] = len;
+  const out: any = Porffor.call(this, args, null, this);
+  // CreateDataPropertyOrThrow, not a set: a setter on the instance must not run
+  for (let k: i32 = 0; k < len; k++) {
+    Object.defineProperty(out, k, { value: items[k], writable: true, enumerable: true, configurable: true });
+  }
+  out.length = len;
+  return out;
+};
+
 export const __Array_from = (arg: any, mapFn: any, thisArg: any = undefined): any[] => {
   if (arg == null) throw new TypeError('Argument cannot be nullish');
 
