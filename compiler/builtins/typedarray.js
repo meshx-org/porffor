@@ -1,6 +1,25 @@
 export default async () => {
   let out = '';
 
+  // An Array method as a typed array's: Array and any[] read as the typed array, except a
+  // plain array the method makes for itself (Porffor.array.new: join's parts, map's out),
+  // which stays one; typed as the typed array, its stores were bytes and its reads garbage
+  // A method whose result is such an array (map, filter, with, toReversed, toSorted) gives
+  // back a typed array of the same kind instead, as the spec has it: made from it on return
+  const typedArrayVersion = (code, name) => {
+    const plainOut = code.includes('const out: any[] = Porffor.array.new');
+    code = code
+      .replace('// @porf-typed-array\n', '')
+      .replaceAll(': any[] = Porffor.array.new', ': __PLAIN_ARRAY__ = Porffor.array.new')
+      .replaceAll('Array', name)
+      .replaceAll('any[]', name)
+      .replaceAll('__PLAIN_ARRAY__', 'any[]');
+    if (plainOut) code = code
+      .replaceAll(`Porffor.callThis(__${name}_prototype_sort, out,`, `Porffor.callThis(__${name}_prototype_sort, new ${name}(out),`)
+      .replaceAll('return out;', `return new ${name}(out);`);
+    return code;
+  };
+
   const arrayCode = (await import('node:fs')).readFileSync(globalThis.precompileCompilerPath + '/builtins/array.ts', 'utf8');
   const typedArrayFuncs = [...arrayCode.matchAll(/\/\/ @porf-typed-array[\s\S]+?^};$/gm)].map(x => x[0]);
 
@@ -233,7 +252,7 @@ export const __${name}_prototype_subarray = function (this: ${name}, start: any,
   return out;
 };
 
-${typedArrayFuncs.reduce((acc, x) => acc + x.replace('// @porf-typed-array\n', '').replaceAll('Array', name).replaceAll('any[]', name) + '\n\n', '')}`;
+${typedArrayFuncs.reduce((acc, x) => acc + typedArrayVersion(x, name) + '\n\n', '')}`;
   };
 
   return out;
