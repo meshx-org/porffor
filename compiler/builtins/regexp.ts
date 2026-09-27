@@ -1316,7 +1316,7 @@ export const __Porffor_regex_parseClassV = (): i32 => {
       const bStart: i32 = __Porffor_regex_rangesTop;
       let sB: i32 = 0;
       if (Porffor.comptime.flag`program.regexStrings`) sB = __Porffor_regex_strsLen();
-      __Porffor_regex_parseClassSetOperand();
+      __Porffor_regex_parseClassSetOperandRanges();
       if (Porffor.comptime.flag`program.regexStrings`) __Porffor_regex_strsCombine(sStart, sB, true);
       const bN: i32 = __Porffor_regex_rangesNormalize(bStart, __Porffor_regex_rangesTop - bStart);
       const rStart: i32 = __Porffor_regex_rangesTop;
@@ -1332,7 +1332,7 @@ export const __Porffor_regex_parseClassV = (): i32 => {
       const bStart: i32 = __Porffor_regex_rangesTop;
       let sB: i32 = 0;
       if (Porffor.comptime.flag`program.regexStrings`) sB = __Porffor_regex_strsLen();
-      __Porffor_regex_parseClassSetOperand();
+      __Porffor_regex_parseClassSetOperandRanges();
       if (Porffor.comptime.flag`program.regexStrings`) __Porffor_regex_strsCombine(sStart, sB, false);
       const bN: i32 = __Porffor_regex_rangesNormalize(bStart, __Porffor_regex_rangesTop - bStart);
       // a minus b = a ∩ comp(b)
@@ -1358,6 +1358,13 @@ export const __Porffor_regex_parseClassV = (): i32 => {
     if (__Porffor_regex_strsLen() > sStart) return __Porffor_regex_strSetNode(start, count, negated, sStart);
   }
   return __Porffor_regex_classNode(start, count, negated);
+};
+
+// an operand of && or --, as ranges: a single character it returns (a, \n, \u{..}) is one
+// too ([a&&a] is a, [\w--_] has no _)
+export const __Porffor_regex_parseClassSetOperandRanges = (): void => {
+  const cp: i32 = __Porffor_regex_parseClassSetOperand();
+  if (cp >= 0) __Porffor_regex_rangePush(cp, cp);
 };
 
 // operand or a-b range in union context, appends and returns count
