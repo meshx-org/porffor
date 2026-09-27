@@ -31,6 +31,14 @@ export const BuiltinVars = ({ builtinFuncs }) => {
   // builtin objects
   const makePrefix = name => (name.startsWith('__') ? '' : '__') + name + '_';
 
+  // the objects whose [Symbol.toStringTag] is a plain string: Object.prototype.toString reads
+  // it (so a program can delete or change it); the others have a builtinTag of their own
+  const toStringTags = {
+    Math: 'Math', JSON: 'JSON', Reflect: 'Reflect', Atomics: 'Atomics'
+  };
+  for (const x of [ 'Map', 'Set', 'WeakMap', 'WeakSet', 'WeakRef', 'Promise', 'ArrayBuffer', 'SharedArrayBuffer', 'DataView', 'BigInt', 'Symbol', 'TextEncoder', 'TextDecoder' ])
+    toStringTags[`__${x}_prototype`] = x;
+
   const done = new Set();
   const object = (name, props) => {
     done.add(name);
@@ -54,7 +62,7 @@ export const BuiltinVars = ({ builtinFuncs }) => {
       localTypes: [ T.jsval ],
       retType: T.ptr,
       returnType: TYPES.object,
-      body: ({ includeBuiltin, funcRefPtr, global, makeString, globalThisUserSync, onFinalize, hasFunc }) => {
+      body: ({ includeBuiltin, funcRefPtr, global, makeString, globalThisUserSync, onFinalize, hasFunc, memberDemanded }) => {
         if (globalThis.precompile) return [ Return(Const(T.ptr, 0)) ];
 
         includeBuiltin('__Porffor_object_new');
@@ -145,6 +153,20 @@ export const BuiltinVars = ({ builtinFuncs }) => {
           out.push(BlockStmt(adds));
         } else {
           for (const x in props) emitProp(out, x, props[x]);
+        }
+
+        // only a program that names .toStringTag can read one
+        const tag = toStringTags[name];
+        if (tag) {
+          const tagAdd = [];
+          onFinalize(() => {
+            tagAdd.length = 0;
+            if (!memberDemanded('toStringTag')) return;
+            includeBuiltin('Symbol');
+            const symbol = global('#wellknown_toStringTag', T.jsval, Call('Symbol', [ makeString('Symbol.toStringTag') ], T.jsval));
+            tagAdd.push(Call('__Porffor_object_fastAdd', [ obj, symbol, makeString(tag), Const(T.i32, 0b0010) ], T.none));
+          });
+          out.push(BlockStmt(tagAdd));
         }
 
         out.push(BlockStmt(sync));

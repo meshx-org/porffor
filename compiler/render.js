@@ -499,6 +499,10 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
   // code after these in a list is unreachable
   const TERMINATOR_KINDS = new Set([ K.Return, K.Throw, K.ThrowNew, K.Unreachable, K.Break, K.Continue ]);
 
+  // a builtin's == and + are the runtime's plain ones: the user-code ones (below) hand a string
+  // and a number, or an object, to ToNumber and ToPrimitive, which the builtins never need and
+  // which inlined at their many sites cost kilobytes
+  let renderingBuiltin = false;
   const renderExpr = node => {
     switch (node[N_KIND]) {
       case K.Const: {
@@ -631,8 +635,8 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
       case K.JvBits: return [`porf_pack(${rx(node[N_A], P_COMMA)})`, P_POSTFIX];
       case K.JvFromBits: return [`porf_unpack(${rx(node[N_A], P_COMMA)})`, P_POSTFIX];
       case K.JvIsNum: return [`porf_jv_is_num(${rx(node[N_A], P_COMMA)})`, P_POSTFIX];
-      case K.Eq: return [`${node[N_A] ? 'porf_strict_eq' : 'porf_loose_eq'}(${jsArg(node[N_B])}, ${jsArg(node[N_C])})`, P_POSTFIX];
-      case K.Add: return [`porf_add(${jsArg(node[N_A])}, ${jsArg(node[N_B])})`, P_POSTFIX];
+      case K.Eq: return [`${node[N_A] ? 'porf_strict_eq' : renderingBuiltin ? 'porf_loose_eq_plain' : 'porf_loose_eq'}(${jsArg(node[N_B])}, ${jsArg(node[N_C])})`, P_POSTFIX];
+      case K.Add: return [`${renderingBuiltin ? 'porf_add_plain' : 'porf_add'}(${jsArg(node[N_A])}, ${jsArg(node[N_B])})`, P_POSTFIX];
       case K.Cmp: return [`porf_cmp(${jsArg(node[N_A])}, ${jsArg(node[N_B])})`, P_POSTFIX];
       case K.JvTruthy: return [`porf_truthy(${jsArg(node[N_A])})`, P_POSTFIX];
       case K.JvFalsy: return [`porf_falsy(${jsArg(node[N_A])})`, P_POSTFIX];
@@ -1145,6 +1149,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
 
   const renderFunc = f => {
     cur = partsOf(unitOf(f));
+    renderingBuiltin = !!f.internal;
     const plan = stackless.get(f);
     if (plan) {
       renderStackless(f, plan);
@@ -1180,9 +1185,14 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
   const prelude = [];
   const toStr = funcs.find(x => x && x.name === '__ecma262_ToString' && x.body);
   if (toStr) runtimeRefs.push(toStr);
+  // the builtins the runtime's == and + hand their slow cases to, when the program has them
+  const toNum = funcs.find(x => x && x.name === '__ecma262_ToNumber' && x.body);
+  if (toNum) runtimeRefs.push(toNum);
+  const toPrimDefault = funcs.find(x => x && x.name === '__ecma262_ToPrimitive_Default' && x.body);
+  if (toPrimDefault) runtimeRefs.push(toPrimDefault);
   if (promiseResolveFunc) runtimeRefs.push(promiseResolveFunc);
   const stackful = funcs.some(f => needsCoro(f) && !stackless.has(f));
-  prelude.push(RUNTIME_HEAD(prefs, usesCoro, toStr ? fnSym(toStr) : null, !usedTypes || usedTypes.has(TYPES.bigint), stackful));
+  prelude.push(RUNTIME_HEAD(prefs, usesCoro, toStr ? fnSym(toStr) : null, !usedTypes || usedTypes.has(TYPES.bigint), stackful, toNum ? fnSym(toNum) : null, toPrimDefault ? fnSym(toPrimDefault) : null));
   if (usesCoro) prelude.push(CORO_RUNTIME());
 
   // link unit head: static data image, globals, gc roots, per-function tables
@@ -4105,7 +4115,7 @@ ${st}void porf_gc_collect(int minor) {
 // sign-set NaNs from raw bytes are canonicalized at Float64Array/DataView reads (porf_canon)
 // bigintUsed: the program can hold a BigInt, which packs specially (porf_pack)
 // stackful: some coroutine runs on a stack of its own (not stackless, see stackless.js)
-const RUNTIME_HEAD = (prefs, usesCoro = false, toStr = null, bigintUsed = true, stackful = false) => {
+const RUNTIME_HEAD = (prefs, usesCoro = false, toStr = null, bigintUsed = true, stackful = false, toNum = null, toPrimDefault = null) => {
   const st = 'static ';
   const sti = 'static inline ';
   // --ropes: string concatenation builds ropes (needs the GC to trace them)
@@ -4700,6 +4710,8 @@ ${sti}jmp_buf* porf_try_ensure(void) {
 }
 
 ${toStr ? `jsval ${toStr}(jsval);
+` : ''}${toNum ? `jsval ${toNum}(jsval);
+` : ''}${toPrimDefault ? `jsval ${toPrimDefault}(jsval);
 ` : ''}\
 PORF_NORETURN ${st}void porf_throw(jsval v) {
   porf_exception = v;
@@ -5903,9 +5915,26 @@ ${sti}int porf_is_strlike(jsval v) {
 }
 
 // JS + : string-ish on either side concats; else numeric coercion
-${sti}jsval porf_add(jsval a, jsval b) {
+${toPrimDefault ? `// not a primitive (what ToPrimitive calls a method on): the primitive types are all at most
+// ${TYPES.symbol} but the two string ones, and null is an object with no pointer
+static inline int porf_is_object(jsval v) {
+  const i32 t = porf_jv_type(v);
+  return t > ${TYPES.symbol} && (t & 0x7f) != ${TYPES.string} && !(t == ${TYPES.object} && (u32)v.val == 0);
+}
+` : ''}\
+${[ [ 'porf_add', toPrimDefault ], [ 'porf_add_plain', null ] ].map(([ name, hook ]) => `${hook ? `${sti}jsval ${name}(jsval a, jsval b);
+// an object operand of + is a primitive first, hint "default" (valueOf before toString, a
+// Date as a string): out of line, so the + inlined everywhere grows only by the check
+PORF_NOINLINE ${st}jsval ${name}_objects(jsval a, jsval b) {
+  if (porf_is_object(a)) a = ${hook}(a);
+  if (porf_is_object(b)) b = ${hook}(b);
+  return ${name}(a, b);
+}
+` : ''}${sti}jsval ${name}(jsval a, jsval b) {
   if (porf_jv_is_num(a) && porf_jv_is_num(b))
     return porf_box_num(a.val + b.val);
+${hook ? `  if (porf_is_object(a) || porf_is_object(b)) return ${name}_objects(a, b);
+` : ''}\
   if (porf_is_strlike(a) || porf_is_strlike(b)) {
     jsval sa = porf_to_str(a);
     volatile u32 keep_sa = porf_gc_type_can_reference(sa.type) ? (u32)sa.val : 0u;
@@ -5917,7 +5946,7 @@ ${bigintUsed ? `  if (a.type == ${TYPES.bigint} || b.type == ${TYPES.bigint}) re
 ` : ''}\
   return porf_box_num(porf_to_num(a) + porf_to_num(b));
 }
-
+`).join('')}
 // numeric -, *, / on two unknown-typed operands: a single combined both-number fast-path (one
 // hoistable/unswitchable condition) rather than two independent porf_to_num branches.
 ${sti}jsval porf_sub(jsval a, jsval b) {
@@ -5970,7 +5999,9 @@ ${ropes ? `    a = porf_str_flat(a);
 
 // loose ==: common matrix (num/num, str/str, bool->num, null<->undefined);
 // str<->num coercion arrives with the ToNumber builtin port
-${sti}i32 porf_loose_eq(jsval a, jsval b) {
+${[ [ 'porf_loose_eq', toNum, toPrimDefault ], [ 'porf_loose_eq_plain', null, null ] ].map(([ name, num, prim ]) => `${num ? `${st}i32 ${name}_numeric(jsval a, jsval b);
+` : ''}${prim ? `${st}i32 ${name}_object(jsval a, jsval b);
+` : ''}${sti}i32 ${name}(jsval a, jsval b) {
   const i32 ta = porf_jv_type(a), tb = porf_jv_type(b);
   if (ta == ${TYPES.number} && tb == ${TYPES.number}) return a.val == b.val;
   const int an = ta == ${TYPES.undefined} || (ta == ${TYPES.object} && (u32)a.val == 0);
@@ -5986,15 +6017,31 @@ ${bigintUsed ? `  if (ta == ${TYPES.bigint} || tb == ${TYPES.bigint}) {
 ` : ''}\
   if ((ta == ${TYPES.bytestring} || ta == ${TYPES.string}) && (tb == ${TYPES.bytestring} || tb == ${TYPES.string}))
     return porf_str_eq(a, b);
+${num ? `  // a string and a number: the string as a number (ToNumber, out of line)
+  if (((ta == ${TYPES.bytestring} || ta == ${TYPES.string}) && tb == ${TYPES.number}) ||
+      (ta == ${TYPES.number} && (tb == ${TYPES.bytestring} || tb == ${TYPES.string}))) return ${name}_numeric(a, b);
+` : `  // (a string and a number: only the empty string is known to be 0 here)
   if ((ta == ${TYPES.bytestring} || ta == ${TYPES.string}) && tb == ${TYPES.number})
     return b.val == 0.0 && ((u32)a.val == 0u || *(u32*)(MEM + (u32)a.val) == 0u);
   if (ta == ${TYPES.number} && (tb == ${TYPES.bytestring} || tb == ${TYPES.string}))
     return a.val == 0.0 && ((u32)b.val == 0u || *(u32*)(MEM + (u32)b.val) == 0u);
-  if (ta == ${TYPES.boolean}) return porf_loose_eq(porf_box_num((f64)(u32)a.val), b);
-  if (tb == ${TYPES.boolean}) return porf_loose_eq(a, porf_box_num((f64)(u32)b.val));
+`}\
+  if (ta == ${TYPES.boolean}) return ${name}(porf_box_num((f64)(u32)a.val), b);
+  if (tb == ${TYPES.boolean}) return ${name}(a, porf_box_num((f64)(u32)b.val));
+${prim ? `  // an object and a primitive: the object as a primitive, hint "default" (out of line)
+  if (porf_is_object(a) != porf_is_object(b)) return ${name}_object(a, b);
+` : ''}\
   return porf_jv_eq(a, b);
 }
-
+${num ? `PORF_NOINLINE ${st}i32 ${name}_numeric(jsval a, jsval b) {
+  const f64 x = porf_jv_is_num(a) ? a.val : ${num}(a).val;
+  const f64 y = porf_jv_is_num(b) ? b.val : ${num}(b).val;
+  return x == y;
+}
+` : ''}${prim ? `PORF_NOINLINE ${st}i32 ${name}_object(jsval a, jsval b) {
+  return porf_is_object(a) ? ${name}(${prim}(a), b) : ${name}(a, ${prim}(b));
+}
+` : ''}`).join('')}
 // === : numbers as f64, strings by content, else identity
 ${sti}i32 porf_strict_eq(jsval a, jsval b) {
   if (porf_jv_is_num(a)) return porf_jv_is_num(b) && a.val == b.val;

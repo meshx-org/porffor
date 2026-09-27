@@ -9,19 +9,42 @@ export const __ecma262_SameValueZero = (x: any, y: any): boolean => {
   return false;
 };
 
+// GetMethod(input, @@toPrimitive): undefined when absent (or null), a TypeError when not callable
+export const __Porffor_toPrimitiveMethod = (input: any): any => {
+  const method: any = input[Symbol.toPrimitive];
+  if (method == null) return undefined;
+  if (typeof method !== 'function') throw new TypeError('Symbol.toPrimitive is not a function');
+  return method;
+};
+
+// the method's result, which has to be a primitive
+export const __Porffor_callToPrimitive = (method: any, input: any, hint: bytestring): any => {
+  const result: any = Porffor.callThis(method, input, hint);
+  if (Porffor.object.isObject(result)) throw new TypeError('Cannot convert object to primitive value');
+  return result;
+};
+
 // 7.1.1.1 OrdinaryToPrimitive: the first of the two methods that is callable and returns
 // a primitive wins. A method that returns null or undefined has returned a primitive (it
 // is not skipped: only a missing or non-callable method, or an object result, is).
+// 7.1.1.1 OrdinaryToPrimitive, inline in each (an extra call per conversion cost a third
+// on conversion-heavy code): the first of the two methods that is callable and returns a
+// primitive wins (null and undefined are primitives). Each is read once: a getter runs once
 export const __ecma262_ToPrimitive_Number = (input: any): any => {
-  // todo: %Symbol.toPrimitive%
+  // an object's own [Symbol.toPrimitive] decides first: only in a program that names
+  // .toPrimitive can there be one (each conversion would look it up otherwise)
+  if (Porffor.comptime.flag`member.toPrimitive`) {
+    const exotic: any = __Porffor_toPrimitiveMethod(input);
+    if (exotic !== undefined) return __Porffor_callToPrimitive(exotic, input, 'number');
+  }
 
-  const valueOf: any = input.valueOf; // read once: a getter must run once
+  const valueOf: any = input.valueOf;
   if (typeof valueOf === 'function') {
     const value: any = Porffor.callThis(valueOf, input);
     if (!Porffor.object.isObject(value)) return value;
   }
 
-  const toString: any = input.toString; // read once: a getter must run once
+  const toString: any = input.toString;
   if (typeof toString === 'function') {
     const value: any = Porffor.callThis(toString, input);
     if (!Porffor.object.isObject(value)) return value;
@@ -31,21 +54,36 @@ export const __ecma262_ToPrimitive_Number = (input: any): any => {
 };
 
 export const __ecma262_ToPrimitive_String = (input: any): any => {
-  // todo: %Symbol.toPrimitive%
+  if (Porffor.comptime.flag`member.toPrimitive`) {
+    const exotic: any = __Porffor_toPrimitiveMethod(input);
+    if (exotic !== undefined) return __Porffor_callToPrimitive(exotic, input, 'string');
+  }
 
-  const toString: any = input.toString; // read once: a getter must run once
+  const toString: any = input.toString;
   if (typeof toString === 'function') {
     const value: any = Porffor.callThis(toString, input);
     if (!Porffor.object.isObject(value)) return value;
   }
 
-  const valueOf: any = input.valueOf; // read once: a getter must run once
+  const valueOf: any = input.valueOf;
   if (typeof valueOf === 'function') {
     const value: any = Porffor.callThis(valueOf, input);
     if (!Porffor.object.isObject(value)) return value;
   }
 
   throw new TypeError('Cannot convert an object to primitive');
+};
+
+// the hint "default" (+ and ==): given to the method as it is; with none, as "number", but a
+// Date takes it as "string" (Date.prototype[@@toPrimitive]). Primitives pass through
+export const __ecma262_ToPrimitive_Default = (input: any): any => {
+  if (!Porffor.object.isObject(input)) return input;
+  if (Porffor.comptime.flag`member.toPrimitive`) {
+    const exotic: any = __Porffor_toPrimitiveMethod(input);
+    if (exotic !== undefined) return __Porffor_callToPrimitive(exotic, input, 'default');
+  }
+  if (Porffor.type(input) == Porffor.TYPES.date) return __ecma262_ToPrimitive_String(input);
+  return __ecma262_ToPrimitive_Number(input);
 };
 
 // 7.1.4 ToNumber (argument)

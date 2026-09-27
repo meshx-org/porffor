@@ -663,8 +663,9 @@ export const __Object_prototype_toString = function (this: any) {
   // 2. If the this value is null, return "[object Null]".
   if (this === null) return '[object Null]';
 
-  // an object's [Symbol.toStringTag] string is its tag (only a program with symbols has one)
-  if (Porffor.comptime.flag`hasType.symbol`) if (Porffor.object.isObject(this)) {
+  // an object's [Symbol.toStringTag] string is its tag: only in a program that names
+  // .toStringTag can one have been set
+  if (Porffor.comptime.flag`member.toStringTag`) {
     const tag: any = this[Symbol.toStringTag];
     if ((Porffor.type(tag) | 0b10000000) == Porffor.TYPES.bytestring) return '[object ' + tag + ']';
   }
@@ -682,6 +683,60 @@ export const __Object_prototype_toString = function (this: any) {
     Porffor.type(this) == Porffor.TYPES.stringobject)) return '[object String]';
   if (Porffor.type(this) == Porffor.TYPES.date) return '[object Date]';
   if (Porffor.type(this) == Porffor.TYPES.regexp) return '[object RegExp]';
+
+  // the built-ins' own tags: libraries tell a Map, a Promise or a Uint8Array apart by these.
+  // Type switches, so a case is compiled only in a program that has the type. The first are
+  // their prototypes' @@toStringTag: read above when the program can have changed one
+  if (Porffor.comptime.flag`member.toStringTag`) {} else switch (Porffor.type(this)) {
+    case Porffor.TYPES.map: return '[object Map]';
+    case Porffor.TYPES.set: return '[object Set]';
+    case Porffor.TYPES.weakmap: return '[object WeakMap]';
+    case Porffor.TYPES.weakset: return '[object WeakSet]';
+    case Porffor.TYPES.weakref: return '[object WeakRef]';
+    case Porffor.TYPES.promise: return '[object Promise]';
+    case Porffor.TYPES.arraybuffer: return '[object ArrayBuffer]';
+    case Porffor.TYPES.sharedarraybuffer: return '[object SharedArrayBuffer]';
+    case Porffor.TYPES.dataview: return '[object DataView]';
+    case Porffor.TYPES.bigint: return '[object BigInt]';
+    case Porffor.TYPES.symbol: return '[object Symbol]';
+    case Porffor.TYPES.textencoder: return '[object TextEncoder]';
+    case Porffor.TYPES.textdecoder: return '[object TextDecoder]';
+  }
+
+  // %TypedArray%.prototype's tag getter, the generators' prototypes, the disposable stacks
+  // (which put their tags on at construction) and Error's builtinTag
+  switch (Porffor.type(this)) {
+    case Porffor.TYPES.uint8clampedarray: return '[object Uint8ClampedArray]';
+    case Porffor.TYPES.uint8array: return '[object Uint8Array]';
+    case Porffor.TYPES.int8array: return '[object Int8Array]';
+    case Porffor.TYPES.uint16array: return '[object Uint16Array]';
+    case Porffor.TYPES.int16array: return '[object Int16Array]';
+    case Porffor.TYPES.uint32array: return '[object Uint32Array]';
+    case Porffor.TYPES.int32array: return '[object Int32Array]';
+    case Porffor.TYPES.biguint64array: return '[object BigUint64Array]';
+    case Porffor.TYPES.bigint64array: return '[object BigInt64Array]';
+    case Porffor.TYPES.float32array: return '[object Float32Array]';
+    case Porffor.TYPES.float64array: return '[object Float64Array]';
+    case Porffor.TYPES.__porffor_generator: return '[object Generator]';
+    case Porffor.TYPES.__porffor_asyncgenerator: return '[object AsyncGenerator]';
+    case Porffor.TYPES.disposablestack: return '[object DisposableStack]';
+    case Porffor.TYPES.asyncdisposablestack: return '[object AsyncDisposableStack]';
+    case Porffor.TYPES.error:
+    case Porffor.TYPES.aggregateerror:
+    case Porffor.TYPES.typeerror:
+    case Porffor.TYPES.referenceerror:
+    case Porffor.TYPES.syntaxerror:
+    case Porffor.TYPES.rangeerror:
+    case Porffor.TYPES.evalerror:
+    case Porffor.TYPES.urierror:
+    case Porffor.TYPES.suppressederror:
+      return '[object Error]';
+    case Porffor.TYPES.proxy:
+      // IsArray looks through a proxy (a revoked one throws)
+      __Porffor_proxy_handler(this);
+      if (__Array_isArray(__Porffor_proxy_target(this))) return '[object Array]';
+      break;
+  }
 
   return '[object Object]';
 };

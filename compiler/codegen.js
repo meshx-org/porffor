@@ -794,6 +794,9 @@ const lookup = (scope, name, allowImplicitArguments = true, markFunctionReferenc
 
   // builtin value globals like Number.MAX_VALUE
   if (name in builtinVars) {
+    // Symbol.toPrimitive arrives here as __Symbol_toPrimitive: a read of that member, for the
+    // member.<name> comptime flags (a builtin checks for one only in a program that names it)
+    if (!globalThis.precompile && name.startsWith('__Symbol_')) memberDemands.add(name.slice(9));
     const v = builtinVars[name];
     return typeof v === 'function' ? v(scope, irBuiltinHelpers(scope, name, {})) : v;
   }
@@ -1146,7 +1149,20 @@ const performOp = (scope, op, left, right, leftType, rightType) => {
     const rawInt = rawIntType(left, right);
     if (rawInt != null) r = Bin(neg ? '!=' : '==', rawInt, rawIntValue(rawInt, left), rawIntValue(rawInt, right));
     else if ((knownLeft === TYPES.number || isRawNum(left)) && (knownRight === TYPES.number || isRawNum(right))) r = Bin(neg ? '!=' : '==', T.f64, numValue(left), numValue(right));
-    else { r = Eq(strict, left, right); if (neg) r = Un('!', T.i32, r); }
+    else {
+      // the runtime's == turns a string compared with a number into one (ToNumber) and an
+      // object compared with a primitive into one (hint "default"): those builtins brought
+      // in unless both sides are known one kind
+      // (not for == null / == undefined, which the runtime answers itself)
+      const nullish = x => x[N_KIND] === K.JvConst && x[N_B] === 0 && (x[N_A] === TYPES.undefined || x[N_A] === TYPES.object);
+      if (!strict && !(knownLeft != null && knownLeft === knownRight) && !(isStr(knownLeft) && isStr(knownRight)) &&
+          !nullish(left) && !nullish(right)) {
+        includeBuiltin(scope, '__ecma262_ToNumber');
+        if ('__ecma262_ToPrimitive_Default' in builtinFuncs) includeBuiltin(scope, '__ecma262_ToPrimitive_Default');
+      }
+      r = Eq(strict, left, right);
+      if (neg) r = Un('!', T.i32, r);
+    }
     return boolBox(r);
   }
 
@@ -1171,10 +1187,17 @@ const performOp = (scope, op, left, right, leftType, rightType) => {
     if (rawType != null) return Bin('+', rawType, Convert(rawType, left, rawType === T.i32 ? CONVERT_SIGNED : 0), Convert(rawType, right, rawType === T.i32 ? CONVERT_SIGNED : 0));
     if ((knownLeft === TYPES.number || isRawNum(left)) && (knownRight === TYPES.number || isRawNum(right))) return Box(Bin('+', T.f64, numValue(left), numValue(right)), Const(T.i32, TYPES.number));
     if (bothNum) return Box(Bin('+', T.f64, numValue(left), numValue(right)), Const(T.i32, TYPES.number));
-    if (knownLeft == null || knownRight == null) {
-      const l = reuse(scope, left[N_TYPE] === T.jsval ? left : valNumber(left));
-      const r = reuse(scope, right[N_TYPE] === T.jsval ? right : valNumber(right));
-      return Add(l, r);
+    // a side not known to be a number, a boolean or undefined may be an object: the runtime's +
+    // makes it a primitive with the hint "default" first (a Date adds as a string)
+    const numish = ty => ty === TYPES.number || ty === TYPES.boolean || ty === TYPES.undefined;
+    // (user code: the builtins add no objects, and would grow a + inlined at each such site)
+    if (knownLeft == null || knownRight == null || (!globalThis.precompile && (!numish(knownLeft) || !numish(knownRight)))) {
+      if (knownLeft !== TYPES.bigint && knownRight !== TYPES.bigint && knownLeft !== TYPES.symbol && knownRight !== TYPES.symbol) {
+        if ('__ecma262_ToPrimitive_Default' in builtinFuncs) includeBuiltin(scope, '__ecma262_ToPrimitive_Default');
+        const l = reuse(scope, left[N_TYPE] === T.jsval ? left : valNumber(left));
+        const r = reuse(scope, right[N_TYPE] === T.jsval ? right : valNumber(right));
+        return Add(l, r);
+      }
     }
     if (knownLeft === TYPES.bigint || knownRight === TYPES.bigint) {
       const numeric = ty => ty === TYPES.bigint || ty === TYPES.number;
@@ -1596,7 +1619,10 @@ const getNodeType = (scope, node) => {
         if (known !== TYPES.bytestring) allBytes = false;
       }
 
-      if (anyBigint && node.operator !== '+') ret = TYPES.bigint;
+      // a template's pieces are always a string: so each substitution is ToString'd (hint
+      // "string") by the + that adds it, as a template does, not made a primitive as + would
+      if (node._template) ret = TYPES.string;
+      else if (anyBigint && node.operator !== '+') ret = TYPES.bigint;
       else if (anyBigint) ret = anyStringLike || anyUnknown ? null : TYPES.bigint;
       // an operand of unknown type may be a BigInt, unless a Number is in it too (a BigInt
       // would throw), or it is >>> (never a BigInt)
@@ -4922,7 +4948,8 @@ const generateTemplate = (scope, decl) => {
       type: 'BinaryExpression',
       operator: '+',
       left: current,
-      right: val
+      right: val,
+      _template: true
     };
   };
 

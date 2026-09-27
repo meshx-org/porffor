@@ -32,8 +32,17 @@ export const Array = function (...args: any[]): any[] {
   return args;
 };
 
-export const __Array_isArray = (x: unknown): boolean =>
-  Porffor.type(x) == Porffor.TYPES.array;
+export const __Array_isArray = (x: unknown): boolean => {
+  if (Porffor.type(x) == Porffor.TYPES.array) return true;
+  // a proxy is an array when its target is (a revoked one throws)
+  if (Porffor.comptime.flag`hasType.proxy`) {
+    if (Porffor.type(x) == Porffor.TYPES.proxy) {
+      __Porffor_proxy_handler(x);
+      return __Array_isArray(__Porffor_proxy_target(x));
+    }
+  }
+  return false;
+};
 
 // Array.of as a value (Array.of.call(C, ...), a reference to it): the arguments as elements
 // of a new C(length) when this is a constructor, else of a plain array. A direct Array.of(...)
