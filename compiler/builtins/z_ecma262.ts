@@ -15,13 +15,15 @@ export const __ecma262_SameValueZero = (x: any, y: any): boolean => {
 export const __ecma262_ToPrimitive_Number = (input: any): any => {
   // todo: %Symbol.toPrimitive%
 
-  if (typeof input.valueOf === 'function') {
-    const value: any = input.valueOf?.(); // the optional call looks the method up dynamically
+  const valueOf: any = input.valueOf; // read once: a getter must run once
+  if (typeof valueOf === 'function') {
+    const value: any = Porffor.callThis(valueOf, input);
     if (!Porffor.object.isObject(value)) return value;
   }
 
-  if (typeof input.toString === 'function') {
-    const value: any = input.toString?.(); // the optional call looks the method up dynamically
+  const toString: any = input.toString; // read once: a getter must run once
+  if (typeof toString === 'function') {
+    const value: any = Porffor.callThis(toString, input);
     if (!Porffor.object.isObject(value)) return value;
   }
 
@@ -31,13 +33,15 @@ export const __ecma262_ToPrimitive_Number = (input: any): any => {
 export const __ecma262_ToPrimitive_String = (input: any): any => {
   // todo: %Symbol.toPrimitive%
 
-  if (typeof input.toString === 'function') {
-    const value: any = input.toString?.(); // the optional call looks the method up dynamically
+  const toString: any = input.toString; // read once: a getter must run once
+  if (typeof toString === 'function') {
+    const value: any = Porffor.callThis(toString, input);
     if (!Porffor.object.isObject(value)) return value;
   }
 
-  if (typeof input.valueOf === 'function') {
-    const value: any = input.valueOf?.(); // the optional call looks the method up dynamically
+  const valueOf: any = input.valueOf; // read once: a getter must run once
+  if (typeof valueOf === 'function') {
+    const value: any = Porffor.callThis(valueOf, input);
     if (!Porffor.object.isObject(value)) return value;
   }
 
