@@ -5265,8 +5265,10 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
       if (func.topLevel && !decl._module) {
         func.export = true;
 
-        // drain the microtask queue at program end when promises exist
-        if (('Promise' in funcIndex) || ('__Porffor_promise_create' in funcIndex) || ('__Promise_resolve' in funcIndex) || ('__Promise_reject' in funcIndex)) {
+        // drain the microtask queue at program end when promises exist: named, or made by
+        // an async function (an await resumes from a job, with no Promise builtin named)
+        if (('Promise' in funcIndex) || ('__Porffor_promise_create' in funcIndex) || ('__Promise_resolve' in funcIndex) || ('__Promise_reject' in funcIndex) ||
+          funcs.some(f => f?.async)) {
           exprStmt(func, builtinCall(func, '__Porffor_promise_runJobs', []));
         }
       }
