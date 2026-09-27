@@ -74,7 +74,8 @@ export const __Porffor_print = (arg: any, colors: boolean = true, depth: number 
   switch (Porffor.type(arg)) {
     case Porffor.TYPES.number:
       if (colors) Porffor.printStatic('\x1b[33m'); // yellow
-      Porffor.c`printf("%.15g", arg.val);`;
+      // as Number::toString (%.15g lost digits: 0.1 + 0.2 printed 0.3), and -0 as -0 as Node
+      Porffor.c`if (arg.val == 0 && signbit(arg.val)) printf("-0"); else { const jsval s = porf_num_to_str(arg.val); printf("%.*s", (int)*(u32*)(MEM + (u32)s.val), (const char*)(MEM + (u32)s.val + 4)); }`;
       if (colors) Porffor.printStatic('\x1b[0m');
       return;
 

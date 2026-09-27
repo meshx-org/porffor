@@ -107,9 +107,17 @@ export default async () => {
   return out;
 };
 
-export const __${name}_of = (...items: any[]): ${name} => new ${name}(items);
+// of and from make the result with this: a TypeError for a non-constructor, and a
+// subclass or custom constructor makes its own (__Porffor_typedArrayCreate)
+export const __${name}_of = function (this: any, ...items: any[]): any {
+  if (!__ecma262_IsConstructor(this)) throw new TypeError('${name}.of: this is not a constructor');
+  if (this == ${name}) return new ${name}(items);
+  return __Porffor_typedArrayFrom${name}(this, items);
+};
 
-export const __${name}_from = (arg: any, mapFn: any): ${name} => {
+export const __${name}_from = function (this: any, arg: any, mapFn: any): any {
+  if (!__ecma262_IsConstructor(this)) throw new TypeError('${name}.from: this is not a constructor');
+  if (Porffor.fastAnd(Porffor.type(mapFn) != Porffor.TYPES.undefined, Porffor.type(mapFn) != Porffor.TYPES.function)) throw new TypeError('${name}.from: mapFn is not a function');
   const arr: any[] = Porffor.array.new(4);
   let len: i32 = 0;
 
@@ -137,7 +145,17 @@ export const __${name}_from = (arg: any, mapFn: any): ${name} => {
 
   arr.length = len;
 
-  return new ${name}(arr);
+  if (this == ${name}) return new ${name}(arr);
+  return __Porffor_typedArrayFrom${name}(this, arr);
+};
+
+// another constructor as this can only come through call or apply (or a subclass's
+// inherited static, which subclassing typed arrays does not reach yet): the construct
+// machinery only in a program that has those, else the kind itself
+export const __Porffor_typedArrayFrom${name} = (C: any, items: any[]): any => {
+  if (Porffor.comptime.flag\`member.call\`) return __Porffor_typedArrayCreate(C, items);
+  if (Porffor.comptime.flag\`member.apply\`) return __Porffor_typedArrayCreate(C, items);
+  return new ${name}(items);
 };
 
 export const __${name}_prototype_buffer$get = function (this: ${name}): any|ArrayBuffer {
@@ -254,6 +272,22 @@ export const __${name}_prototype_subarray = function (this: ${name}, start: any,
 
 ${typedArrayFuncs.reduce((acc, x) => acc + typedArrayVersion(x, name) + '\n\n', '')}`;
   };
+
+
+  out += `
+// TypedArrayCreate: C(len) through a constructor that is not the typed array itself, which
+// has to give a typed array at least that long; the items then set into it
+export const __Porffor_typedArrayCreate = (C: any, items: any[]): any => {
+  const len: i32 = items.length;
+  const args: any[] = Porffor.array.new(1);
+  args[0] = len;
+  const out: any = Porffor.call(C, args, null, C);
+  const t: i32 = Porffor.type(out);
+  if (Porffor.fastOr(t < Porffor.TYPES.uint8clampedarray, t > Porffor.TYPES.float64array)) throw new TypeError('constructor did not make a typed array');
+  if (out.length < len) throw new TypeError('constructor made a typed array too short');
+  for (let k: i32 = 0; k < len; k++) out[k] = items[k];
+  return out;
+};`;
 
   return out;
 };

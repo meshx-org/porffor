@@ -73,6 +73,22 @@ export const __Porffor_object_builtinPrototype = (f: any): any => {`;
     }
   }
 
+  // typedarray.js makes the typed arrays' (not a .ts file this reads)
+  const typedArrays = [ 'Uint8', 'Int8', 'Uint8Clamped', 'Uint16', 'Int16', 'Uint32', 'Int32', 'Float32', 'Float64', 'BigInt64', 'BigUint64' ].map(x => x + 'Array');
+  for (const ctor of typedArrays) {
+    if (!ctors.has(ctor)) continue;
+    if (!statics.has(ctor)) statics.set(ctor, new Set());
+    statics.get(ctor).add('from').add('of');
+  }
+
+  // and their static values (Number.EPSILON, Uint8Array.BYTES_PER_ELEMENT), read off the
+  // constructor itself: each only in a program that reads a member of its name. Not
+  // Symbol's well-known symbols: a builtin reading one does not bring in its initialiser
+  const staticValues = new Map([
+    [ 'Number', [ 'NaN', 'POSITIVE_INFINITY', 'NEGATIVE_INFINITY', 'MAX_VALUE', 'MIN_VALUE', 'MAX_SAFE_INTEGER', 'MIN_SAFE_INTEGER', 'EPSILON' ] ],
+    ...typedArrays.map(x => [ x, [ 'BYTES_PER_ELEMENT' ] ])
+  ]);
+
   out += `
 
 export const __Porffor_object_builtinStatics = (f: any, store: object): void => {`;
@@ -82,6 +98,8 @@ export const __Porffor_object_builtinStatics = (f: any, store: object): void => 
     if (f == ${ctor}) {`;
     for (const method of methods) out += `
       if (Porffor.comptime.flag\`hasFunc.__${ctor}_${method}\`) __Porffor_object_fastAdd(store, '${method}', __${ctor}_${method}, 0b1010);`;
+    for (const value of staticValues.get(ctor) ?? []) out += `
+      if (Porffor.comptime.flag\`member.${value}\`) __Porffor_object_fastAdd(store, '${value}', ${ctor}.${value}, 0b0000);`;
     out += `
       return;
     }

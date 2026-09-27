@@ -817,6 +817,7 @@ return sign * (i64)((((u64)*(u32*)(MEM + ptr + 4)) << 32) + (u64)*(u32*)(MEM + p
     };
 
     Object.defineProperty(_, name, {
+      configurable: true,
       get() {
         return v;
       },
@@ -824,6 +825,9 @@ return sign * (i64)((((u64)*(u32*)(MEM + ptr + 4)) << 32) + (u64)*(u32*)(MEM + p
         x.comptime = comptime;
         x.returnType = returnType;
         v = x;
+        // a real function now (Array.of): listed like any builtin, so a static read through
+        // its constructor as a value finds it
+        Object.defineProperty(_, name, { enumerable: true });
       }
     });
   };

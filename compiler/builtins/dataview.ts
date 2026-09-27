@@ -21,8 +21,19 @@ export const DataView = function (arg: any, byteOffset: any, length: any): DataV
   const out: DataView = Porffor.malloc(12);
   Porffor.IR.storeI32(out, 4, Porffor.IR.ptr(arg) + offset);
   Porffor.IR.storeI32(out, 8, offset);
-  Porffor.IR.storeI32(out, 0, len);
+  // on a resizable buffer with no length given, the view follows the buffer's length (-1)
+  const tracks: boolean = Porffor.fastAnd(Porffor.type(length) == Porffor.TYPES.undefined, __Porffor_arraybuffer_maxOf(arg) !== undefined);
+  Porffor.IR.storeI32(out, 0, tracks ? -1 : len);
   return out;
+};
+
+// The view's byte length now, or -1 when its buffer is detached or has shrunk past it
+export const __Porffor_dataview_len = (view: DataView): i32 => {
+  const offset: i32 = Porffor.IR.loadI32(view, 8);
+  const bufferLen: i32 = Porffor.IR.loadI32(Porffor.IR.loadI32(view, 4) - offset, 0); // -1 once detached
+  const stored: i32 = Porffor.IR.loadI32(view, 0);
+  if (stored == -1) return bufferLen >= offset ? bufferLen - offset : -1;
+  return offset + stored <= bufferLen ? stored : -1;
 };
 
 export const __DataView_prototype_buffer$get = function (this: DataView) {
@@ -30,16 +41,20 @@ export const __DataView_prototype_buffer$get = function (this: DataView) {
 };
 
 export const __DataView_prototype_byteLength$get = function (this: DataView) {
-  return Porffor.IR.loadI32(this, 0);
+  const len: i32 = __Porffor_dataview_len(this);
+  if (len < 0) throw new TypeError('DataView is out of bounds of its buffer, or the buffer is detached');
+  return len;
 };
 
 export const __DataView_prototype_byteOffset$get = function (this: DataView) {
+  if (__Porffor_dataview_len(this) < 0) throw new TypeError('DataView is out of bounds of its buffer, or the buffer is detached');
   return Porffor.IR.loadI32(this, 8);
 };
 
 export const __Porffor_dataview_ptr = function (this: DataView, byteOffset: number, size: i32): i32 {
-  if (Porffor.callThis(__DataView_prototype_buffer$get, this).detached) throw new TypeError('Cannot operate on a detached ArrayBuffer');
-  if (byteOffset + size > Porffor.IR.loadI32(this, 0)) throw new RangeError('Byte offset is out of bounds of the DataView');
+  const len: i32 = __Porffor_dataview_len(this);
+  if (len < 0) throw new TypeError('DataView is out of bounds of its buffer, or the buffer is detached');
+  if (byteOffset + size > len) throw new RangeError('Byte offset is out of bounds of the DataView');
   return Porffor.IR.loadI32(this, 4) + byteOffset;
 };
 
