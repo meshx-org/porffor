@@ -188,6 +188,34 @@ const reuseNamed = (scope, expr) => {
 
 const assign = (scope, target, value) => stmt(scope, Assign(target, value));
 
+// A write barrier on an object allocated since the last point a collection could run does
+// nothing: the object is young (card scans skip young objects) and its GC kind is already its
+// type. freshMark, right after the allocation, notes where the code stands; stillFresh says
+// whether nothing emitted since can collect (no call or allocation, nested bodies included),
+// so the barrier can be left out. A different block (a branch opened since) is not fresh.
+const mayCollect = node => {
+  if (!Array.isArray(node)) return false;
+  if (typeof node[N_KIND] === 'number' && typeof node[N_FX] === 'number') {
+    if ((node[N_FX] & FX.call) !== 0) return true;
+    for (let i = 3; i < node.length; i++) if (mayCollect(node[i])) return true;
+    return false;
+  }
+  for (const x of node) if (mayCollect(x)) return true;
+  return false;
+};
+const freshMark = scope => {
+  const block = curBlock(scope);
+  return { block, pos: block.length, dead: false };
+};
+const stillFresh = (scope, mark) => {
+  if (mark == null || mark.dead || curBlock(scope) !== mark.block) return false;
+  const block = mark.block;
+  for (; mark.pos < block.length; mark.pos++) {
+    if (mayCollect(block[mark.pos])) { mark.dead = true; return false; }
+  }
+  return true;
+};
+
 const emitIf = (scope, cond, thenFn, elseFn = null) => {
   const then = collect(scope, thenFn);
   const els = elseFn ? collect(scope, elseFn) : null;
@@ -408,6 +436,7 @@ const currentClosureEnv = scope => {
 // [parent u32][count u32][payload f64, type u8, padding x7]...
 const makeClosureEnv = (scope, parent, count, values = null) => {
   const pointer = reuse(scope, Alloc(Const(T.i32, 8 + count * 16), TYPES.__porffor_closureenv));
+  const allocated = freshMark(scope);
   stmt(scope, Store('u32', pointer, 0, JvPtr(parent)));
   if (values) {
     for (let i = 0; i < values.length; i++) {
@@ -424,7 +453,7 @@ const makeClosureEnv = (scope, parent, count, values = null) => {
     ], fresh(scope)));
   }
   stmt(scope, Store('u32', pointer, 4, Const(T.i32, count)));
-  stmt(scope, GcBarrier(pointer, Const(T.i32, TYPES.__porffor_closureenv)));
+  if (!stillFresh(scope, allocated)) stmt(scope, GcBarrier(pointer, Const(T.i32, TYPES.__porffor_closureenv)));
   typeUsed(scope, TYPES.__porffor_closureenv);
   return valOf(pointer, TYPES.__porffor_closureenv);
 };
@@ -1935,12 +1964,13 @@ const getLastNode = body => {
 const makeArrayFromValues = (scope, values) => {
   const capacity = Math.max(values.length, 2);
   const pointer = reuse(scope, Alloc(Const(T.i32, 16 + capacity * 8), TYPES.array));
+  const allocated = freshMark(scope);
   stmt(scope, LenSet(pointer, Const(T.i32, 0)));
   stmt(scope, Store('u32', pointer, 4, Bin('+', T.u32, pointer, Const(T.u32, 16))));
   stmt(scope, Store('i32', pointer, 8, Const(T.i32, capacity)));
   for (let i = 0; i < values.length; i++) stmt(scope, ArrSet(pointer, Const(T.u32, i), values[i]));
   stmt(scope, LenSet(pointer, Const(T.i32, values.length)));
-  if (values.some(v => v[N_TYPE] === T.jsval || v[N_TYPE] === T.ptr))
+  if (values.some(v => v[N_TYPE] === T.jsval || v[N_TYPE] === T.ptr) && !stillFresh(scope, allocated))
     stmt(scope, GcBarrier(pointer, Const(T.i32, TYPES.array)));
   typeUsed(scope, TYPES.array);
   return valOf(pointer, TYPES.array);
@@ -3257,7 +3287,8 @@ const generateAssign = (scope, decl, valueUnused = false) => {
     const value = reuse(scope, op === '=' ? right : performOp(scope, op, previous, right, null, getNodeType(scope, decl.right)));
     stmt(scope, Store('f64', JvPtr(env), 8 + slot * 16, JvNum(value)));
     stmt(scope, Store('u8', JvPtr(env), 16 + slot * 16, JvType(value)));
-    stmt(scope, If(canReferenceCheck(scope, value), [
+    const freshEnv = env[N_KIND] === K.Local && env[N_A] === '#closure_env_local' && stillFresh(scope, scope.freshEnv);
+    if (!freshEnv) stmt(scope, If(canReferenceCheck(scope, value), [
       GcBarrier(JvPtr(env), Const(T.i32, TYPES.__porffor_closureenv))
     ]));
     return valueUnused ? valUndefined() : value;
@@ -4455,6 +4486,7 @@ const generateArray = (scope, decl, name = '$undeclared', staticAlloc = false) =
   } else {
     pointer = reuse(scope, Alloc(Const(T.i32, allocSize), TYPES.array));
   }
+  const allocated = isStatic ? null : freshMark(scope);
 
   stmt(scope, LenSet(pointer, Const(T.i32, 0)));
   stmt(scope, Store('u32', pointer, 4, Bin('+', T.u32, pointer, Const(T.u32, 16))));
@@ -4478,8 +4510,9 @@ const generateArray = (scope, decl, name = '$undeclared', staticAlloc = false) =
 
   // a collection during element evaluation can sticky-promote this fresh array to old,
   // raw stores of young pointers into it must then be remembered, so flag it to the GC
-  // once after construction. skipped for static arrays / all-non-reference entries, no-op sans GC
-  if (!isStatic && i > 0 &&
+  // once after construction. skipped for static arrays / all-non-reference entries, no-op sans GC,
+  // and when nothing in the elements could collect (the array is still young)
+  if (!isStatic && i > 0 && !stillFresh(scope, allocated) &&
       elements.slice(0, i).some(x => {
         if (x == null) return false;
         if (x.type === 'Literal' && typeof x.value === 'number') return false;
@@ -4526,6 +4559,8 @@ const denseArrayIndexKey = (scope, prop) => {
 
 const generateObject = (scope, decl) => {
   const obj = reuse(scope, builtinCall(scope, '__Porffor_object_new', [ Const(T.i32, Math.max(decl.properties.length, 2)) ]));
+  // __Porffor_object_new allocates it as an object: fresh, as makeArrayFromValues' array is
+  const allocated = freshMark(scope);
   const keys = new Set();
   let slot = 0;
 
@@ -4575,7 +4610,7 @@ const generateObject = (scope, decl) => {
       stmt(scope, Store('u8', entries, slot * 20 + 17, JvType(val)));
       stmt(scope, Store('u8', entries, slot * 20 + 18, JvType(prop)));
       stmt(scope, Store('u16', JvPtr(obj), 0, Const(T.i32, ++slot)));
-      stmt(scope, If(canReferenceCheck(scope, val), [ GcBarrier(JvPtr(obj), Const(T.i32, TYPES.object)) ]));
+      if (!stillFresh(scope, allocated)) stmt(scope, If(canReferenceCheck(scope, val), [ GcBarrier(JvPtr(obj), Const(T.i32, TYPES.object)) ]));
     } else {
       slot = -1;
       exprStmt(scope, builtinCall(scope, `__Porffor_object_expr_${kind}`, [
@@ -5493,6 +5528,8 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
         const parent = reuse(func, func.closureAware ? valOf(Local('#env', T.ptr), TYPES.__porffor_closureenv) : valUndefined());
         allocVar(func, '#closure_env_local');
         setLocalWithType(func, '#closure_env_local', false, makeClosureEnv(func, parent, count), false, TYPES.__porffor_closureenv);
+        // the parameters copied in next need no barrier while nothing can collect
+        func.freshEnv = freshMark(func);
       }
 
       // a named function expression sees its own name
