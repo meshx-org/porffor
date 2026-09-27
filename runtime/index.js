@@ -37,7 +37,7 @@ const help = () => {
   // flags
   console.log(`\n\x1B[1m\x1B[4mFlags\x1B[0m`);
   for (let [ flag, desc ] of Object.entries({
-    'On': 'Optimization level, use -O(0|\x1B[1m1\x1B[0m|2|3)',
+    'On': 'Optimization level, use -O(0|1|2|\x1B[1m3\x1B[0m|s|z): s and z trade speed for smaller code',
     t: 'Force parsing input as TypeScript',
     d: 'Debug mode (include names and debug logs)',
     module: 'Parse input as a module',

@@ -136,6 +136,10 @@ export default (code, module = Prefs.module, opts = {}) => {
     if (Prefs.musl) compiler = [ 'zig', 'cc', '-target', 'x86_64-linux-musl' ];
     if (Prefs.musl) cxx = [ 'zig', 'c++', '-target', 'x86_64-linux-musl' ];
     const isTinyCC = compiler[0].endsWith('tcc');
+    // -O: 0-3 for speed (3 the default), s and z for smaller code at some speed. Not fast:
+    // its fast-math breaks NaN, -0 and rounding, which JS defines
+    const optLevel = String(Prefs.O ?? 3);
+    if (!/^[0-3sz]$/.test(optLevel)) throw new Error(`unknown -O${optLevel} (0, 1, 2, 3, s or z)`);
     // split builds skip lto by default: it costs seconds at every link for ~1% throughput
     if (!Prefs.d && Prefs.flto == null) Prefs.flto = !Prefs.musl && !isTinyCC && !split;
 
@@ -159,7 +163,7 @@ export default (code, module = Prefs.module, opts = {}) => {
       '-fno-ident', '-ffunction-sections', '-fdata-sections',
       ...darwinReleaseCompileArgs,
       ...compilerArgs,
-      `-O${Prefs.O ?? 3}`
+      `-O${optLevel}`
     ];
 
     // content-cached units: only changed ones recompile, all of them when porf.h or flags change
@@ -221,7 +225,7 @@ export default (code, module = Prefs.module, opts = {}) => {
         '-o', outFile ?? (process.platform === 'win32' ? 'out.exe' : 'out'),
         '-pthread',
         ...compilerArgs,
-        `-O${Prefs.O ?? 3}`,
+        `-O${optLevel}`,
         ...linkStripArgs,
         ...objects,
         uSocketsArchive,
@@ -244,7 +248,7 @@ export default (code, module = Prefs.module, opts = {}) => {
         ...(objects ?? [ '-xc', '-', ...compileOnlyArgs ]),
         '-o', outFile ?? (process.platform === 'win32' ? 'out.exe' : 'out'), // set path for output
         '-lm', // link math.h
-        ...(objects ? [ ...compilerArgs, `-O${Prefs.O ?? 3}` ] : []),
+        ...(objects ? [ ...compilerArgs, `-O${optLevel}` ] : []),
         ...(isTinyCC ? [] : linkStripArgs)
       ];
 
