@@ -38,11 +38,14 @@ export const BuiltinVars = ({ builtinFuncs }) => {
     return global(`#wellknown_${x}`, T.jsval, Call('Symbol', [ makeString(`Symbol.${x}`) ], T.jsval));
   };
 
+  // the namespace objects made (Math, JSON, Reflect): globalThis has them
+  const namespaces = [];
   const object = (name, props) => {
     const prefix = name === 'globalThis' ? '' : makePrefix(name);
     const lazyKind = name === 'globalThis' ? 'global' : null;
 
     const existingFunc = builtinFuncs[name];
+    if (!existingFunc && !name.startsWith('__') && name !== 'globalThis') namespaces.push(name);
 
     const getName = '#get_' + name;
     builtinFuncs[getName] = existingFunc ? {
@@ -133,8 +136,9 @@ export const BuiltinVars = ({ builtinFuncs }) => {
               adds.length = 0;
               for (const y of slots) if (y) adds.push(y);
             };
-            if (key in builtinFuncs) whenFact([ [ 'hasFunc', key ] ], emit);
-              else if (('#get_' + key) in builtinFuncs) whenFact([ [ 'hasFunc', '#get_' + key ] ], emit);
+            // a global in the program, or read by name (globalThis.Math: it brings it in)
+            if (key in builtinFuncs) whenFact([ [ 'hasFunc', key ], [ 'member', x ] ], emit);
+              else if (('#get_' + key) in builtinFuncs) whenFact([ [ 'hasFunc', '#get_' + key ], [ 'member', x ] ], emit);
               else emit();
           });
           out.push(BlockStmt(adds));
@@ -495,7 +499,14 @@ export const BuiltinVars = ({ builtinFuncs }) => {
       writable: true,
       enumerable: true,
       configurable: true
-    }, enumerableGlobals)
+    }, enumerableGlobals),
+
+    // the namespaces (Math, JSON, Reflect, Atomics)
+    ...props({
+      writable: true,
+      enumerable: false,
+      configurable: true
+    }, namespaces.filter(x => !enumerableGlobals.includes(x)))
   });
 
   return _;

@@ -26,6 +26,7 @@
 export const NATIVE_ERRORS = [ 'AggregateError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError', 'SuppressedError' ];
 export const ERRORS = [ 'Error', ...NATIVE_ERRORS ];
 export const TYPED_ARRAY_KINDS = [ 'Uint8', 'Int8', 'Uint8Clamped', 'Uint16', 'Int16', 'Uint32', 'Int32', 'Float32', 'Float64', 'BigInt64', 'BigUint64' ].map(x => x + 'Array');
+const BYTES_PER_ELEMENT = { Uint8Array: 1, Int8Array: 1, Uint8ClampedArray: 1, Uint16Array: 2, Int16Array: 2, Uint32Array: 4, Int32Array: 4, Float32Array: 4, Float64Array: 8, BigInt64Array: 8, BigUint64Array: 8 };
 
 // the prototypes whose [Symbol.toStringTag] is a plain string (Object.prototype.toString
 // reads it, so a program can delete or change it); the others have a builtinTag of their own
@@ -76,6 +77,7 @@ export const prototypeDescriptors = (funcNames, isConstructor) => {
     // per spec Array.prototype is an array exotic object with length 0
     if (base === 'Array') data.push({ key: 'length', kind: 'data', value: 0, attrs: { writable: true, enumerable: false, configurable: false } });
 
+
     const ctor = prototypeCtor(name);
     const hasCtor = isConstructor(ctor);
     const own = new Set(data.map(x => x.key));
@@ -107,6 +109,8 @@ export const prototypeDescriptors = (funcNames, isConstructor) => {
 
     props.push(...data);
     if (hasCtor) props.push({ key: 'constructor', kind: 'data', func: ctor, attrs: METHOD_ATTRS });
+    // a typed array kind's prototype has its element size, as its constructor does
+    if (isTypedArrayKind) props.push({ key: 'BYTES_PER_ELEMENT', kind: 'data', value: BYTES_PER_ELEMENT[base], attrs: { writable: false, enumerable: false, configurable: false } });
 
     for (const [ symbol, method ] of SYMBOL_METHODS[base] ?? [])
       props.push({ symbol, kind: 'method', func: name + '_' + method, attrs: METHOD_ATTRS, always: true });
