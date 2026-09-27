@@ -2,6 +2,7 @@ import * as PrecompiledBuiltins from './builtins_precompiled.js';
 import { TYPES, TYPE_NAMES } from './types.js';
 import { Bin, Un, T, K, Const, JvConst, Box, JvType, JvNum, JvPtr, JvIsNum, Select, Convert, Reinterpret, CONVERT_SIGNED, N_KIND, N_TYPE, N_A, N_B, Local, Assign, Call, CallDynamic, If, TypeSwitch, Return, RawC, BlockStmt } from './ir.js';
 import './prefs.js';
+import { prototypeDescriptors, NAMESPACE_TO_STRING_TAGS } from './builtinDescriptors.js';
 
 const f64FromBytes = bytes => {
   const floats = new Float64Array(1);
@@ -31,27 +32,15 @@ export const BuiltinVars = ({ builtinFuncs }) => {
   // builtin objects
   const makePrefix = name => (name.startsWith('__') ? '' : '__') + name + '_';
 
-  // the objects whose [Symbol.toStringTag] is a plain string: Object.prototype.toString reads
-  // it (so a program can delete or change it); the others have a builtinTag of their own
-  const toStringTags = {
-    Math: 'Math', JSON: 'JSON', Reflect: 'Reflect', Atomics: 'Atomics'
-  };
-  for (const x of [ 'Map', 'Set', 'WeakMap', 'WeakSet', 'WeakRef', 'Promise', 'ArrayBuffer', 'SharedArrayBuffer', 'DataView', 'BigInt', 'Symbol', 'TextEncoder', 'TextDecoder', 'DisposableStack', 'AsyncDisposableStack' ])
-    toStringTags[`__${x}_prototype`] = x;
-
-  // symbol-keyed methods, the same function as a string-keyed one: using reads them (inside
-  // a builtin, so no member demand), so they are always there
-  const symbolMethods = {
-    __DisposableStack_prototype: [ 'dispose', '__DisposableStack_prototype_dispose' ],
-    __AsyncDisposableStack_prototype: [ 'asyncDispose', '__AsyncDisposableStack_prototype_disposeAsync' ]
+  // a well-known symbol's value (Symbol.toStringTag): a global each
+  const wellKnownSymbol = (includeBuiltin, global, makeString, x) => {
+    includeBuiltin('Symbol');
+    return global(`#wellknown_${x}`, T.jsval, Call('Symbol', [ makeString(`Symbol.${x}`) ], T.jsval));
   };
 
-  const done = new Set();
   const object = (name, props) => {
-    done.add(name);
     const prefix = name === 'globalThis' ? '' : makePrefix(name);
-    const lazyKind = name === 'globalThis' ? 'global'
-      : name.startsWith('__') && name.endsWith('_prototype') ? 'proto' : null;
+    const lazyKind = name === 'globalThis' ? 'global' : null;
 
     const existingFunc = builtinFuncs[name];
 
@@ -114,18 +103,6 @@ export const BuiltinVars = ({ builtinFuncs }) => {
         includeBuiltin('__Porffor_object_fastAdd');
         const emitProp = (out, x, d) => {
           const key = prefix + x;
-
-          // a prototype's x$get is its accessor x; none over a data property of that name (the
-          // errors' name, message and constructor: their getters are for errors themselves)
-          if (lazyKind === 'proto' && x.endsWith('$get') && key in builtinFuncs) {
-            if (x.slice(0, -4) in props) return;
-            // a typed array kind's are %TypedArray%.prototype's (inherited)
-            if (/Array_prototype$/.test(name) && name !== '__Array_prototype' && name !== '__Porffor_TypedArray_prototype') return;
-            includeBuiltin('__Porffor_object_fastAddAccessor');
-            out.push(Call('__Porffor_object_fastAddAccessor', [ obj, makeString(x.slice(0, -4)), funcValue(key), Const(T.i32, 0b0010) ], T.none));
-            return;
-          }
-
           const value = propValue(key, d);
 
           if (x === '__proto__') {
@@ -143,29 +120,16 @@ export const BuiltinVars = ({ builtinFuncs }) => {
         };
 
         if (lazyKind && Prefs.lazyObjects) {
-          // entries only for included methods/globals, explicit X.prototype marks the proto full -> everything
-          // (%TypedArray%'s constructor keeps its __ prefix: it is no global)
-          const ctorName = lazyKind === 'proto' ? (name === '__Porffor_TypedArray_prototype' ? '__Porffor_TypedArray' : name.slice(2, name.indexOf('_prototype'))) : null;
+          // globalThis: entries only for included globals
           const adds = [];
           onFinalize(() => {
             adds.length = 0;
             for (const x in props) {
               const key = prefix + x;
-              if (lazyKind === 'proto') {
-                if (key in builtinFuncs) {
-                  if (fullPrototypes.has(getName)) includeBuiltin(key);
-                    else if (!hasFunc(key)) continue;
-                }
-                if (x === 'constructor') {
-                  if (fullPrototypes.has(getName)) includeBuiltin(ctorName);
-                    else if (!hasFunc(ctorName)) continue;
-                }
-              } else {
-                if (key in builtinFuncs) {
-                  if (!hasFunc(key)) continue;
-                } else if (('#get_' + key) in builtinFuncs) {
-                  if (!hasFunc('#get_' + key)) continue;
-                }
+              if (key in builtinFuncs) {
+                if (!hasFunc(key)) continue;
+              } else if (('#get_' + key) in builtinFuncs) {
+                if (!hasFunc('#get_' + key)) continue;
               }
               emitProp(adds, x, props[x]);
             }
@@ -175,25 +139,13 @@ export const BuiltinVars = ({ builtinFuncs }) => {
           for (const x in props) emitProp(out, x, props[x]);
         }
 
-        const wellKnown = x => {
-          includeBuiltin('Symbol');
-          return global(`#wellknown_${x}`, T.jsval, Call('Symbol', [ makeString(`Symbol.${x}`) ], T.jsval));
-        };
-
-
-        const symbolMethod = symbolMethods[name];
-        if (symbolMethod)
-          out.push(Call('__Porffor_object_fastAdd', [ obj, wellKnown(symbolMethod[0]), funcValue(symbolMethod[1]), Const(T.i32, 0b1010) ], T.none));
-
         // only a program that names .toStringTag can read one
-        const tag = toStringTags[name];
-        if (tag) {
+        if (NAMESPACE_TO_STRING_TAGS.includes(name)) {
           const tagAdd = [];
           onFinalize(() => {
             tagAdd.length = 0;
             if (!memberDemanded('toStringTag')) return;
-            const symbol = wellKnown('toStringTag');
-            tagAdd.push(Call('__Porffor_object_fastAdd', [ obj, symbol, makeString(tag), Const(T.i32, 0b0010) ], T.none));
+            tagAdd.push(Call('__Porffor_object_fastAdd', [ obj, wellKnownSymbol(includeBuiltin, global, makeString, 'toStringTag'), makeString(name), Const(T.i32, 0b0010) ], T.none));
           });
           out.push(BlockStmt(tagAdd));
         }
@@ -205,7 +157,6 @@ export const BuiltinVars = ({ builtinFuncs }) => {
     };
 
    _[name] = (_scope, { includeBuiltin }) => {
-      if (lazyKind === 'proto') fullPrototypes.add(getName);
       includeBuiltin('#get_' + name);
       return Box(Call('#get_' + name, [], T.ptr), Const(T.i32, existingFunc ? TYPES.function : TYPES.object));
     };
@@ -341,83 +292,107 @@ export const BuiltinVars = ({ builtinFuncs }) => {
     wellKnownSymbolProps[x].value.type = TYPES.symbol;
   }
 
-  // automatically generate objects for prototypes
-  for (const x of builtinFuncKeys.reduce((acc, x) => {
-    const ind = x.indexOf('_prototype_');
-    if (ind === -1) return acc;
+  const attrFlags = a => (a.configurable ? 0b0010 : 0) | (a.enumerable ? 0b0100 : 0) | (a.writable ? 0b1000 : 0);
 
-    acc.add(x.slice(0, ind + 10));
-    return acc;
-  }, new Set())) {
-    const props = autoFuncs(x);
+  // a prototype object, built from its descriptor (builtinDescriptors.js). Its properties go
+  // on when the program is known: a method or accessor only when its function is in the
+  // program, or all of them when the program reads the object itself (X.prototype)
+  const prototypeObject = desc => {
+    const { name } = desc;
+    const getName = '#get_' + name;
+    builtinFuncs[getName] = {
+      params: [],
+      localNames: [ 'obj' ],
+      localTypes: [ T.jsval ],
+      retType: T.ptr,
+      returnType: TYPES.object,
+      body: ({ includeBuiltin, funcRefPtr, global, makeString, onFinalize, hasFunc, memberDemanded, programFlag }) => {
+        if (globalThis.precompile) return [ Return(Const(T.ptr, 0)) ];
 
-    // special case: Object.prototype.__proto__ = null
-    if (x === '__Object_prototype') {
-      Object.defineProperty(props, '__proto__', { value: { value: null, configurable: true }, enumerable: true });
+        includeBuiltin('__Porffor_object_new');
+        const getPtr = global(`getptr_${name}`, T.ptr);
+        const obj = Local('obj', T.jsval);
+        const out = [
+          If(getPtr, [ Return(getPtr) ]),
+          Assign(obj, Call('__Porffor_object_new', [ Const(T.i32, desc.props.length) ])),
+          Assign(getPtr, JvPtr(obj))
+        ];
+
+        const funcValue = f => Box(funcRefPtr(f), Const(T.i32, TYPES.function));
+        const objectValue = o => {
+          includeBuiltin('#get_' + o);
+          return Box(Call('#get_' + o, [], T.ptr), Const(T.i32, TYPES.object));
+        };
+        const keyValue = p => p.symbol ? wellKnownSymbol(includeBuiltin, global, makeString, p.symbol) : makeString(p.key);
+        const dataValue = p => p.func ? funcValue(p.func)
+          : typeof p.value === 'number' ? Box(Const(T.f64, p.value), Const(T.i32, TYPES.number))
+          : typeof p.value === 'string' ? makeString(p.value)
+          : JvConst(TYPES.object, 0);
+
+        const adds = [];
+        onFinalize(() => {
+          adds.length = 0;
+          const full = !Prefs.lazyObjects || fullPrototypes.has(getName);
+
+          // its parent (a new object's is Object.prototype already)
+          let parent = desc.parent;
+          if (parent?.flag && !programFlag(parent.flag)) parent = parent.otherwise ? { object: parent.otherwise } : undefined;
+          if (parent !== undefined) {
+            includeBuiltin('__Porffor_object_setPrototype');
+            adds.push(Call('__Porffor_object_setPrototype', [ obj, parent === null ? JvConst(TYPES.object, 0) : objectValue(parent.object) ], T.none));
+          }
+
+          for (const p of desc.props) {
+            if (p.demand && !memberDemanded(p.demand)) continue;
+            const f = p.func ?? p.get;
+            if (f && !p.always) {
+              if (full) includeBuiltin(f);
+                else if (!hasFunc(f)) continue;
+            }
+
+            if (p.kind === 'accessor') {
+              includeBuiltin('__Porffor_object_fastAddAccessor');
+              adds.push(Call('__Porffor_object_fastAddAccessor', [ obj, keyValue(p), funcValue(p.get), Const(T.i32, attrFlags(p.attrs)) ], T.none));
+            } else {
+              includeBuiltin('__Porffor_object_fastAdd');
+              adds.push(Call('__Porffor_object_fastAdd', [ obj, keyValue(p), p.kind === 'method' ? funcValue(p.func) : dataValue(p), Const(T.i32, attrFlags(p.attrs)) ], T.none));
+            }
+          }
+        });
+
+        out.push(BlockStmt(adds));
+        out.push(Return(getPtr));
+        return out;
+      }
+    };
+
+    // the object read as a value (X.prototype): all of it
+    _[name] = (_scope, { includeBuiltin }) => {
+      fullPrototypes.add(getName);
+      includeBuiltin(getName);
+      return Box(Call(getName, [], T.ptr), Const(T.i32, TYPES.object));
+    };
+    _[name].type = TYPES.object;
+
+    // its data properties read statically (TypeError.prototype.name, Map.prototype.constructor)
+    for (const p of desc.props) {
+      if (p.kind !== 'data' || p.symbol) continue;
+      const k = name + '_' + p.key;
+      if (k in builtinFuncs || k in _) continue;
+      if (p.func) {
+        _[k] = (_scope, { funcRefPtr }) => Box(funcRefPtr(p.func), Const(T.i32, TYPES.function));
+        _[k].type = TYPES.function;
+      } else if (typeof p.value === 'number') {
+        _[k] = () => Box(Const(T.f64, p.value), Const(T.i32, TYPES.number));
+        _[k].type = TYPES.number;
+      } else if (typeof p.value === 'string') {
+        _[k] = (_scope, { makeString }) => makeString(p.value);
+        _[k].type = TYPES.bytestring;
+      }
     }
+  };
 
-    // special case: the native errors' prototypes inherit from Error.prototype, so a
-    // TypeError is instanceof Error (and inherits Error.prototype's members)
-    if ([ 'AggregateError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError', 'SuppressedError' ].some(e => x === `__${e}_prototype`)) {
-      const errorProto = (_scope, { includeBuiltin }) => {
-        includeBuiltin('#get___Error_prototype');
-        return Box(Call('#get___Error_prototype', [], T.ptr), Const(T.i32, TYPES.object));
-      };
-      Object.defineProperty(props, '__proto__', { value: { value: errorProto, configurable: true }, enumerable: true });
-    }
-
-    // the errors' prototypes have their name and the message '' as data properties (a
-    // subclass instance, a plain object, reads them there; an error's getters are for errors)
-    if ([ 'Error', 'AggregateError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError', 'SuppressedError' ].some(e => x === `__${e}_prototype`)) {
-      props.name = { value: x.slice(2, -10), writable: true, configurable: true };
-      props.message = { value: '', writable: true, configurable: true };
-    }
-
-    // the typed arrays' prototypes inherit from %TypedArray%.prototype, which has the
-    // methods they share (a dispatcher each), and its constructor is %TypedArray%
-    if (/^__(Uint8|Int8|Uint8Clamped|Uint16|Int16|Uint32|Int32|Float32|Float64|BigInt64|BigUint64)Array_prototype$/.test(x)) {
-      // (only in a program that can reach %TypedArray%: else Object.prototype, as before)
-      const typedArrayProto = (_scope, { includeBuiltin, programFlag }) => {
-        const proto = programFlag('typedArrayCtorValue') ? '#get___Porffor_TypedArray_prototype' : '#get___Object_prototype';
-        includeBuiltin(proto);
-        return Box(Call(proto, [], T.ptr), Const(T.i32, TYPES.object));
-      };
-      Object.defineProperty(props, '__proto__', { value: { value: typedArrayProto, configurable: true }, enumerable: true });
-    }
-    if (x === '__Porffor_TypedArray_prototype') {
-      const value = (_scope, { funcRefPtr }) => Box(funcRefPtr('__Porffor_TypedArray'), Const(T.i32, TYPES.function));
-      value.type = TYPES.function;
-      props.constructor = { value, writable: true, enumerable: false, configurable: true };
-    }
-
-    // special case: Function.prototype.length = 0
-    // special case: Function.prototype.name = ''
-    if (x === '__Function_prototype') {
-      props.length = { value: 0, configurable: true };
-      props.name = { value: '', configurable: true };
-    }
-
-    // per spec Array.prototype is an array exotic object with length = 0
-    if (x === '__Array_prototype') {
-      props.length = { value: 0, writable: true, configurable: false };
-    }
-
-    // add constructor for constructors
-    const name = x.slice(2, x.indexOf('_', 2));
-    if (builtinFuncs[name]?.constr) {
-      const value = (_scope, { funcRefPtr }) => Box(funcRefPtr(name), Const(T.i32, TYPES.function));
-      value.type = TYPES.function;
-
-      props.constructor = {
-        value,
-        writable: true,
-        enumerable: false,
-        configurable: true
-      };
-    }
-
-    object(x, props);
-  }
+  for (const desc of prototypeDescriptors(builtinFuncKeys, x => !!builtinFuncs[x]?.constr).values()) prototypeObject(desc);
 
 
   object('Number', {
