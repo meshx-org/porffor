@@ -106,8 +106,30 @@ const cReservedNames = new Set([
   // time.h continued
   'mktime', 'ctime', 'asctime', 'strftime', 'strptime', 'difftime', 'timegm', 'timelocal',
   'tzset', 'daylight', 'timezone', 'tzname', 'nanosleep', 'clock_gettime', 'clock_settime',
-  'clock_getres', 'ctime_r', 'asctime_r', 'gmtime_r', 'localtime_r', 'gettimeofday'
+  'clock_getres', 'ctime_r', 'asctime_r', 'gmtime_r', 'localtime_r', 'gettimeofday',
+  // unistd continued (revoke: Proxy.revocable code names its function that)
+  'revoke', 'acct', 'getpagesize', 'getdtablesize', 'getpass', 'getusershell', 'setusershell',
+  'endusershell', 'ttyslot', 'profil', 'vhangup', 'swapon', 'lockf', 'ctermid', 'tcgetpgrp',
+  'tcsetpgrp', 'setlogin', 'issetugid', 'getentropy', 'faccessat', 'fchownat', 'linkat',
+  'unlinkat', 'readlinkat', 'symlinkat', 'renameat', 'openat', 'fcntl', 'ioctl', 'select', 'poll',
+  // sys/types typedefs without the _t suffix
+  'uint', 'ushort', 'ulong', 'u_char', 'u_short', 'u_int', 'u_long', 'u_quad_t', 'quad_t',
+  'caddr_t', 'daddr_t', 'fixpt_t', 'register_t', 'segsz_t', 'swblk_t', 'unchar',
+  // math.h and assert.h macros spelled in lowercase
+  'isnan', 'isinf', 'isfinite', 'isnormal', 'signbit', 'fpclassify', 'isgreater',
+  'isgreaterequal', 'isless', 'islessequal', 'islessgreater', 'isunordered', 'assert',
+  'offsetof', 'va_arg', 'va_start', 'va_end', 'va_copy', 'va_list', 'noreturn', 'alignas',
+  'alignof', 'static_assert', 'complex', 'imaginary',
+  // ctype
+  'isalnum', 'isalpha', 'isblank', 'iscntrl', 'isdigit', 'isgraph', 'islower', 'isprint',
+  'ispunct', 'isspace', 'isupper', 'isxdigit', 'isascii', 'toascii', 'tolower', 'toupper'
 ]);
+
+// Whole classes of C names a JS name can collide with that no list keeps up with: an
+// all-caps name is how C spells a macro (INT32_MIN, UINT32_MAX, EOF, SIG_ERR, and the
+// runtime's own MEM), and a name ending in _t is reserved by POSIX for types. Such JS
+// names get a prefix of their own in the C
+const cCollisionProne = name => /^[A-Z][A-Z0-9_]*$/.test(name) || /_t$/.test(name);
 
 // inlining these has little perf benefit and significantly increases binary size
 const NEVER_INLINE = new Set([
@@ -130,6 +152,7 @@ export const sanitize = str => {
   }
   if (out.length === 0) out = 'anon';
   if (out[0] >= '0' && out[0] <= '9') out = '_' + out;
+  if (cCollisionProne(out)) out = 'J_' + out;
   // keep prefixing: one '_' can itself collide (exit -> _exit)
   while (cReservedNames.has(out) || sanitizeUsed.has(out)) out = '_' + out;
   sanitizeUsed.add(out);
