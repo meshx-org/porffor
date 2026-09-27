@@ -301,10 +301,66 @@ export const __Porffor_typedArray_validate = (ta: any): void => {
   if (__Porffor_typedArray_detached(ta)) throw new TypeError('Cannot perform %TypedArray%.prototype method on a detached ArrayBuffer');
 };`;
 
+  // %TypedArray%: the typed arrays' abstract parent (not a global: its name is the last
+  // segment). Its prototype has the methods every kind shares, each one calling the kind's
+  // own, read off the kind's prototype object by name (so no dispatcher names a kind)
+  out += `
+export const __Porffor_TypedArray = function (): any {
+  throw new TypeError('Abstract class TypedArray not directly constructable');
+};
+
+// this's kind's own method called name (an own property of its prototype object: the
+// chain would lead back to %TypedArray%.prototype) called on it, a TypeError for anything
+// else. One for all the dispatchers: none takes more than three arguments
+export const __Porffor_typedArray_call = (ta: any, name: any, a: any, b: any, c: any): any => {
+  const t: i32 = Porffor.type(ta);
+  if (Porffor.fastOr(t < Porffor.TYPES.uint8clampedarray, t > Porffor.TYPES.float64array))
+    throw new TypeError('%TypedArray%.prototype method called on a non-TypedArray');
+  const proto: any = __Porffor_object_getHiddenPrototype(t);
+  const entry: i32 = __Porffor_object_lookup(proto, name, __Porffor_object_hash(name));
+  if (entry == 0) throw new TypeError('%TypedArray%.prototype method called on a non-TypedArray');
+  const method: any = __Porffor_object_readValue(entry);
+  return Porffor.callThis(method, ta, a, b, c);
+};
+`;
+  // %TypedArray%.prototype's getters read the view itself (length, pointer, offset: the same
+  // for every kind), a TypeError for anything else; 0 for a view of a detached buffer
+  const getter = (name, body) => `
+export const __Porffor_TypedArray_prototype_${name}$get = function (this: any) {
+  const t: i32 = Porffor.type(this);
+  if (Porffor.fastOr(t < Porffor.TYPES.uint8clampedarray, t > Porffor.TYPES.float64array))
+    throw new TypeError('%TypedArray%.prototype.${name} called on a non-TypedArray');
+${body}
+};
+`;
+  const detachedZero = `  if (Porffor.comptime.flag\`hasFunc.__Porffor_arraybuffer_detach\`) if (__Porffor_typedArray_detached(this)) return 0;`;
+  out += getter('length', `${detachedZero}
+  return Porffor.IR.loadI32(this, 0);`);
+  out += getter('byteOffset', `${detachedZero}
+  return Porffor.IR.loadI32(this, 8);`);
+  out += getter('buffer', `  return Porffor.IR.loadI32(this, 4) - Porffor.IR.loadI32(this, 8) as ArrayBuffer;`);
+  out += getter('byteLength', `${detachedZero}
+  let size: i32 = 1;
+  if (Porffor.fastOr(t == Porffor.TYPES.uint16array, t == Porffor.TYPES.int16array)) size = 2;
+    else if (Porffor.fastOr(t == Porffor.TYPES.uint32array, t == Porffor.TYPES.int32array, t == Porffor.TYPES.float32array)) size = 4;
+    else if (Porffor.fastOr(t == Porffor.TYPES.float64array, t == Porffor.TYPES.bigint64array, t == Porffor.TYPES.biguint64array)) size = 8;
+  return Porffor.IR.loadI32(this, 0) * size;`);
+  const notShared = new Set([ 'concat', 'valueOf' ]);
+  for (const [ , method, params ] of out.matchAll(/export const __Uint8Array_prototype_([A-Za-z]+(?:\$get)?) = function \(this: Uint8Array,? ?([^)]*)\)/g)) {
+    if (notShared.has(method) || params.includes('...') || method.endsWith('$get')) continue;
+    if (params.split(',').filter(x => x.trim()).length > 3) throw new Error(`%TypedArray%.prototype.${method} takes more than __Porffor_typedArray_call passes`);
+    const names = params.split(',').map(x => x.trim()).filter(Boolean).map(x => x.split(':')[0].trim());
+    out += `
+export const __Porffor_TypedArray_prototype_${method} = function (this: any${names.map(x => `, ${x}: any`).join('')}) {
+  return __Porffor_typedArray_call(this, '${method}'${[ 0, 1, 2 ].map(i => ', ' + (names[i] ?? 'undefined')).join('')});
+};
+`;
+  }
+
   // every prototype method validates this first (not the getters, nor subarray: its new view
   // throws for a detached buffer itself), only in a program that can detach a buffer
   out = out.replace(/(export const __\w+Array_prototype_(\w+) = function \(this: \w+[^\n]*\{\n)/g, (m, head, method) =>
-    method.endsWith('$get') || method === 'subarray' ? m
+    method.endsWith('$get') || method === 'subarray' || head.includes('__Porffor_TypedArray_') ? m
       : head + '  if (Porffor.comptime.flag`hasFunc.__Porffor_arraybuffer_detach`) __Porffor_typedArray_validate(this);\n');
 
   return out;

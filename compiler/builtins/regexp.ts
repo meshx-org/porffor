@@ -3753,3 +3753,14 @@ export const __RegExp_escape = (str: any) => {
 
   return out;
 };
+
+// a RegExp getter called with this not a RegExp (its guard's path, out of line): on
+// RegExp.prototype itself source is "(?:)" and the flags undefined, else a TypeError
+export const __Porffor_regexp_offTypeGetter = (value: any, source: boolean): any => {
+  // (read as the type's hidden prototype: naming __RegExp_prototype would build all of it)
+  if (Porffor.type(value) == Porffor.TYPES.object) if (value === __Porffor_object_getHiddenPrototype(Porffor.TYPES.regexp)) {
+    if (source) return '(?:)';
+    return undefined;
+  }
+  throw new TypeError("RegExp.prototype getter expects 'this' to be a RegExp");
+};

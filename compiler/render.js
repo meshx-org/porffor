@@ -133,7 +133,13 @@ const cCollisionProne = name => /^[A-Z][A-Z0-9_]*$/.test(name) || /_t$/.test(nam
 
 // inlining these has little perf benefit and significantly increases binary size
 const NEVER_INLINE = new Set([
-  '__Porffor_object_get_ic', '__Porffor_object_get_icMiss', '__Porffor_object_get_withHash'
+  '__Porffor_object_get_ic', '__Porffor_object_get_icMiss', '__Porffor_object_get_withHash',
+  // every %TypedArray%.prototype dispatcher tail-calls it
+  '__Porffor_typedArray_call',
+  // each built-in prototype's getters are added through it (inlined, one per prototype)
+  '__Porffor_object_fastAddAccessor',
+  // every RegExp getter's guard path
+  '__Porffor_regexp_offTypeGetter'
 ]);
 
 const sanitizeMemo = new Map();
@@ -423,6 +429,8 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
   for (const f of linkFuncs) {
     let name = f.jsName ?? f.name;
     name = name.startsWith('__') ? name.split('_').pop() : name.split('#')[0];
+    // a getter's name is "get x" (Map.prototype.size's is "get size")
+    if (name.endsWith('$get')) name = 'get ' + name.slice(0, -4);
     if (name.length === 0) { fnNameOff.push(0); continue; }
     const bytes = [ name.length & 0xff, (name.length >>> 8) & 0xff, (name.length >>> 16) & 0xff, (name.length >>> 24) & 0xff ];
     for (let k = 0; k < name.length; k++) bytes.push(name.charCodeAt(k) & 0xff);

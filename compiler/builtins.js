@@ -69,7 +69,7 @@ export const BuiltinVars = ({ builtinFuncs }) => {
       localTypes: [ T.jsval ],
       retType: T.ptr,
       returnType: TYPES.object,
-      body: ({ includeBuiltin, funcRefPtr, global, makeString, globalThisUserSync, onFinalize, hasFunc, memberDemanded }) => {
+      body: ({ includeBuiltin, funcRefPtr, global, makeString, globalThisUserSync, onFinalize, hasFunc, memberDemanded, programFlag }) => {
         if (globalThis.precompile) return [ Return(Const(T.ptr, 0)) ];
 
         includeBuiltin('__Porffor_object_new');
@@ -102,7 +102,7 @@ export const BuiltinVars = ({ builtinFuncs }) => {
           }
           if ('value' in d) {
             const value = d.value;
-            if (typeof value === 'function') return value(_, { includeBuiltin, funcRefPtr, makeString });
+            if (typeof value === 'function') return value(_, { includeBuiltin, funcRefPtr, makeString, programFlag });
             if (typeof value === 'number') return Box(Const(T.f64, value), Const(T.i32, TYPES.number));
             if (typeof value === 'string') return makeString(value);
             if (value === null) return JvConst(TYPES.object, 0);
@@ -114,6 +114,18 @@ export const BuiltinVars = ({ builtinFuncs }) => {
         includeBuiltin('__Porffor_object_fastAdd');
         const emitProp = (out, x, d) => {
           const key = prefix + x;
+
+          // a prototype's x$get is its accessor x; none over a data property of that name (the
+          // errors' name, message and constructor: their getters are for errors themselves)
+          if (lazyKind === 'proto' && x.endsWith('$get') && key in builtinFuncs) {
+            if (x.slice(0, -4) in props) return;
+            // a typed array kind's are %TypedArray%.prototype's (inherited)
+            if (/Array_prototype$/.test(name) && name !== '__Array_prototype' && name !== '__Porffor_TypedArray_prototype') return;
+            includeBuiltin('__Porffor_object_fastAddAccessor');
+            out.push(Call('__Porffor_object_fastAddAccessor', [ obj, makeString(x.slice(0, -4)), funcValue(key), Const(T.i32, 0b0010) ], T.none));
+            return;
+          }
+
           const value = propValue(key, d);
 
           if (x === '__proto__') {
@@ -132,7 +144,8 @@ export const BuiltinVars = ({ builtinFuncs }) => {
 
         if (lazyKind && Prefs.lazyObjects) {
           // entries only for included methods/globals, explicit X.prototype marks the proto full -> everything
-          const ctorName = lazyKind === 'proto' ? name.slice(2, name.indexOf('_prototype')) : null;
+          // (%TypedArray%'s constructor keeps its __ prefix: it is no global)
+          const ctorName = lazyKind === 'proto' ? (name === '__Porffor_TypedArray_prototype' ? '__Porffor_TypedArray' : name.slice(2, name.indexOf('_prototype'))) : null;
           const adds = [];
           onFinalize(() => {
             adds.length = 0;
@@ -166,6 +179,7 @@ export const BuiltinVars = ({ builtinFuncs }) => {
           includeBuiltin('Symbol');
           return global(`#wellknown_${x}`, T.jsval, Call('Symbol', [ makeString(`Symbol.${x}`) ], T.jsval));
         };
+
 
         const symbolMethod = symbolMethods[name];
         if (symbolMethod)
@@ -352,12 +366,28 @@ export const BuiltinVars = ({ builtinFuncs }) => {
       Object.defineProperty(props, '__proto__', { value: { value: errorProto, configurable: true }, enumerable: true });
     }
 
-    // the errors' prototypes have their name as a data property, and Error.prototype the
-    // message '' the others inherit (a subclass instance, a plain object, reads them there;
-    // an error's own getters are for errors)
+    // the errors' prototypes have their name and the message '' as data properties (a
+    // subclass instance, a plain object, reads them there; an error's getters are for errors)
     if ([ 'Error', 'AggregateError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError', 'SuppressedError' ].some(e => x === `__${e}_prototype`)) {
       props.name = { value: x.slice(2, -10), writable: true, configurable: true };
-      if (x === '__Error_prototype') props.message = { value: '', writable: true, configurable: true };
+      props.message = { value: '', writable: true, configurable: true };
+    }
+
+    // the typed arrays' prototypes inherit from %TypedArray%.prototype, which has the
+    // methods they share (a dispatcher each), and its constructor is %TypedArray%
+    if (/^__(Uint8|Int8|Uint8Clamped|Uint16|Int16|Uint32|Int32|Float32|Float64|BigInt64|BigUint64)Array_prototype$/.test(x)) {
+      // (only in a program that can reach %TypedArray%: else Object.prototype, as before)
+      const typedArrayProto = (_scope, { includeBuiltin, programFlag }) => {
+        const proto = programFlag('typedArrayCtorValue') ? '#get___Porffor_TypedArray_prototype' : '#get___Object_prototype';
+        includeBuiltin(proto);
+        return Box(Call(proto, [], T.ptr), Const(T.i32, TYPES.object));
+      };
+      Object.defineProperty(props, '__proto__', { value: { value: typedArrayProto, configurable: true }, enumerable: true });
+    }
+    if (x === '__Porffor_TypedArray_prototype') {
+      const value = (_scope, { funcRefPtr }) => Box(funcRefPtr('__Porffor_TypedArray'), Const(T.i32, TYPES.function));
+      value.type = TYPES.function;
+      props.constructor = { value, writable: true, enumerable: false, configurable: true };
     }
 
     // special case: Function.prototype.length = 0

@@ -843,6 +843,9 @@ const generateIdent = (scope, decl) => {
   // TDZ: read before its let/const initializer (static flag from binding resolver)
   if (decl._tdz) return internalThrow(scope, 'ReferenceError', `Cannot access '${unhackName(decl.name)}' before initialization`);
 
+  // a typed array's constructor as a value can lead to %TypedArray% (resolveMemberDemandsOnce)
+  if (!globalThis.precompile && TYPED_ARRAY_CTORS.includes(decl.name)) typedArrayCtorValue = true;
+
   if (decl.name === '#closure_env') {
     if (!scope.closureAware) throw new Error(`missing closure env in ${scope.name}`);
     return currentClosureEnv(scope);
@@ -1337,7 +1340,7 @@ const irBuiltinHelpers = (scope, name, def) => ({
   makeString: str => makeString(scope, str),
   usesAnyType,
   hasFunc: name => funcIndex[name] != null,
-  programFlag: name => name === 'usesIterProtocol' ? usesIterProtocol : false,
+  programFlag: name => name === 'usesIterProtocol' ? usesIterProtocol : name === 'typedArrayCtorValue' ? typedArrayCtorValue : false,
   memberDemanded: name => memberDemands.has(name) || calledMembers.has(name),
   onFinalize,
   remapData: id => {
@@ -4558,6 +4561,8 @@ const generateObject = (scope, decl) => {
 };
 
 let memberDemands;
+// the program uses a typed array's constructor as a value (not only new Uint8Array(...))
+let typedArrayCtorValue = false;
 let calledMembers;
 // the program can make its own iterators (parse.js): for...of and friends need the protocol
 let usesIterProtocol = true;
@@ -4596,7 +4601,18 @@ const resolveMemberDemands = scope => {
   } while (memberDemands.size !== before);
 };
 
+const TYPED_ARRAY_CTORS = [ 'Uint8', 'Int8', 'Uint8Clamped', 'Uint16', 'Int16', 'Uint32', 'Int32', 'Float32', 'Float64', 'BigInt64', 'BigUint64' ].map(x => x + 'Array');
+
+// %TypedArray%.prototype can be reached: through a prototype read of a kind's constructor used
+// as a value (each kind's prototype has its own methods)
+const typedArrayReachable = () => typedArrayCtorValue &&
+  (funcIndex.__Object_getPrototypeOf != null || funcIndex.__Reflect_getPrototypeOf != null || memberDemands.has('__proto__'));
+
 const resolveMemberDemandsOnce = scope => {
+  // %TypedArray%.prototype's getters are its accessors (buffer, byteLength, byteOffset, length):
+  // all there once it can be reached (a read by a computed key names none)
+  if (typedArrayReachable()) for (const x of [ 'buffer', 'byteLength', 'byteOffset', 'length' ]) includeBuiltin(scope, `__Porffor_TypedArray_prototype_${x}$get`);
+
   for (const propName of memberDemands) {
     const getterOnly = propName === 'constructor';
     for (const x of getterOnly ? builtinPrototypeObjectGetters.values() : (builtinPrototypeFuncs.get(propName) ?? [])) {
@@ -4607,10 +4623,15 @@ const resolveMemberDemandsOnce = scope => {
         tn = x.slice(2, x.indexOf('_prototype_'));
       }
 
-      // Porffor's own types are named with __ (__Porffor_Generator_prototype_next is
-      // TYPES.__porffor_generator's): without it their methods are never readable
-      const t = TYPES[tn.toLowerCase()] ?? TYPES['__' + tn.toLowerCase()];
-      if (t == null || !usesAnyType([ t, primObjAlias[t] ])) continue;
+      // %TypedArray%.prototype's, in a program that can reach it (typedArrayReachable)
+      if (tn === 'Porffor_TypedArray') {
+        if (!typedArrayReachable()) continue;
+      } else {
+        // Porffor's own types are named with __ (__Porffor_Generator_prototype_next is
+        // TYPES.__porffor_generator's): without it their methods are never readable
+        const t = TYPES[tn.toLowerCase()] ?? TYPES['__' + tn.toLowerCase()];
+        if (t == null || !usesAnyType([ t, primObjAlias[t] ])) continue;
+      }
       includeBuiltin(scope, x);
       if (!getterOnly) {
         const getter = '#get___' + tn + '_prototype';
@@ -5386,7 +5407,11 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
           // but its generic flags getter and toString
           (t !== TYPES.array && TYPE_NAMES[t]?.endsWith('Array')) ||
           (t === TYPES.regexp && method !== 'flags$get' && method !== 'toString')) {
-          const guard = () => internalThrow(func, 'TypeError', `${prettyName} expects 'this' to be a ${TYPE_NAMES[t]}`);
+          let guard = () => internalThrow(func, 'TypeError', `${prettyName} expects 'this' to be a ${TYPE_NAMES[t]}`);
+          // a RegExp getter read off RegExp.prototype itself (as an accessor is, by any read of
+          // it): source is "(?:)" there and the flags undefined
+          if (t === TYPES.regexp && method.endsWith('$get'))
+            guard = () => stmt(func, Return(builtinCall(func, '__Porffor_regexp_offTypeGetter', [ thisRef(), Box(Const(T.f64, method === 'source$get' ? 1 : 0), Const(T.i32, TYPES.boolean)) ])));
           emitIf(func, Bin('!=', T.i32, JvType(thisRef()), Const(T.i32, t)),
             t === TYPES.number
               ? () => emitIf(func, Bin('!=', T.i32, JvType(thisRef()), Const(T.i32, TYPES.numberobject)), guard)
@@ -5716,6 +5741,7 @@ export default (program, opts = {}) => {
   includedBuiltinGlobalInits = new Set();
   irFinalizers = [];
   memberDemands = new Set();
+  typedArrayCtorValue = false;
   calledMembers = new Set();
   usesIterProtocol = !!program._usesIterProtocol;
   // builtins are typed: a BigInt reaches their arithmetic only where they say so

@@ -55,7 +55,36 @@ export const __Porffor_object_builtinPrototype = (f: any): any => {`;
   }`;
   }
 
+  // %TypedArray% is reached only through a kind (its own prototype): gated on the kinds, as
+  // __Porffor_object_builtinParent is (it is brought in there, after these flags are settled)
+  const typedArrayKinds = [ 'Uint8', 'Int8', 'Uint8Clamped', 'Uint16', 'Int16', 'Uint32', 'Int32', 'Float32', 'Float64', 'BigInt64', 'BigUint64' ];
+  // (only a program using a kind's constructor as a value reaches either)
   out += `
+  if (Porffor.comptime.flag\`program.typedArrayCtorValue\`) {`;
+  for (const x of typedArrayKinds) {
+    out += `
+    if (Porffor.comptime.flag\`hasFunc.${x}Array\`) {
+      if (f == __Porffor_TypedArray) return __Porffor_TypedArray_prototype;
+    }`;
+  }
+  out += `
+  }`;
+  out += `
+  return undefined;
+};
+
+// a built-in constructor's own prototype, when it is not Function.prototype: the typed
+// arrays' is %TypedArray%
+export const __Porffor_object_builtinParent = (f: any): any => {
+  if (Porffor.comptime.flag\`program.typedArrayCtorValue\`) {`;
+  for (const x of typedArrayKinds) {
+    out += `
+    if (Porffor.comptime.flag\`hasFunc.${x}Array\`) {
+      if (f == ${x}Array) return __Porffor_TypedArray;
+    }`;
+  }
+  out += `
+  }
   return undefined;
 };`;
 

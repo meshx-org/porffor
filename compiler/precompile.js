@@ -322,22 +322,29 @@ const resolveComptimeFlag = (h, kind, value) => kind === 'hasFunc' ? h.hasFunc(v
 //   - TypeSwitch case              -> deferred to h.onFinalize, gated on h.usesAnyType(typeIds)
 //     when usedTypes is final, so a dead case's subtree is never walked (its builtins/strings are
 //     never included -> never emitted), while a type first used by a later builtin still activates.
+// a comptime flag x in the list node: resolved when the program is known, its branch put in
+// its place and walked (a flag directly in that branch is deferred the same way: walk()
+// passes a flag by, so one nested in another's branch was never resolved)
+const deferFlag = (node, x, h) => h.onFinalize(() => {
+  const pos = node.indexOf(x);
+  if (pos === -1) return;
+  const [ kind, value, thenBranch, elseBranch ] = x.__porfComptimeFlag;
+  const selected = resolveComptimeFlag(h, kind, value) ? thenBranch : elseBranch;
+  node.splice(pos, 1, ...selected);
+  for (let j = pos; j < pos + selected.length; j++) {
+    if (isComptimeFlag(node[j])) deferFlag(node, node[j], h);
+      else node[j] = walk(node[j], h);
+  }
+});
+
 const walk = (node, h) => {
   if (isComptimeFlag(node)) return node;
   if (!isNode(node)) {
     if (Array.isArray(node)) {
       for (let i = 0; i < node.length; i++) {
         const x = node[i];
-        if (isComptimeFlag(x)) {
-          h.onFinalize(() => {
-            const pos = node.indexOf(x);
-            if (pos === -1) return;
-            const [ kind, value, thenBranch, elseBranch ] = x.__porfComptimeFlag;
-            const selected = resolveComptimeFlag(h, kind, value) ? thenBranch : elseBranch;
-            node.splice(pos, 1, ...selected);
-            for (let j = pos; j < pos + selected.length; j++) walk(node[j], h);
-          });
-        } else node[i] = walk(x, h);
+        if (isComptimeFlag(x)) deferFlag(node, x, h);
+          else node[i] = walk(x, h);
       }
     }
     return node;

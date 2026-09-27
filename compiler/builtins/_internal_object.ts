@@ -188,6 +188,18 @@ export const __Porffor_object_fastAdd = (obj: any, key: any, value: any, flags: 
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
 };
 
+// a built-in prototype's getter (Map.prototype.size): an accessor with no setter. Unlike
+// writeAccessor, it leaves accessorsExist alone: that makes every new property's set search
+// the prototype chain for a setter, and a built-in getter has none
+export const __Porffor_object_fastAddAccessor = (obj: any, key: any, get: any, flags: i32): void => {
+  const entryPtr: i32 = __Porffor_object_appendEntry(obj, key, __Porffor_object_hash(key));
+
+  Porffor.IR.storeI32(entryPtr, 8, Porffor.IR.ptr(get));
+  Porffor.IR.storeI32(entryPtr, 12, 0);
+  Porffor.IR.storeU8(entryPtr, 16, flags | 0b0001);
+  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, get);
+};
+
 export const __Porffor_object_readValue = (entryPtr: i32): any => {
   return Porffor.as(Porffor.IR.loadUnF64(entryPtr, 8), Porffor.IR.loadU8(entryPtr, 17));
 };
@@ -359,6 +371,9 @@ export const __Porffor_object_underlying = (_obj: any): any => {
         }
         // a built-in constructor's static methods (Object.keys read as O.keys)
         __Porffor_object_builtinStatics(_obj, underlying);
+        // and its own prototype (Int8Array's is %TypedArray%), when not Function.prototype
+        const parent: any = __Porffor_object_builtinParent(_obj);
+        if (parent !== undefined) __Porffor_object_setPrototype(underlying, parent);
       }
     }
 
