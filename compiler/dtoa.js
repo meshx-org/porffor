@@ -463,13 +463,13 @@ static void porf_ryu(uint64_t bits, uint64_t* out_sig, int* out_exp) {
 `;
 
 // Grisu3 (--dtoa=grisu3), from https://github.com/google/double-conversion (fast-dtoa.cc,
-// cached-powers.cc). Its license asks for the notice in source redistributions, and the C
-// below lands in every generated program, so the notice goes with it
+// cached-powers.cc, bignum-dtoa.cc). Its license asks for the notice in source
+// redistributions, and the C below lands in every generated program, so the notice goes
+// with it
 export const GRISU3_C = `// Grisu3 (Florian Loitsch): the shortest decimal that round-trips to a binary64, and the
-// closest such, for the ~99.7% of doubles it can prove it for. Ported to C from
-// double-conversion (fast-dtoa.cc, cached-powers.cc), shortest mode only.
-// For the rest it keeps to Grisu2's narrower interval: the digits still round-trip, but
-// may be a digit longer, or one off in the last place, than the shortest closest ones.
+// closest such, for the ~99.7% of doubles it can prove it for; the rest go to an exact
+// bignum digit generation (Steele & White's, as V8 does). Ported to C from
+// double-conversion (fast-dtoa.cc, cached-powers.cc, bignum-dtoa.cc), shortest mode only.
 //
 // Copyright 2006-2011, the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
@@ -542,13 +542,11 @@ static int porf_grisu_round_weed(uint64_t* digits, uint64_t distance_too_high_w,
   return 2 * unit <= rest && rest <= unsafe_interval - 4 * unit;
 }
 
-// digits for the scaled boundaries low < w < high (exponent e, -60 <= e <= -32). With
-// safe set the interval shrinks by a unit on each side instead of growing (Grisu2): every
-// digit string it can end on then rounds to the double
-static int porf_grisu_digit_gen(uint64_t low, uint64_t w, uint64_t high, int e, int safe, uint64_t* out, int* kappa) {
+// digits for the scaled boundaries low < w < high (exponent e, -60 <= e <= -32), and 1 when
+// they are provably the shortest and closest
+static int porf_grisu_digit_gen(uint64_t low, uint64_t w, uint64_t high, int e, uint64_t* out, int* kappa) {
   uint64_t unit = 1;
-  const uint64_t too_low = safe ? low + unit : low - unit;
-  const uint64_t too_high = safe ? high - unit : high + unit;
+  const uint64_t too_low = low - unit, too_high = high + unit;
   uint64_t unsafe_interval = too_high - too_low;
   const int shift = -e;
   const uint64_t one = 1ull << shift;
@@ -568,7 +566,7 @@ static int porf_grisu_digit_gen(uint64_t low, uint64_t w, uint64_t high, int e, 
     const uint64_t rest = ((uint64_t)integrals << shift) + fractionals;
     if (rest < unsafe_interval) {
       *out = digits;
-      return safe ? 1 : porf_grisu_round_weed(out, too_high - w, unsafe_interval, rest, (uint64_t)divisor << shift, unit);
+      return porf_grisu_round_weed(out, too_high - w, unsafe_interval, rest, (uint64_t)divisor << shift, unit);
     }
   }
   for (;;) {
@@ -580,9 +578,126 @@ static int porf_grisu_digit_gen(uint64_t low, uint64_t w, uint64_t high, int e, 
     (*kappa)--;
     if (fractionals < unsafe_interval) {
       *out = digits;
-      return safe ? 1 : porf_grisu_round_weed(out, (too_high - w) * unit, unsafe_interval, fractionals, one, unit);
+      return porf_grisu_round_weed(out, (too_high - w) * unit, unsafe_interval, fractionals, one, unit);
     }
   }
+}
+
+// an unsigned integer of up to 1280 bits, enough for 2 * 10^324 * 2^53 * 10: the largest
+// the bignum digit generation below makes
+typedef struct { uint32_t d[40]; int n; } porf_bn;
+
+PORF_COLD static void porf_bn_set(porf_bn* b, uint64_t v) {
+  b->d[0] = (uint32_t)v;
+  b->d[1] = (uint32_t)(v >> 32);
+  b->n = b->d[1] ? 2 : 1;
+}
+PORF_COLD static void porf_bn_mul(porf_bn* b, uint32_t m) {
+  uint64_t carry = 0;
+  for (int i = 0; i < b->n; i++) {
+    carry += (uint64_t)b->d[i] * m;
+    b->d[i] = (uint32_t)carry;
+    carry >>= 32;
+  }
+  if (carry) b->d[b->n++] = (uint32_t)carry;
+}
+PORF_COLD static void porf_bn_shl(porf_bn* b, int bits) {
+  const int limbs = bits / 32, r = bits % 32;
+  b->d[b->n] = 0;
+  for (int i = b->n; i >= 0; i--) {
+    const uint32_t hi = r ? b->d[i] << r | (i ? b->d[i - 1] >> (32 - r) : 0) : b->d[i];
+    b->d[i + limbs] = hi;
+  }
+  for (int i = 0; i < limbs; i++) b->d[i] = 0;
+  b->n += limbs + 1;
+  while (b->n > 1 && !b->d[b->n - 1]) b->n--;
+}
+// times 5^p
+PORF_COLD static void porf_bn_pow5(porf_bn* b, int p) {
+  for (; p >= 13; p -= 13) porf_bn_mul(b, 1220703125u);
+  uint32_t m = 1;
+  while (p--) m *= 5;
+  porf_bn_mul(b, m);
+}
+// a + b compared with c: negative, zero or positive
+PORF_COLD static int porf_bn_plus_cmp(const porf_bn* a, const porf_bn* b, const porf_bn* c) {
+  uint32_t sum[41];
+  uint64_t carry = 0;
+  const int n = a->n > b->n ? a->n : b->n;
+  for (int i = 0; i < n; i++) {
+    carry += (uint64_t)(i < a->n ? a->d[i] : 0) + (i < b->n ? b->d[i] : 0);
+    sum[i] = (uint32_t)carry;
+    carry >>= 32;
+  }
+  sum[n] = (uint32_t)carry;
+  for (int i = (n + 1 > c->n ? n + 1 : c->n) - 1; i >= 0; i--) {
+    const uint32_t x = i <= n ? sum[i] : 0, y = i < c->n ? c->d[i] : 0;
+    if (x != y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
+// a - b, when a >= b
+PORF_COLD static void porf_bn_sub(porf_bn* a, const porf_bn* b) {
+  int64_t borrow = 0;
+  for (int i = 0; i < a->n; i++) {
+    borrow += (int64_t)a->d[i] - (i < b->n ? b->d[i] : 0);
+    a->d[i] = (uint32_t)borrow;
+    borrow >>= 32;
+  }
+  while (a->n > 1 && !a->d[a->n - 1]) a->n--;
+}
+
+// the exact shortest closest digits (Steele & White), for what Grisu3 cannot prove: v is
+// numerator / denominator * 10^point, and the deltas the half-distances to the neighbours
+PORF_COLD static void porf_grisu_bignum(uint64_t f, int e, int lower_closer, int norm_e, uint64_t* out_sig, int* out_exp) {
+  const int even = (f & 1) == 0;
+  static const porf_bn zero = { { 0 }, 1 };
+  porf_bn num, den, dminus, dplus;
+  int point = (int)ceil((norm_e + 52) * 0.30102999566398114 - 1e-10); // estimated, maybe 1 low
+  if (e >= 0) {
+    porf_bn_set(&num, f); porf_bn_shl(&num, e + 1);
+    porf_bn_set(&den, 1); porf_bn_pow5(&den, point); porf_bn_shl(&den, point + 1);
+    porf_bn_set(&dplus, 1); porf_bn_shl(&dplus, e);
+  } else if (point >= 0) {
+    porf_bn_set(&num, f); porf_bn_shl(&num, 1);
+    porf_bn_set(&den, 1); porf_bn_pow5(&den, point); porf_bn_shl(&den, point - e + 1);
+    porf_bn_set(&dplus, 1);
+  } else {
+    porf_bn_set(&num, f); porf_bn_pow5(&num, -point); porf_bn_shl(&num, -point + 1);
+    porf_bn_set(&den, 1); porf_bn_shl(&den, -e + 1);
+    porf_bn_set(&dplus, 1); porf_bn_pow5(&dplus, -point); porf_bn_shl(&dplus, -point);
+  }
+  dminus = dplus;
+  if (lower_closer) { porf_bn_shl(&den, 1); porf_bn_shl(&num, 1); porf_bn_shl(&dplus, 1); }
+
+  // the estimate was one too low when v + delta+ reaches 1: otherwise start a digit on
+  if (porf_bn_plus_cmp(&num, &dplus, &den) >= !even) point++;
+    else { porf_bn_mul(&num, 10); porf_bn_mul(&dminus, 10); porf_bn_mul(&dplus, 10); }
+
+  uint64_t digits = 0;
+  int length = 0;
+  for (;;) {
+    uint32_t digit = 0;
+    while (porf_bn_plus_cmp(&num, &zero, &den) >= 0) { porf_bn_sub(&num, &den); digit++; }
+    digits = digits * 10 + digit;
+    length++;
+    const int low = porf_bn_plus_cmp(&num, &zero, &dminus) < even;
+    const int high = porf_bn_plus_cmp(&num, &dplus, &den) >= !even;
+    if (!low && !high) {
+      porf_bn_mul(&num, 10); porf_bn_mul(&dminus, 10); porf_bn_mul(&dplus, 10);
+      continue;
+    }
+    if (low && high) {
+      // both neighbours' digit strings round to v: the closer one, the even one on a tie
+      const int c = porf_bn_plus_cmp(&num, &num, &den);
+      if (c > 0 || (c == 0 && (digit & 1))) digits++;
+    } else if (high) {
+      digits++;
+    }
+    break;
+  }
+  *out_sig = digits;
+  *out_exp = point - length;
 }
 
 // bits: a finite, nonzero binary64. Its shortest decimal is *out_sig * 10^*out_exp
@@ -616,8 +731,8 @@ static void porf_grisu3(uint64_t bits, uint64_t* out_sig, int* out_exp) {
 
   const uint64_t sw = porf_grisu_mul(wf, pow_f), sm = porf_grisu_mul(minus, pow_f), sp = porf_grisu_mul(plus, pow_f);
   int kappa;
-  if (!porf_grisu_digit_gen(sm, sw, sp, scaled_e, 0, out_sig, &kappa)) porf_grisu_digit_gen(sm, sw, sp, scaled_e, 1, out_sig, &kappa);
-  *out_exp = -mk + kappa;
+  if (porf_grisu_digit_gen(sm, sw, sp, scaled_e, out_sig, &kappa)) *out_exp = -mk + kappa;
+    else porf_grisu_bignum(f, e, frac == 0 && biased > 1, we + 11, out_sig, out_exp);
 }
 `;
 

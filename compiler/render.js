@@ -4178,12 +4178,16 @@ ${prefs.nativeFetch ? '' : st}u8* porf_mem;
 #define MEM porf_mem
 #define PORF_NOINLINE __attribute__((noinline))
 // run-once code (module init, top level): optimize for size whatever -O the unit gets
+// rarely-run code (slow paths): the same, and kept off the hot path's layout
 #if defined(__clang__)
 #define PORF_ONCE __attribute__((noinline, minsize))
+#define PORF_COLD __attribute__((cold, noinline, minsize))
 #elif defined(__GNUC__)
 #define PORF_ONCE __attribute__((noinline, optimize("Os")))
+#define PORF_COLD __attribute__((cold, noinline, optimize("Os")))
 #else
 #define PORF_ONCE
+#define PORF_COLD
 #endif
 #define PORF_NORETURN __attribute__((cold, noinline, noreturn))
 ${usesCoro ? `#if defined(__wasm__) && !defined(PORF_NO_STACK_CHECK)
