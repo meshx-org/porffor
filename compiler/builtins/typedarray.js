@@ -329,7 +329,7 @@ ${body}
   out += getter('buffer', `  return Porffor.IR.loadI32(this, 4) - Porffor.IR.loadI32(this, 8) as ArrayBuffer;`);
   out += getter('byteLength', `${detachedZero}
   let size: i32 = 1;
-  if (Porffor.fastOr(t == Porffor.TYPES.uint16array, t == Porffor.TYPES.int16array)) size = 2;
+  if (Porffor.fastOr(t == Porffor.TYPES.uint16array, t == Porffor.TYPES.int16array, t == Porffor.TYPES.float16array)) size = 2;
     else if (Porffor.fastOr(t == Porffor.TYPES.uint32array, t == Porffor.TYPES.int32array, t == Porffor.TYPES.float32array)) size = 4;
     else if (Porffor.fastOr(t == Porffor.TYPES.float64array, t == Porffor.TYPES.bigint64array, t == Porffor.TYPES.biguint64array)) size = 8;
   return Porffor.IR.loadI32(this, 0) * size;`);

@@ -269,6 +269,7 @@ export const BuiltinVars = ({ builtinFuncs }) => {
     Int16Array: 2,
     Uint32Array: 4,
     Int32Array: 4,
+    Float16Array: 2,
     Float32Array: 4,
     Float64Array: 8,
     BigInt64Array: 8,
@@ -450,7 +451,7 @@ export const BuiltinVars = ({ builtinFuncs }) => {
     }, autoFuncKeys(x).slice(0, 12)));
   }
 
-  for (const x of [ 'Array', 'ArrayBuffer', 'Atomics', 'Date', 'Error', 'JSON', 'Object', 'Promise', 'Reflect', 'String', 'Symbol', 'Uint8Array', 'Int8Array', 'Uint8ClampedArray', 'Uint16Array', 'Int16Array', 'Uint32Array', 'Int32Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array', 'SharedArrayBuffer', 'BigInt', 'Boolean', 'DataView', 'AggregateError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError', 'SuppressedError', 'DisposableStack', 'AsyncDisposableStack', 'Function', 'Map', 'RegExp', 'Set', 'WeakMap', 'WeakRef', 'WeakSet', 'TextEncoder', 'TextDecoder', 'Iterator' ]) {
+  for (const x of [ 'Array', 'ArrayBuffer', 'Atomics', 'Date', 'Error', 'JSON', 'Object', 'Promise', 'Reflect', 'String', 'Symbol', 'Uint8Array', 'Int8Array', 'Uint8ClampedArray', 'Uint16Array', 'Int16Array', 'Uint32Array', 'Int32Array', 'Float16Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array', 'SharedArrayBuffer', 'BigInt', 'Boolean', 'DataView', 'AggregateError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError', 'SuppressedError', 'DisposableStack', 'AsyncDisposableStack', 'Function', 'Map', 'RegExp', 'Set', 'WeakMap', 'WeakRef', 'WeakSet', 'TextEncoder', 'TextDecoder', 'Iterator' ]) {
     object(x, {
       ...(typedArrayBytesPerElement[x] == null ? {} : props({
         writable: false,
@@ -609,6 +610,19 @@ return porf_box_num(pow(baseNum, exponentNum));`, false)
     body: [
       Assign(Local('n', T.f64), nativeMathArg('x')),
       RawC('return porf_box_num((f64)porf_clz32(porf_to_u32(n)));', false)
+    ]
+  };
+
+  // binary16's rounding (Math.f16round): through porf_f64_to_f16, back
+  _.__Math_f16round = {
+    params: [ { name: 'x', type: T.jsval } ],
+    localNames: [ 'n' ],
+    localTypes: [ T.f64 ],
+    retType: T.jsval,
+    returnType: TYPES.number,
+    body: [
+      Assign(Local('n', T.f64), nativeMathArg('x')),
+      RawC('return porf_box_num(porf_f16_to_f64(porf_f64_to_f16(n)));', false)
     ]
   };
 

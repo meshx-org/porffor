@@ -311,7 +311,7 @@ export const JvNullish = jv => {
 // memory
 const ctypeResult = ctype =>
   ctype === 'f64' ? T.f64 :
-  ctype === 'f32' ? T.f64 : // f32 widened on load
+  ctype === 'f32' || ctype === 'f16' ? T.f64 : // f32/f16 widened on load
   ctype === 'u64' || ctype === 'i64' ? T.i64 :
   ctype === 'jsval' ? T.jsval :
   T.i32;

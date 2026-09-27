@@ -192,7 +192,7 @@ export const __TextDecoder_prototype_decode = function (this: TextDecoder, input
     } else if (Porffor.fastOr(
       t == Porffor.TYPES.dataview, t == Porffor.TYPES.uint8array, t == Porffor.TYPES.int8array,
       t == Porffor.TYPES.uint8clampedarray, t == Porffor.TYPES.uint16array, t == Porffor.TYPES.int16array,
-      t == Porffor.TYPES.uint32array, t == Porffor.TYPES.int32array, t == Porffor.TYPES.float32array,
+      t == Porffor.TYPES.uint32array, t == Porffor.TYPES.int32array, t == Porffor.TYPES.float16array, t == Porffor.TYPES.float32array,
       t == Porffor.TYPES.float64array, t == Porffor.TYPES.bigint64array, t == Porffor.TYPES.biguint64array
     )) {
       base = Porffor.IR.ptr(input.buffer) + input.byteOffset;

@@ -720,6 +720,7 @@ export const __Object_prototype_toString = function (this: any) {
     case Porffor.TYPES.int32array: return '[object Int32Array]';
     case Porffor.TYPES.biguint64array: return '[object BigUint64Array]';
     case Porffor.TYPES.bigint64array: return '[object BigInt64Array]';
+    case Porffor.TYPES.float16array: return '[object Float16Array]';
     case Porffor.TYPES.float32array: return '[object Float32Array]';
     case Porffor.TYPES.float64array: return '[object Float64Array]';
     case Porffor.TYPES.__porffor_generator: return '[object Generator]';

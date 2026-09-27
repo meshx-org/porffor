@@ -618,6 +618,8 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
       case K.Reinterpret:
         if (node[N_B] === 'bitsToF32') return [`porf_bits_to_f32(${rx(node[N_A], P_COMMA)})`, P_POSTFIX];
         if (node[N_B] === 'f32ToBits') return [`porf_f32_to_bits(${rx(node[N_A], P_COMMA)})`, P_POSTFIX];
+        if (node[N_B] === 'bitsToF16') return [`porf_f16_to_f64((u16)${rx(node[N_A], P_CAST)})`, P_POSTFIX];
+        if (node[N_B] === 'f16ToBits') return [`(i32)porf_f64_to_f16(${rx(node[N_A], P_COMMA)})`, P_CAST];
         return [node[N_TYPE] === T.f64
           ? `porf_bits_to_f64(${rx(node[N_A], P_COMMA)})`
           : `porf_f64_to_bits(${rx(node[N_A], P_COMMA)})`, P_POSTFIX];
@@ -658,9 +660,11 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
           if (ctype === 'i32') return [`(i32)porf_load_un_u32(${addr})`, P_CAST];
           if (ctype === 'i64') return [`(i64)porf_load_un_u64(${addr})`, P_CAST];
           if (ctype === 'jsval') return [`porf_unpack(porf_load_un_u64(${addr}))`, P_POSTFIX];
+          if (ctype === 'f16') return [`porf_f16_to_f64(porf_load_un_u16(${addr}))`, P_POSTFIX];
           return [`porf_load_un_${ctype}(${addr})`, P_POSTFIX];
         }
         if (ctype === 'jsval') return [`porf_unpack(*(jsbits*)(${addr}))`, P_POSTFIX];
+        if (ctype === 'f16') return [`porf_f16_to_f64(*(u16*)(${addr}))`, P_POSTFIX];
         return [`*(${ctype === 'i8' ? 'int8_t' : ctype === 'i16' ? 'int16_t' : ctype}*)(${addr})`, P_UNARY];
       }
 
@@ -788,7 +792,11 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
         const ctype = node[N_A];
         const [off, unaligned, value] = node[N_C];
         const addr = `MEM + ${rx(node[N_B], P_ADD)}${off ? ` + ${off}u` : ''}`;
-        if (unaligned) {
+        if (ctype === 'f16') {
+          // a half: rounded from the double (porf_f64_to_f16), stored as its bits
+          if (unaligned) emit(`${ind()}porf_store_un_u16(${addr}, porf_f64_to_f16(${rx(value, P_COMMA)}));\n`);
+            else emit(`${ind()}*(u16*)(${addr}) = porf_f64_to_f16(${rx(value, P_COMMA)});\n`);
+        } else if (unaligned) {
           const un = { i16: 'u16', i32: 'u32', i64: 'u64', jsval: 'u64' }[ctype] ?? ctype;
           emit(`${ind()}porf_store_un_${un}(${addr}, ${ctype === 'jsval' ? packArg(value) : rx(value, P_COMMA)});\n`);
         } else if (ctype === 'jsval') emit(`${ind()}*(jsbits*)(${addr}) = ${packArg(value)};\n`);
@@ -3170,6 +3178,7 @@ static int porf_gc_should_rescan_marked_body(i32 body, i32 type) {
     case ${TYPES.int16array}:
     case ${TYPES.uint32array}:
     case ${TYPES.int32array}:
+    case ${TYPES.float16array}:
     case ${TYPES.float32array}:
     case ${TYPES.float64array}:
     case ${TYPES.bigint64array}:
@@ -3331,6 +3340,7 @@ weakmap_seen:
     case ${TYPES.int16array}:
     case ${TYPES.uint32array}:
     case ${TYPES.int32array}:
+    case ${TYPES.float16array}:
     case ${TYPES.float32array}:
     case ${TYPES.float64array}:
     case ${TYPES.bigint64array}:
@@ -4339,6 +4349,27 @@ static inline f64 porf_bits_to_f64_bits(u64 b) { f64 d; memcpy(&d, &b, 8); retur
 static inline u64 porf_f64_to_bits(f64 d) { u64 b; memcpy(&b, &d, 8); return b; }
 static inline f64 porf_bits_to_f32(u32 b) { f32 f; memcpy(&f, &b, 4); return (f64)f; }
 static inline u32 porf_f32_to_bits(f64 d) { f32 f = (f32)d; u32 b; memcpy(&b, &f, 4); return b; }
+// binary16 (Float16Array, Math.f16round): exact to double; from double rounded once, to
+// nearest with ties to even (rint in the default rounding mode), not through float
+static inline f64 porf_f16_to_f64(u16 h) {
+  const u32 e = (h >> 10) & 0x1f, m = h & 0x3ff;
+  const f64 v = e == 0 ? ldexp((f64)m, -24) : e == 31 ? (m ? NAN : INFINITY) : ldexp((f64)(m | 0x400), (i32)e - 25);
+  return (h & 0x8000) ? -v : v;
+}
+static u16 porf_f64_to_f16(f64 d) {
+  const u16 sign = signbit(d) ? 0x8000 : 0;
+  if (d != d) return 0x7e00;
+  const f64 a = fabs(d);
+  if (a == INFINITY) return sign | 0x7c00;
+  // subnormal: whole multiples of 2^-24 (rounding up to 0x400 is the smallest normal)
+  if (a < 0x1p-14) return sign | (u16)rint(a * 0x1p24);
+  int x; const f64 f = frexp(a, &x); // a = f * 2^x, f in [0.5, 1)
+  f64 sig = rint(f * 2048);          // 11 significant bits
+  int e = x - 1 + 15;
+  if (sig == 2048) { sig = 1024; e++; }
+  if (e >= 31) return sign | 0x7c00;
+  return sign | (u16)(e << 10) | (u16)(sig - 1024);
+}
 static inline f64 porf_jsval_to_f64(jsval v) { return v.val; }
 #define porf_bits_to_f64(x) _Generic((x), jsval: porf_jsval_to_f64, default: porf_bits_to_f64_bits)(x)
 

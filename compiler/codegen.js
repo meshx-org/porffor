@@ -1979,7 +1979,7 @@ const generateIRIntrinsic = (scope, op, args) => {
   const rawPtr = v => v[N_TYPE] === T.ptr || v[N_TYPE] === T.u32 || v[N_TYPE] === T.i32 ? v : JvPtr(v);
   const rawI32 = v => v[N_TYPE] === T.i32 ? v : Convert(T.i32, numValue(v), CONVERT_SIGNED);
   const rawFor = (ctype, v) => ctype === 'jsval' ? (v[N_TYPE] === T.jsval ? v : valNumber(v))
-    : ctype === 'f64' || ctype === 'f32' ? numValue(v)
+    : ctype === 'f64' || ctype === 'f32' || ctype === 'f16' ? numValue(v)
     : ctype === 'u64' || ctype === 'i64' ? (v[N_TYPE] === T.i64 || v[N_TYPE] === T.u64 ? v : Convert(T.i64, numValue(v), ctype === 'i64' ? CONVERT_SIGNED : 0))
     : Convert(T.i32, numValue(v), ctype[0] === 'i' ? CONVERT_SIGNED : 0);
   let m;
@@ -1996,6 +1996,8 @@ const generateIRIntrinsic = (scope, op, args) => {
   }
   if (op === 'bitsToF32') return Reinterpret(T.f64, rawI32(a(0)), 'bitsToF32');
   if (op === 'f32ToBits') return Reinterpret(T.i32, numValue(a(0)), 'f32ToBits');
+  if (op === 'bitsToF16') return Reinterpret(T.f64, rawI32(a(0)), 'bitsToF16');
+  if (op === 'f16ToBits') return Reinterpret(T.i32, numValue(a(0)), 'f16ToBits');
   if (op === 'bitsToF64') return Reinterpret(T.f64, a(0));
   if (op === 'f64ToBits') return Reinterpret(T.u64, a(0));
   if (op === 'copy') return MemCopy(rawPtr(a(0)), rawPtr(a(1)), rawI32(a(2)));
@@ -3363,7 +3365,7 @@ const generateAssign = (scope, decl, valueUnused = false) => {
       const v = reuse(scope, op === '=' ? simpleValue
         : performOp(scope, op, Box(Convert(T.f64, Load(ctype, addr, 4)), Const(T.i32, TYPES.number)), generate(scope, decl.right), TYPES.number, getNodeType(scope, decl.right)));
       const f = numValue(v);
-      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' ? f : signed ? Convert(T.i32, f) : Convert(T.u32, f, 0)));
+      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' || ctype === 'f16' ? f : signed ? Convert(T.i32, f) : Convert(T.u32, f, 0)));
       return v[N_TYPE] === T.jsval ? v : valNumber(v);
     };
     const taSetClamped = () => {
@@ -3390,6 +3392,7 @@ const generateAssign = (scope, decl, valueUnused = false) => {
       [ TYPES.int16array, taSet('i16', 2, true) ],
       [ TYPES.uint32array, taSet('u32', 4, false) ],
       [ TYPES.int32array, taSet('i32', 4, true) ],
+      [ TYPES.float16array, taSet('f16', 2, false) ],
       [ TYPES.float32array, taSet('f32', 4, false) ],
       [ TYPES.float64array, taSet('f64', 8, false) ],
       [ TYPES.bigint64array, taSetBig ],
@@ -3826,7 +3829,7 @@ const FAST_ITERABLES = new Set([
   TYPES.array, TYPES.string, TYPES.bytestring, TYPES.set, TYPES.map,
   TYPES.__porffor_generator, TYPES.__porffor_asyncgenerator,
   TYPES.uint8array, TYPES.int8array, TYPES.uint8clampedarray, TYPES.uint16array, TYPES.int16array,
-  TYPES.uint32array, TYPES.int32array, TYPES.float32array, TYPES.float64array,
+  TYPES.uint32array, TYPES.int32array, TYPES.float16array, TYPES.float32array, TYPES.float64array,
   TYPES.bigint64array, TYPES.biguint64array
 ]);
 
@@ -4003,6 +4006,7 @@ const generateForOfCore = (scope, decl) => {
       [ TYPES.int16array, taNext('i16', 2, num) ],
       [ TYPES.uint32array, taNext('u32', 4, num) ],
       [ TYPES.int32array, taNext('i32', 4, num) ],
+      [ TYPES.float16array, taNext('f16', 2, num) ],
       [ TYPES.float32array, taNext('f32', 4, num) ],
       [ TYPES.float64array, taNext('f64', 8, x => Box(x, Const(T.i32, TYPES.number))) ],
       [ TYPES.bigint64array, taNext('i64', 8, x => Box(builtinCall(scope, '__Porffor_bigint_fromS64', [ x ]), Const(T.i32, TYPES.bigint))) ],
@@ -4776,7 +4780,7 @@ const generateMember = (scope, decl, objValue = null) => {
     size === 1 ? Convert(T.u32, numValue(prop), 0) : Bin('*', T.u32, Convert(T.u32, numValue(prop), 0), Const(T.u32, size)));
   const taGet = (ctype, size, signed = true) => () => {
     const loaded = Load(ctype, taAddr(size), 4);
-    const f = ctype === 'f32' || ctype === 'f64' ? loaded : Convert(T.f64, loaded, signed ? CONVERT_SIGNED : 0);
+    const f = ctype === 'f32' || ctype === 'f64' || ctype === 'f16' ? loaded : Convert(T.f64, loaded, signed ? CONVERT_SIGNED : 0);
     return Box(f, Const(T.i32, TYPES.number));
   };
   const taGetBig = signed => () =>
@@ -4810,6 +4814,7 @@ const generateMember = (scope, decl, objValue = null) => {
     [ TYPES.int16array, taGet('i16', 2, true) ],
     [ TYPES.uint32array, taGet('u32', 4, false) ],
     [ TYPES.int32array, taGet('i32', 4, true) ],
+    [ TYPES.float16array, taGet('f16', 2) ],
     [ TYPES.float32array, taGet('f32', 4) ],
     [ TYPES.float64array, taGet('f64', 8) ],
     [ TYPES.bigint64array, taGetBig(true) ],

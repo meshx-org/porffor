@@ -25,8 +25,8 @@
 
 export const NATIVE_ERRORS = [ 'AggregateError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError', 'SuppressedError' ];
 export const ERRORS = [ 'Error', ...NATIVE_ERRORS ];
-export const TYPED_ARRAY_KINDS = [ 'Uint8', 'Int8', 'Uint8Clamped', 'Uint16', 'Int16', 'Uint32', 'Int32', 'Float32', 'Float64', 'BigInt64', 'BigUint64' ].map(x => x + 'Array');
-const BYTES_PER_ELEMENT = { Uint8Array: 1, Int8Array: 1, Uint8ClampedArray: 1, Uint16Array: 2, Int16Array: 2, Uint32Array: 4, Int32Array: 4, Float32Array: 4, Float64Array: 8, BigInt64Array: 8, BigUint64Array: 8 };
+export const TYPED_ARRAY_KINDS = [ 'Uint8', 'Int8', 'Uint8Clamped', 'Uint16', 'Int16', 'Uint32', 'Int32', 'Float16', 'Float32', 'Float64', 'BigInt64', 'BigUint64' ].map(x => x + 'Array');
+const BYTES_PER_ELEMENT = { Uint8Array: 1, Int8Array: 1, Uint8ClampedArray: 1, Uint16Array: 2, Int16Array: 2, Uint32Array: 4, Int32Array: 4, Float16Array: 2, Float32Array: 4, Float64Array: 8, BigInt64Array: 8, BigUint64Array: 8 };
 
 // the prototypes whose [Symbol.toStringTag] is a plain string (Object.prototype.toString
 // reads it, so a program can delete or change it); the others have a builtinTag of their own

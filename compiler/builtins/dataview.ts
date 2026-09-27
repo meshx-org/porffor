@@ -158,6 +158,18 @@ export const __DataView_prototype_setBigInt64 = function (this: DataView, byteOf
   return Porffor.callThis(__DataView_prototype_setBigUint64, this, byteOffset, value, littleEndian);
 };
 
+export const __DataView_prototype_getFloat16 = function (this: DataView, byteOffset: any, littleEndian: any = false) {
+  const value: number = Porffor.callThis(__DataView_prototype_getUint16, this, byteOffset, littleEndian);
+  return Porffor.IR.bitsToF16(value | 0);
+};
+
+export const __DataView_prototype_setFloat16 = function (this: DataView, byteOffset: any, value: any, littleEndian: any = false) {
+  // the index first, then the value (SetViewValue's order)
+  byteOffset = ecma262.ToIndex(byteOffset);
+  value = ecma262.ToNumber(value);
+  return Porffor.callThis(__DataView_prototype_setUint16, this, byteOffset, Porffor.IR.f16ToBits(value), littleEndian);
+};
+
 export const __DataView_prototype_getFloat32 = function (this: DataView, byteOffset: any, littleEndian: any = false) {
   const value: number = Porffor.callThis(__DataView_prototype_getUint32, this, byteOffset, littleEndian);
   return Porffor.IR.bitsToF32(value | 0);

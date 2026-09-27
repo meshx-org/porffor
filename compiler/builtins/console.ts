@@ -50,7 +50,7 @@ export const __Porffor_printHexDigit = (arg: number): void => {
 };
 
 export const __Porffor_print = (arg: any, colors: boolean = true, depth: number = 0): void => {
-  const __Porffor_printArray = (arg: any[]|Uint8Array|Int8Array|Uint8ClampedArray|Uint16Array|Int16Array|Uint32Array|Int32Array|Float32Array|Float64Array, colors: boolean, length: boolean = false) => {
+  const __Porffor_printArray = (arg: any[]|Uint8Array|Int8Array|Uint8ClampedArray|Uint16Array|Int16Array|Uint32Array|Int32Array|Float16Array|Float32Array|Float64Array, colors: boolean, length: boolean = false) => {
     const arrLen: i32 = arg.length;
     if (length) {
       Porffor.printStatic('(');
@@ -225,6 +225,11 @@ export const __Porffor_print = (arg: any, colors: boolean = true, depth: number 
 
     case Porffor.TYPES.int32array:
       Porffor.printStatic('Int32Array');
+      __Porffor_printArray(arg, colors, true);
+      return;
+
+    case Porffor.TYPES.float16array:
+      Porffor.printStatic('Float16Array');
       __Porffor_printArray(arg, colors, true);
       return;
 
