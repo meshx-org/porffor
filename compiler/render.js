@@ -1272,7 +1272,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
       const name = sanitize(g.name);
       if (g.type === T.jsval) markGlobalRootLines.push(`  porf_gc_mark_js(${name}.val, ${name}.type);`);
       // (builtin globals holding a raw block: the miss cache is marked like any other)
-      else if (g.type === T.ptr || (g.type === T.i32 && /(?:underlyingStore|underlyingBuckets|__Porffor_regex_cache|missCache)$/.test(g.name))) {
+      else if (g.type === T.ptr || (g.type === T.i32 && /(?:underlyingStore|underlyingBuckets|__Porffor_regex_cache|missCache|__Porffor_json_buf)$/.test(g.name))) {
         if (/underlyingStore$/.test(g.name)) {
           const buckets = sanitize(g.name.replace(/underlyingStore$/, 'underlyingBuckets'));
           const bucketsCap = sanitize(g.name.replace(/underlyingStore$/, 'underlyingBucketsCap'));
