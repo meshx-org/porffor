@@ -84,6 +84,22 @@ const coerceReturnValue = (scope, v) => {
   return valNumber(v);
 };
 
+// a derived constructor knows whether super() was called when every super() in it is its
+// own (not an arrow's) and no direct eval could make one
+const tracksSuperCall = scope => scope._tracksSuperCall ??= !!scope.subclass && !!scope.constr && (() => {
+  let direct = true;
+  const walk = (node, nested) => {
+    if (!direct || node == null || typeof node !== 'object') return;
+    if (Array.isArray(node)) { for (const x of node) walk(x, nested); return; }
+    if (node.type === 'CallExpression' && ((node.callee.type === 'Super' && nested) ||
+      (node.callee.type === 'Identifier' && node.callee.name === 'eval'))) { direct = false; return; }
+    const inner = nested || isFuncType(node.type);
+    for (const k in node) if (k[0] !== '_' && k !== 'parent' && k !== 'loc' && k !== 'range') walk(node[k], inner);
+  };
+  walk(scope.ast?.body, false);
+  return direct;
+})();
+
 const initBuilder = scope => {
   scope.body = [];
   scope.blockStack = [ scope.body ];
@@ -287,6 +303,8 @@ const closureLayout = scope => {
     if (closureBindingNeedsSlot(scope.closureOwnLocals[name])) slots[name] = ++count;
   }
   if (scope.closureOwnThis) slots['#this'] = ++count;
+  if (scope.closureOwnNewTarget) slots['#newtarget'] = ++count;
+  if (scope.closureOwnCallee) slots['#callee'] = ++count;
 
   return scope.closureLayout = { slots, count };
 };
@@ -979,7 +997,12 @@ const generateReturn = (scope, decl) => {
   // constructors coerce their return value
   if (scope.constr && !globalThis.precompile) {
     const constructing = () => JvTruthy(Local('#newtarget', T.jsval));
-    const retThis = () => stmt(scope, Return(Local('#this', T.jsval)));
+    const retThis = () => {
+      // a derived constructor gives back this only once super() has made it
+      if (tracksSuperCall(scope)) emitIf(scope, Un('!', T.i32, local(scope, '#super_called', T.i32)),
+        () => internalThrow(scope, 'ReferenceError', "Must call super constructor in derived class before returning"));
+      stmt(scope, Return(Local('#this', T.jsval)));
+    };
 
     // return undefined / return this give back the new instance when constructing
     if ((arg.type === 'Identifier' && arg.name === 'undefined') || arg.type === 'ThisExpression') {
@@ -2152,14 +2175,38 @@ const generateCall = (scope, decl) => {
   // super(...): invoke the parent constructor on #this, threading new.target through,
   // a marker is left so subclass field initialisers inject right after the super() call
   if (decl.callee.type === 'Super') {
-    const superCtor = reuse(scope, generate(scope, scope.ast?._superClassExpr ?? {
+    // in an arrow: the enclosing constructor's parent, this and new.target (its closure env)
+    const owner = decl.callee._closureThisFunc;
+    const superCtor = reuse(scope, generate(scope, owner ? {
+      type: 'CallExpression',
+      callee: { type: 'Identifier', name: '__Porffor_object_getPrototype' },
+      arguments: [ closureEnvNode(scope, '#callee', owner) ]
+    } : scope.ast?._superClassExpr ?? {
       type: 'CallExpression',
       callee: { type: 'Identifier', name: '__Porffor_object_getPrototype' },
       arguments: [ { type: 'Identifier', name: scope.name } ]
     }));
     const argVals = hasSpread ? [] : userArgs.map(a => reuse(scope, generate(scope, a)));
-    const res = reuse(scope, CallDynamic(superCtor, generate(scope, { type: 'ThisExpression', _noGlobalThis: true }),
-      argVals, Local('#newtarget', T.jsval), spreadArr));
+    const res = reuse(scope, CallDynamic(superCtor, generate(scope, { type: 'ThisExpression', _noGlobalThis: true, _closureThisFunc: owner }),
+      argVals, owner ? generate(scope, closureEnvNode(scope, '#newtarget', owner)) : Local('#newtarget', T.jsval), spreadArr));
+    // a built-in parent (Map, Array, Date, a typed array) makes an instance of its own
+    // rather than filling in this: that instance is this, with the subclass's prototype.
+    // Not an error: the Error constructors give a subclass's this its message instead
+    // (an error's name and message getters would hide the instance's own)
+    const resType = reuse(scope, JvType(res));
+    if (scope.constr) emitIf(scope, Bin('&', T.i32, Bin('&', T.i32,
+      Bin('!=', T.i32, resType, Const(T.i32, TYPES.object)),
+      Bin('!=', T.i32, resType, Const(T.i32, TYPES.undefined))),
+      Bin('>', T.u32, Bin('-', T.u32, resType, Const(T.u32, TYPES.error)), Const(T.u32, TYPES.suppressederror - TYPES.error))), () => {
+      stmt(scope, builtinCall(scope, '__Porffor_object_setPrototype', [ res, generate(scope, {
+        type: 'MemberExpression', computed: false, optional: false,
+        object: { type: 'MetaProperty', meta: { type: 'Identifier', name: 'new' }, property: { type: 'Identifier', name: 'target' } },
+        property: { type: 'Identifier', name: 'prototype' }
+      }) ], T.none));
+      stmt(scope, Assign(Local('#this', T.jsval), res));
+      if (hasClosureOwnEnv(scope) && scope.closureOwnThis) mirrorToClosureEnv(scope, '#this', { type: 'ThisExpression', _noGlobalThis: true });
+    });
+    if (tracksSuperCall(scope)) stmt(scope, Assign(local(scope, '#super_called', T.i32), Const(T.i32, 1)));
     stmt(scope, CLASS_FIELD_INIT_MARKER);
     return res;
   }
@@ -4306,7 +4353,8 @@ const generateMeta = (scope, decl) => {
     // new.target: the hidden #newtarget param (the constructor when invoked via `new`)
     if (scope.constr) return Local('#newtarget', T.jsval);
 
-    // todo: access upper-scoped new.target
+    // an arrow's is its enclosing function's (in that one's closure env)
+    if (decl._closureThisFunc) return generate(scope, closureEnvNode(scope, '#newtarget', decl._closureThisFunc));
     return valUndefined();
   }
 
@@ -5209,6 +5257,9 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
       closurePassThrough: !!decl._closurePassThrough
     }),
     closureOwnThis: !!decl._capturedThis,
+    closureOwnNewTarget: !!decl._capturedNewTarget,
+    // super() in an arrow finds the parent class through the constructor itself
+    closureOwnCallee: !!decl._capturedSuperCall && !!decl._superClassExpr,
     knownThisSlots: !arrow && !decl.generator && !decl.async && !decl._method ? getKnownThisSlots(decl) : null,
 
     // render's C signature return type (IR T.*), porffor TYPES inference type rides in
@@ -5328,6 +5379,8 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
       }
 
       if (hasClosureOwnEnv(func) && func.closureOwnThis) mirrorToClosureEnv(func, '#this', { type: 'ThisExpression' });
+      if (hasClosureOwnEnv(func) && func.closureOwnNewTarget) mirrorToClosureEnv(func, '#newtarget', { type: 'MetaProperty', meta: { type: 'Identifier', name: 'new' }, property: { type: 'Identifier', name: 'target' } });
+      if (hasClosureOwnEnv(func) && func.closureOwnCallee) mirrorToClosureEnv(func, '#callee', { type: 'Identifier', name: '#callee' });
 
       for (let i = 0; i < args.length; i++) {
         const { name: argName, def, destr, type, inferredType } = args[i];

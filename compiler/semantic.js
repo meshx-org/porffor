@@ -690,6 +690,22 @@ const annotate = (node, parent = null, key = null) => {
         node._closureThisFunc = owner;
         currentFunc._capturesThis = owner;
         owner._capturedThis = true;
+        // super() in an arrow constructs with the constructor's new.target as well
+        if (node.type === 'Super' && parent?.type === 'CallExpression' && key === 'callee') owner._capturedNewTarget = owner._capturedSuperCall = true;
+        markClosurePassThrough(currentFunc, owner);
+      }
+      break;
+    }
+
+    // new.target in an arrow is its enclosing function's
+    case 'MetaProperty': {
+      if (node.meta.name !== 'new') break;
+      const currentFunc = scopes[scopes.lastFuncs.at(-1)];
+      const owner = findLexicalThisOwner(currentFunc);
+      if (owner) {
+        node._closureThisFunc = owner;
+        currentFunc._capturesThis = owner;
+        owner._capturedNewTarget = true;
         markClosurePassThrough(currentFunc, owner);
       }
       break;

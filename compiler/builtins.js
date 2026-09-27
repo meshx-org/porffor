@@ -337,6 +337,14 @@ export const BuiltinVars = ({ builtinFuncs }) => {
       Object.defineProperty(props, '__proto__', { value: { value: errorProto, configurable: true }, enumerable: true });
     }
 
+    // the errors' prototypes have their name as a data property, and Error.prototype the
+    // message '' the others inherit (a subclass instance, a plain object, reads them there;
+    // an error's own getters are for errors)
+    if ([ 'Error', 'AggregateError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError', 'SuppressedError' ].some(e => x === `__${e}_prototype`)) {
+      props.name = { value: x.slice(2, -10), writable: true, configurable: true };
+      if (x === '__Error_prototype') props.message = { value: '', writable: true, configurable: true };
+    }
+
     // special case: Function.prototype.length = 0
     // special case: Function.prototype.name = ''
     if (x === '__Function_prototype') {
