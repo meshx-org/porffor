@@ -162,11 +162,14 @@ export const __${name}_prototype_buffer$get = function (this: ${name}): any|Arra
   return Porffor.IR.loadI32(this, 4) - Porffor.IR.loadI32(this, 8) as ArrayBuffer;
 };
 
+// a detached buffer's views are 0 long, at 0 (only a program that can detach one checks)
 export const __${name}_prototype_byteLength$get = function (this: ${name}) {
+  if (Porffor.comptime.flag\`hasFunc.__Porffor_arraybuffer_detach\`) if (__Porffor_typedArray_detached(this)) return 0;
   return Porffor.IR.loadI32(this, 0) * ${name}.BYTES_PER_ELEMENT;
 };
 
 export const __${name}_prototype_byteOffset$get = function (this: ${name}) {
+  if (Porffor.comptime.flag\`hasFunc.__Porffor_arraybuffer_detach\`) if (__Porffor_typedArray_detached(this)) return 0;
   return Porffor.IR.loadI32(this, 8);
 };
 
@@ -287,7 +290,22 @@ export const __Porffor_typedArrayCreate = (C: any, items: any[]): any => {
   if (out.length < len) throw new TypeError('constructor made a typed array too short');
   for (let k: i32 = 0; k < len; k++) out[k] = items[k];
   return out;
+};
+
+// a view of a detached buffer (its length word is -1)
+export const __Porffor_typedArray_detached = (ta: any): boolean =>
+  Porffor.IR.loadI32(Porffor.IR.loadI32(ta, 4) - Porffor.IR.loadI32(ta, 8), 0) == 4294967295;
+
+// ValidateTypedArray: such a view throws
+export const __Porffor_typedArray_validate = (ta: any): void => {
+  if (__Porffor_typedArray_detached(ta)) throw new TypeError('Cannot perform %TypedArray%.prototype method on a detached ArrayBuffer');
 };`;
+
+  // every prototype method validates this first (not the getters, nor subarray: its new view
+  // throws for a detached buffer itself), only in a program that can detach a buffer
+  out = out.replace(/(export const __\w+Array_prototype_(\w+) = function \(this: \w+[^\n]*\{\n)/g, (m, head, method) =>
+    method.endsWith('$get') || method === 'subarray' ? m
+      : head + '  if (Porffor.comptime.flag`hasFunc.__Porffor_arraybuffer_detach`) __Porffor_typedArray_validate(this);\n');
 
   return out;
 };
