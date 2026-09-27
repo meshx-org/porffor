@@ -139,7 +139,37 @@ export const __Porffor_object_ensureCapacity = (obj: any, needed: i32): i32 => {
   return newEntriesPtr;
 };
 
+// Missing properties, cached (as V8's protectors or JSC's watchpoints guard its caches): a
+// key found on neither a receiver nor its type's default prototype chain is remembered by
+// (key hash, receiver type), with the epoch it was seen at. The prototypes walked are
+// marked watched (0b0100 in their flags); adding a property to one, or changing its
+// prototype, starts a new epoch, and every remembered miss is forgotten. The receiver's
+// own properties are always looked at first.
+let missEpoch: i32 = 1;
+let missCache: i32 = 0;
+
+export const __Porffor_object_missSlot = (hash: i32, type: i32): i32 => {
+  if (missCache == 0) {
+    missCache = Porffor.malloc(1024 * 12);
+    for (let i: i32 = 0; i < 1024 * 12; i += 4) Porffor.IR.storeI32(missCache + i, 0, 0);
+  }
+  return missCache + (((hash ^ (type * -1640531535)) >>> 22) * 12);
+};
+
+export const __Porffor_object_missCached = (hash: i32, type: i32): boolean => {
+  const slot: i32 = __Porffor_object_missSlot(hash, type);
+  return Porffor.fastAnd(Porffor.IR.loadI32(slot, 0) == hash, Porffor.IR.loadI32(slot, 4) == type, Porffor.IR.loadI32(slot, 8) == missEpoch);
+};
+
+export const __Porffor_object_missRecord = (hash: i32, type: i32): void => {
+  const slot: i32 = __Porffor_object_missSlot(hash, type);
+  Porffor.IR.storeI32(slot, 0, hash);
+  Porffor.IR.storeI32(slot, 4, type);
+  Porffor.IR.storeI32(slot, 8, missEpoch);
+};
+
 export const __Porffor_object_appendEntry = (obj: any, key: any, hash: i32): i32 => {
+  if (Porffor.IR.loadU8(obj, 4) & 0b0100) missEpoch++;
   const size: i32 = Porffor.IR.loadU16(obj, 0);
   const entriesPtr: i32 = __Porffor_object_ensureCapacity(obj, size + 1);
   Porffor.IR.storeU16(obj, 0, size + 1);
@@ -200,6 +230,35 @@ export const __Porffor_underlyingRebuild = (): void => {
   for (let i: i32 = 0; i < len; i++) {
     __Porffor_underlyingInsertEntry(underlyingStore + 8 + i * 16, i);
   }
+};
+
+// the side-table object holding a non-object value's own properties, if it has one yet
+// (null if not): __Porffor_object_underlying makes one, for a value it has to write to
+export const __Porffor_object_underlyingFind = (_obj: any): any => {
+  const objType: i32 = Porffor.type(_obj);
+  if (Porffor.fastOr(underlyingStore == 0, underlyingBuckets == 0)) return null;
+  let lookupHash: i32 = Porffor.IR.ptr(_obj);
+  lookupHash = lookupHash >>> 3;
+  lookupHash ^= lookupHash >>> 16;
+  lookupHash *= 0x7feb352d;
+  lookupHash ^= lookupHash >>> 15;
+  lookupHash ^= objType;
+
+  let slot: i32 = lookupHash & (underlyingBucketsCap - 1);
+  while (true) {
+    const entry: i32 = Porffor.IR.loadI32(underlyingBuckets + slot * 4, 0);
+    if (entry == 0) return null;
+
+    const base: i32 = underlyingStore + 8 + (entry - 1) * 16;
+    if (Porffor.fastAnd(
+      Porffor.IR.ptr(Porffor.IR.loadJv(base, 0)) == Porffor.IR.ptr(_obj),
+      Porffor.IR.loadU8(base, 12) == objType
+    ))
+      return Porffor.IR.loadI32(base, 8) as object;
+
+    slot = (slot + 1) & (underlyingBucketsCap - 1);
+  }
+  return null;
 };
 
 export const __Porffor_object_underlying = (_obj: any): any => {
@@ -349,6 +408,17 @@ export const __Porffor_object_underlying = (_obj: any): any => {
   return _obj;
 };
 
+// key is 'length' or an array index (a string of digits): an own property of an array or a
+// string without a side table
+export const __Porffor_object_isLengthOrIndex = (key: any): boolean => {
+  if ((Porffor.type(key) | 0b10000000) != Porffor.TYPES.bytestring) return true;
+  if (Porffor.strcmp(key, 'length')) return true;
+  const len: i32 = key.length;
+  if (len == 0) return false;
+  const c: i32 = key.charCodeAt(0);
+  return Porffor.fastAnd(c >= 48, c <= 57);
+};
+
 export const __Porffor_object_isObject = (arg: any): boolean => {
   const t: i32 = Porffor.type(arg);
   return Porffor.fastAnd(
@@ -404,6 +474,7 @@ export const __Porffor_object_setPrototype = (obj: any, proto: any): void => {
   }
 
   if (__Porffor_object_isObjectOrNull(proto)) {
+    if (Porffor.IR.loadU8(obj, 4) & 0b0100) missEpoch++;
     Porffor.IR.storeI32(obj, 8, proto);
     Porffor.IR.storeU8(obj, 5, Porffor.type(proto));
     Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, proto);
@@ -720,28 +791,54 @@ export const __Porffor_object_get_withHash = (_obj: any, key: any, hash: i32): a
   let obj: any = _obj;
   const trueType: i32 = Porffor.type(obj);
   if (trueType == Porffor.TYPES.proxy) return __Porffor_proxy_get(_obj, key, _obj);
+  // whether the receiver has own properties to look at (an array or a string without a side
+  // table has none but its length and indices), and whether its prototype chain is its
+  // type's default one (so a miss on it can be remembered)
+  let own: boolean = true;
+  let defaultChain: boolean = false;
   if (trueType == Porffor.TYPES.object) {
     if (Porffor.IR.ptr(obj) == 0) throw new TypeError('Cannot get property of null');
+    defaultChain = Porffor.IR.loadU8(obj, 5) == Porffor.TYPES.undefined;
   } else {
     if (trueType == Porffor.TYPES.undefined) throw new TypeError('Cannot get property of null');
-    obj = __Porffor_object_underlying(obj);
+    obj = __Porffor_object_underlyingFind(_obj);
+    if (Porffor.IR.ptr(obj) != 0) {
+      defaultChain = Porffor.IR.loadU8(obj, 5) == Porffor.TYPES.undefined;
+    } else if (Porffor.fastOr(trueType == Porffor.TYPES.array, (trueType | 0b10000000) == Porffor.TYPES.bytestring)) {
+      // reading makes no side table: without one, an array's or a string's own properties
+      // are its length and indices, and only those keys need one made
+      if (__Porffor_object_isLengthOrIndex(key)) {
+        obj = __Porffor_object_underlying(_obj);
+      } else {
+        own = false;
+        defaultChain = true;
+      }
+    } else {
+      obj = __Porffor_object_underlying(_obj);
+      if (Porffor.type(obj) == Porffor.TYPES.object) defaultChain = Porffor.IR.loadU8(obj, 5) == Porffor.TYPES.undefined;
+    }
   }
 
   let entryPtr: i32 = 0;
-  if (Porffor.type(obj) == Porffor.TYPES.object) entryPtr = __Porffor_object_lookup(obj, key, hash);
+  if (own) if (Porffor.type(obj) == Porffor.TYPES.object) entryPtr = __Porffor_object_lookup(obj, key, hash);
   if (entryPtr == 0) {
+    // missing from this type's default chain the last time it was walked, unchanged since
+    if (defaultChain) if (__Porffor_object_missCached(hash, trueType)) return undefined;
+
     // check prototype chain
     if (trueType == Porffor.TYPES.object) {
       obj = __Porffor_object_getPrototype(obj);
       // if undefined, prototype is object.prototype
       if (Porffor.type(obj) == Porffor.TYPES.undefined) obj = __Object_prototype;
-    } else obj = __Porffor_object_getPrototypeWithHidden(obj, trueType);
+    } else if (!own) obj = __Porffor_object_getHiddenPrototype(trueType);
+      else obj = __Porffor_object_getPrototypeWithHidden(obj, trueType);
 
     let proto: any = obj;
     if (Porffor.type(obj) != Porffor.TYPES.object) obj = __Porffor_object_underlying(obj);
     if (obj == null) return undefined;
     while (true) {
       if ((entryPtr = __Porffor_object_lookup(obj, key, hash)) != 0) break;
+      if (defaultChain) Porffor.IR.storeU8(obj, 4, Porffor.IR.loadU8(obj, 4) | 0b0100);
 
       // inline get prototype
       obj = __Porffor_object_getPrototype(obj);
@@ -756,7 +853,10 @@ export const __Porffor_object_get_withHash = (_obj: any, key: any, hash: i32): a
       if (obj == null) break;
     }
 
-    if (entryPtr == 0) return undefined;
+    if (entryPtr == 0) {
+      if (defaultChain) __Porffor_object_missRecord(hash, trueType);
+      return undefined;
+    }
   }
 
   const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
