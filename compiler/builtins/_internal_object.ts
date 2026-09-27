@@ -730,8 +730,10 @@ export const __Porffor_object_get = (_obj: any, key: any): any => {
 };
 
 // per-call-site slot cache stores byte offsets into object entries
-// IC_EMPTY is i32 max so unset and stale slots fail the bounds/hash checks
-export const __Porffor_object_get_ic = (_obj: any, key: any, hash: i32, slot: i32): any => {
+// IC_EMPTY is i32 max so unset and stale slots fail the bounds/hash checks. The key is a
+// constant bytestring, passed as its address (one i32 at each site instead of a whole value);
+// only a miss needs it as a value
+export const __Porffor_object_get_ic = (_obj: any, keyPtr: i32, hash: i32, slot: i32): any => {
   if (Porffor.type(_obj) == Porffor.TYPES.object) {
     if (Porffor.IR.ptr(_obj) != 0) {
       const off: i32 = Porffor.IR.loadI32(slot, 0);
@@ -744,10 +746,10 @@ export const __Porffor_object_get_ic = (_obj: any, key: any, hash: i32, slot: i3
     }
   }
 
-  return __Porffor_object_get_icMiss(_obj, key, hash, slot);
+  return __Porffor_object_get_icMiss(_obj, keyPtr, hash, slot);
 };
 
-export const __Porffor_object_get_icMiss = (_obj: any, key: any, hash: i32, slot: i32): any => {
+export const __Porffor_object_get_icMiss = (_obj: any, keyPtr: i32, hash: i32, slot: i32): any => {
   if (Porffor.type(_obj) == Porffor.TYPES.object) {
     if (Porffor.IR.ptr(_obj) != 0) {
       const entriesPtr: i32 = Porffor.IR.loadI32(_obj, 12);
@@ -764,14 +766,14 @@ export const __Porffor_object_get_icMiss = (_obj: any, key: any, hash: i32, slot
     }
   }
 
-  return __Porffor_object_get_withHash(_obj, key, hash);
+  return __Porffor_object_get_withHash(_obj, Porffor.as(keyPtr, Porffor.TYPES.bytestring), hash);
 };
 
 // obj.key = value, cached per site as __Porffor_object_get_ic caches reads: the slot holds
 // the offset of the key's entry. A hit is an own, writable data property of a plain object
 // (so no setter to run and nothing to check), written as the full set writes one; anything
 // else takes the full set (strict or not), and the first property found fills the slot
-export const __Porffor_object_set_ic = (_obj: any, key: any, value: any, hash: i32, slot: i32, strict: boolean): any => {
+export const __Porffor_object_set_ic = (_obj: any, keyPtr: i32, value: any, hash: i32, slot: i32, strict: boolean): any => {
   if (Porffor.type(_obj) == Porffor.TYPES.object) {
     if (Porffor.IR.ptr(_obj) != 0) {
       const off: i32 = Porffor.IR.loadI32(slot, 0);
@@ -790,10 +792,11 @@ export const __Porffor_object_set_ic = (_obj: any, key: any, value: any, hash: i
     }
   }
 
-  return __Porffor_object_set_icMiss(_obj, key, value, hash, slot, strict);
+  return __Porffor_object_set_icMiss(_obj, keyPtr, value, hash, slot, strict);
 };
 
-export const __Porffor_object_set_icMiss = (_obj: any, key: any, value: any, hash: i32, slot: i32, strict: boolean): any => {
+export const __Porffor_object_set_icMiss = (_obj: any, keyPtr: i32, value: any, hash: i32, slot: i32, strict: boolean): any => {
+  const key: any = Porffor.as(keyPtr, Porffor.TYPES.bytestring);
   if (strict) __Porffor_object_setStrict_withHash(_obj, key, value, hash);
     else __Porffor_object_set_withHash(_obj, key, value, hash);
 

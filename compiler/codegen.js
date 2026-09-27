@@ -3149,6 +3149,11 @@ const icSlot = scope => {
   return index === 0 ? chunk : Bin('+', T.i32, chunk, Const(T.i32, index * 4));
 };
 
+// a cached site's key: the address of a constant bytestring (what the IC builtins take),
+// or null for any other key (a two-byte string), which then takes the uncached lookup
+const icKey = key => key[N_KIND] === K.Box && key[N_A][N_KIND] === K.DataRef &&
+  key[N_B][N_KIND] === K.Const && key[N_B][N_A] === TYPES.bytestring ? key[N_A] : null;
+
 const bindMemberTarget = (scope, member, prefix, coerceKey = false) => {
   const id = uniqId(scope);
   const objName = prefix + 'obj' + id;
@@ -3376,13 +3381,13 @@ const generateAssign = (scope, decl, valueUnused = false) => {
     const genericMemberSet = () => {
       const key = reuse(scope, keyOf());
       // a known key on what may be a plain object: cached per site (reads and writes)
-      const cached = hash != null && Prefs.ic && (objectKnown == null || objectKnown === TYPES.object);
+      const cached = hash != null && Prefs.ic && (objectKnown == null || objectKnown === TYPES.object) && icKey(key) != null;
       const value = op === '=' ? simpleValue
         : performOp(scope, op,
-            cached ? builtinCall(scope, '__Porffor_object_get_ic', [ obj, key, Const(T.i32, hash), icSlot(scope) ])
+            cached ? builtinCall(scope, '__Porffor_object_get_ic', [ obj, icKey(key), Const(T.i32, hash), icSlot(scope) ])
               : hash != null ? builtinCall(scope, '__Porffor_object_get_withHash', [ obj, key, Const(T.i32, hash) ]) : builtinCall(scope, '__Porffor_object_get', [ obj, key ]),
             generate(scope, decl.right), null, getNodeType(scope, decl.right));
-      if (cached) return builtinCall(scope, '__Porffor_object_set_ic', [ obj, key, value, Const(T.i32, hash), icSlot(scope), Const(T.i32, scope.strict ? 1 : 0) ]);
+      if (cached) return builtinCall(scope, '__Porffor_object_set_ic', [ obj, icKey(key), value, Const(T.i32, hash), icSlot(scope), Const(T.i32, scope.strict ? 1 : 0) ]);
       return hash != null
         ? builtinCall(scope, setBuiltin + '_withHash', [ obj, key, value, Const(T.i32, hash) ])
         : builtinCall(scope, setBuiltin, [ obj, key, value ]);
@@ -4799,8 +4804,8 @@ const generateMember = (scope, decl, objValue = null) => {
     const key = prop[N_TYPE] === T.jsval ? prop : valNumber(prop);
     if (hash == null) return builtinCall(scope, '__Porffor_object_get', [ obj, key ]);
 
-    if (Prefs.ic && (known == null || known === TYPES.object))
-      return builtinCall(scope, '__Porffor_object_get_ic', [ obj, key, Const(T.i32, hash), icSlot(scope) ]);
+    if (Prefs.ic && (known == null || known === TYPES.object) && icKey(key) != null)
+      return builtinCall(scope, '__Porffor_object_get_ic', [ obj, icKey(key), Const(T.i32, hash), icSlot(scope) ]);
 
     return builtinCall(scope, '__Porffor_object_get_withHash', [ obj, key, Const(T.i32, hash) ]);
   };
