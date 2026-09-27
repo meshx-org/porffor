@@ -485,7 +485,13 @@ export const __Porffor_object_accessorSet = (entryPtr: i32): Function|undefined 
   return out;
 };
 
+// whether any accessor has been made yet (by any of the builtins that make one, all through
+// writeAccessor): until then, a property being added has no setter on the prototype chain
+// to run instead, and the set skips looking for one
+let accessorsExist: boolean = false;
+
 export const __Porffor_object_writeAccessor = (entryPtr: i32, get: i32, set: i32): void => {
+  accessorsExist = true;
   Porffor.IR.storeI32(entryPtr, 8, get);
   Porffor.IR.storeI32(entryPtr, 12, set);
 };
@@ -771,9 +777,9 @@ export const __Porffor_object_set = (_obj: any, key: any, value: any): any => {
       return value;
     }
 
-    // todo/opt: skip if no setters used
-    // check prototype chain for setter
-    let proto: any = __Porffor_object_getPrototype(obj);
+    // check prototype chain for setter (none to find while no accessor exists)
+    let proto: any = null;
+    if (accessorsExist) proto = __Porffor_object_getPrototype(obj);
     if (proto != null) {
       if (Porffor.type(proto) != Porffor.TYPES.object) proto = __Porffor_object_underlying(proto);
       let lastProto: any = proto;
@@ -860,9 +866,9 @@ export const __Porffor_object_set_withHash = (_obj: any, key: any, value: any, h
   let entryPtr: i32 = __Porffor_object_lookup(obj, key, hash);
   let flags: i32;
   if (entryPtr == 0) {
-    // todo/opt: skip if no setters used
-    // check prototype chain for setter
-    let proto: any = __Porffor_object_getPrototype(obj);
+    // check prototype chain for setter (none to find while no accessor exists)
+    let proto: any = null;
+    if (accessorsExist) proto = __Porffor_object_getPrototype(obj);
     if (proto != null) {
       if (Porffor.type(proto) != Porffor.TYPES.object) proto = __Porffor_object_underlying(proto);
       let lastProto: any = proto;
@@ -985,9 +991,9 @@ export const __Porffor_object_setStrict = (_obj: any, key: any, value: any): any
       return value;
     }
 
-    // todo/opt: skip if no setters used
-    // check prototype chain for setter
-    let proto: any = __Porffor_object_getPrototype(obj);
+    // check prototype chain for setter (none to find while no accessor exists)
+    let proto: any = null;
+    if (accessorsExist) proto = __Porffor_object_getPrototype(obj);
     if (proto != null) {
       if (Porffor.type(proto) != Porffor.TYPES.object) proto = __Porffor_object_underlying(proto);
 
@@ -1075,9 +1081,9 @@ export const __Porffor_object_setStrict_withHash = (_obj: any, key: any, value: 
   let entryPtr: i32 = __Porffor_object_lookup(obj, key, hash);
   let flags: i32;
   if (entryPtr == 0) {
-    // todo/opt: skip if no setters used
-    // check prototype chain for setter
-    let proto: any = __Porffor_object_getPrototype(obj);
+    // check prototype chain for setter (none to find while no accessor exists)
+    let proto: any = null;
+    if (accessorsExist) proto = __Porffor_object_getPrototype(obj);
     if (proto != null) {
       if (Porffor.type(proto) != Porffor.TYPES.object) proto = __Porffor_object_underlying(proto);
 
