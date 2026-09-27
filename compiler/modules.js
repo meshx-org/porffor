@@ -251,7 +251,19 @@ export default (entrySource, entryFile, opts = {}) => {
     const ts = /\.[cm]?tsx?$/.test(file) || !!(entry ? opts.ts : Prefs.parseTypes || Prefs.t);
     anyTs ||= ts;
     mod.esm = entry || isEsmSource(file, source);
-    mod.body = parse(source, { module: mod.esm, ts }).body;
+    if (mod.esm) mod.body = parse(source, { module: true, ts }).body;
+      else try {
+        mod.body = parse(source, { module: false, ts }).body;
+      } catch (e) {
+        // as Node's syntax detection: a file that is no script but is a module (a top-level
+        // await with no import or export to give it away) is a module
+        try {
+          mod.body = parse(source, { module: true, ts }).body;
+          mod.esm = true;
+        } catch {
+          throw e;
+        }
+      }
     if (mod.esm) collectModule(mod);
     else mod.body.unshift(
       varDecl('const', 'module', { type: 'ObjectExpression', properties: [ property(ident('exports'), { type: 'ObjectExpression', properties: [] }) ] }),
