@@ -30,7 +30,7 @@ const BYTES_PER_ELEMENT = { Uint8Array: 1, Int8Array: 1, Uint8ClampedArray: 1, U
 
 // the prototypes whose [Symbol.toStringTag] is a plain string (Object.prototype.toString
 // reads it, so a program can delete or change it); the others have a builtinTag of their own
-const TO_STRING_TAGS = [ 'Map', 'Set', 'WeakMap', 'WeakSet', 'WeakRef', 'Promise', 'ArrayBuffer', 'SharedArrayBuffer', 'DataView', 'BigInt', 'Symbol', 'TextEncoder', 'TextDecoder', 'DisposableStack', 'AsyncDisposableStack' ];
+const TO_STRING_TAGS = [ 'Map', 'Set', 'WeakMap', 'WeakSet', 'WeakRef', 'Promise', 'ArrayBuffer', 'SharedArrayBuffer', 'DataView', 'BigInt', 'Symbol', 'TextEncoder', 'TextDecoder', 'DisposableStack', 'AsyncDisposableStack', 'FinalizationRegistry' ];
 
 // symbol-keyed methods, the same function as a string-keyed one: using reads them (inside a
 // builtin, so no member demand), so they are always there

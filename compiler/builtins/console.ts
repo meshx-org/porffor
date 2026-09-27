@@ -322,6 +322,10 @@ export const __Porffor_print = (arg: any, colors: boolean = true, depth: number 
       Porffor.printStatic('WeakRef {}');
       return;
 
+    case Porffor.TYPES.finalizationregistry:
+      Porffor.printStatic('FinalizationRegistry {}');
+      return;
+
     case Porffor.TYPES.error:
       __Porffor_printString(Porffor.callThis(__Error_prototype_toString, arg));
       return;

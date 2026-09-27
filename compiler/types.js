@@ -77,3 +77,5 @@ registerInternalType('AsyncDisposableStack');
 
 registerInternalType('TextEncoder');
 registerInternalType('TextDecoder');
+
+registerInternalType('FinalizationRegistry');

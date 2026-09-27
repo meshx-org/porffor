@@ -696,6 +696,7 @@ export const __Object_prototype_toString = function (this: any) {
     case Porffor.TYPES.weakmap: return '[object WeakMap]';
     case Porffor.TYPES.weakset: return '[object WeakSet]';
     case Porffor.TYPES.weakref: return '[object WeakRef]';
+    case Porffor.TYPES.finalizationregistry: return '[object FinalizationRegistry]';
     case Porffor.TYPES.promise: return '[object Promise]';
     case Porffor.TYPES.arraybuffer: return '[object ArrayBuffer]';
     case Porffor.TYPES.sharedarraybuffer: return '[object SharedArrayBuffer]';

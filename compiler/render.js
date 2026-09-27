@@ -3280,6 +3280,14 @@ weakmap_seen:
       porf_gc_mark_js(v.val, v.type);
       break;
     }
+    // its cells (an array) and cleanup callback
+    case ${TYPES.finalizationregistry}: {
+      const jsval cells = porf_unpack(*(jsbits*)(MEM + body));
+      porf_gc_mark_js(cells.val, cells.type);
+      const jsval cleanup = porf_unpack(*(jsbits*)(MEM + body + 8));
+      porf_gc_mark_js(cleanup.val, cleanup.type);
+      break;
+    }
     case ${TYPES.proxy}: {
       // [target, handler], both strong
       const jsval target = porf_unpack(*(jsbits*)(MEM + body));
