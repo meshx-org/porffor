@@ -114,17 +114,8 @@ export const __Porffor_disposable_list = (stack: any): any[] => {
   return list;
 };
 
-// Porffor builds prototype objects from string-keyed members only: the symbol-keyed ones
-// are put on at the first construction
-export const __Porffor_disposable_protoSymbols = (proto: any, dispose: any, tag: any, async: boolean): void => {
-  if (Porffor.object.lookup(proto, Symbol.toStringTag) != 0) return;
-  __Porffor_object_define(proto, async ? Symbol.asyncDispose : Symbol.dispose, dispose, 0b1010);
-  __Porffor_object_define(proto, Symbol.toStringTag, tag, 0b0010);
-};
-
 export const DisposableStack = function (): DisposableStack {
   if (!new.target) throw new TypeError("Constructor DisposableStack requires 'new'");
-  __Porffor_disposable_protoSymbols(__DisposableStack_prototype, __DisposableStack_prototype_dispose, 'DisposableStack', false);
 
   const out: DisposableStack = Porffor.malloc(8);
   Porffor.IR.storeJv(out, 0, Porffor.array.new(4));
@@ -166,7 +157,6 @@ export const __DisposableStack_prototype_move = function (this: DisposableStack)
 
 export const AsyncDisposableStack = function (): AsyncDisposableStack {
   if (!new.target) throw new TypeError("Constructor AsyncDisposableStack requires 'new'");
-  __Porffor_disposable_protoSymbols(__AsyncDisposableStack_prototype, __AsyncDisposableStack_prototype_disposeAsync, 'AsyncDisposableStack', true);
 
   const out: AsyncDisposableStack = Porffor.malloc(8);
   Porffor.IR.storeJv(out, 0, Porffor.array.new(4));

@@ -701,10 +701,11 @@ export const __Object_prototype_toString = function (this: any) {
     case Porffor.TYPES.symbol: return '[object Symbol]';
     case Porffor.TYPES.textencoder: return '[object TextEncoder]';
     case Porffor.TYPES.textdecoder: return '[object TextDecoder]';
+    case Porffor.TYPES.disposablestack: return '[object DisposableStack]';
+    case Porffor.TYPES.asyncdisposablestack: return '[object AsyncDisposableStack]';
   }
 
-  // %TypedArray%.prototype's tag getter, the generators' prototypes, the disposable stacks
-  // (which put their tags on at construction) and Error's builtinTag
+  // %TypedArray%.prototype's tag getter, the generators' prototypes and Error's builtinTag
   switch (Porffor.type(this)) {
     case Porffor.TYPES.uint8clampedarray: return '[object Uint8ClampedArray]';
     case Porffor.TYPES.uint8array: return '[object Uint8Array]';
@@ -719,8 +720,6 @@ export const __Object_prototype_toString = function (this: any) {
     case Porffor.TYPES.float64array: return '[object Float64Array]';
     case Porffor.TYPES.__porffor_generator: return '[object Generator]';
     case Porffor.TYPES.__porffor_asyncgenerator: return '[object AsyncGenerator]';
-    case Porffor.TYPES.disposablestack: return '[object DisposableStack]';
-    case Porffor.TYPES.asyncdisposablestack: return '[object AsyncDisposableStack]';
     case Porffor.TYPES.error:
     case Porffor.TYPES.aggregateerror:
     case Porffor.TYPES.typeerror:

@@ -36,8 +36,15 @@ export const BuiltinVars = ({ builtinFuncs }) => {
   const toStringTags = {
     Math: 'Math', JSON: 'JSON', Reflect: 'Reflect', Atomics: 'Atomics'
   };
-  for (const x of [ 'Map', 'Set', 'WeakMap', 'WeakSet', 'WeakRef', 'Promise', 'ArrayBuffer', 'SharedArrayBuffer', 'DataView', 'BigInt', 'Symbol', 'TextEncoder', 'TextDecoder' ])
+  for (const x of [ 'Map', 'Set', 'WeakMap', 'WeakSet', 'WeakRef', 'Promise', 'ArrayBuffer', 'SharedArrayBuffer', 'DataView', 'BigInt', 'Symbol', 'TextEncoder', 'TextDecoder', 'DisposableStack', 'AsyncDisposableStack' ])
     toStringTags[`__${x}_prototype`] = x;
+
+  // symbol-keyed methods, the same function as a string-keyed one: using reads them (inside
+  // a builtin, so no member demand), so they are always there
+  const symbolMethods = {
+    __DisposableStack_prototype: [ 'dispose', '__DisposableStack_prototype_dispose' ],
+    __AsyncDisposableStack_prototype: [ 'asyncDispose', '__AsyncDisposableStack_prototype_disposeAsync' ]
+  };
 
   const done = new Set();
   const object = (name, props) => {
@@ -155,6 +162,15 @@ export const BuiltinVars = ({ builtinFuncs }) => {
           for (const x in props) emitProp(out, x, props[x]);
         }
 
+        const wellKnown = x => {
+          includeBuiltin('Symbol');
+          return global(`#wellknown_${x}`, T.jsval, Call('Symbol', [ makeString(`Symbol.${x}`) ], T.jsval));
+        };
+
+        const symbolMethod = symbolMethods[name];
+        if (symbolMethod)
+          out.push(Call('__Porffor_object_fastAdd', [ obj, wellKnown(symbolMethod[0]), funcValue(symbolMethod[1]), Const(T.i32, 0b1010) ], T.none));
+
         // only a program that names .toStringTag can read one
         const tag = toStringTags[name];
         if (tag) {
@@ -162,8 +178,7 @@ export const BuiltinVars = ({ builtinFuncs }) => {
           onFinalize(() => {
             tagAdd.length = 0;
             if (!memberDemanded('toStringTag')) return;
-            includeBuiltin('Symbol');
-            const symbol = global('#wellknown_toStringTag', T.jsval, Call('Symbol', [ makeString('Symbol.toStringTag') ], T.jsval));
+            const symbol = wellKnown('toStringTag');
             tagAdd.push(Call('__Porffor_object_fastAdd', [ obj, symbol, makeString(tag), Const(T.i32, 0b0010) ], T.none));
           });
           out.push(BlockStmt(tagAdd));
