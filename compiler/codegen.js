@@ -3006,7 +3006,12 @@ const ctHash = prop => {
 
   prop = prop.property.name;
   if (!prop || prop === '__proto__' || !byteStringable(prop)) return null;
+  return hashString(prop);
+};
 
+// the hash __Porffor_object_hash gives a string at run time (xxh32-based), of a one-byte
+// string known now: a property key, a switch case
+const hashString = prop => {
   let i = 0;
   const len = prop.length;
   let hash = 374761393;
@@ -4019,9 +4024,26 @@ const generateSwitch = (scope, decl) => {
 
   const labels = cases.map(() => fresh(scope));
 
+  // --switch-hash: with string cases, the discriminant is hashed once (as a property key
+  // is) and a string case compares its hash, known now, before comparing the strings: a
+  // case that does not match costs an integer compare, not a string compare
+  const hashCase = x => Prefs.switchHash && x.test?.type === 'Literal' && typeof x.test.value === 'string' && byteStringable(x.test.value);
+  let discHash = null;
+
   const comparisons = collect(scope, () => {
+    if (cases.filter(hashCase).length >= 2) {
+      const disc = generate(scope, { type: 'Identifier', name: discName });
+      const t = reuse(scope, JvType(disc));
+      discHash = tmp(scope, T.i32, Const(T.i32, 0));
+      emitIf(scope, Bin('==', T.i32, Bin('|', T.i32, t, Const(T.i32, 0x80)), Const(T.i32, TYPES.bytestring)),
+        () => assign(scope, discHash, builtinCall(scope, '__Porffor_object_hash', [ generate(scope, { type: 'Identifier', name: discName }) ])));
+    }
     for (let i = 0; i < N; i++) {
-      if (cases[i].test) {
+      if (cases[i].test && discHash && hashCase(cases[i])) {
+        emitIf(scope, Bin('==', T.i32, discHash, Const(T.i32, hashString(cases[i].test.value))),
+          () => emitIf(scope, JvTruthy(generate(scope, { type: 'BinaryExpression', operator: '===', left: { type: 'Identifier', name: discName }, right: cases[i].test })),
+            () => stmt(scope, Break(labels[N - 1 - i]))));
+      } else if (cases[i].test) {
         emitIf(scope, JvTruthy(generate(scope, { type: 'BinaryExpression', operator: '===', left: { type: 'Identifier', name: discName }, right: cases[i].test })),
           () => stmt(scope, Break(labels[N - 1 - i])));
       } else {
