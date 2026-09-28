@@ -1653,7 +1653,9 @@ const getNodeType = (scope, node) => {
       // `x.call(...)` -> type of x
       if (name == null && node.callee.type === 'MemberExpression' && node.callee.property.name === 'call') name = node.callee.object.name;
       if (name != null) {
-        const func = resolveNamedFunction(scope, name) ?? funcByName(name);
+        // (a name several functions share resolves to none: taking any one of them, by
+        // funcByName, typed a call by another function's return)
+        const func = resolveNamedFunction(scope, name);
         if (node.type === 'CallExpression' && (func?.generator || func?.async)) ret = func.async
           ? (func.generator ? TYPES.__porffor_asyncgenerator : TYPES.promise)
           : TYPES.__porffor_generator;
@@ -2914,6 +2916,9 @@ const generateVarDstr = (scope, kind, pattern, init, defaultValue, global) => {
       // an earlier-generated function already read the hoisted global
       const hoistRead = global && name in globals;
       if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {
+        // no binding holds it, so its calls resolve by name: to this function in this scope,
+        // not a same-named one declared further out
+        bindNamedFunction(scope, name, func);
         return valUndefined();
       }
 
@@ -5650,8 +5655,13 @@ const resolveNamedFunction = (scope, name) => {
   for (let cursor = scope; cursor; cursor = cursor.parentFunc) {
     const func = cursor.namedFuncBindings?.[name];
     if (func) return func;
+    // a variable or parameter of this name (const f = () => ..., a callback's resolve)
+    // shadows any function declared by it further out: which function it holds is not known
+    if (cursor.locals && Object.hasOwn(cursor.locals, name)) return null;
   }
 
+  // (a top-level variable, the same)
+  if (globals && Object.hasOwn(globals, name)) return null;
   if (!hasAmbiguousFuncName(name)) return funcByName(name);
   return null;
 };
@@ -5961,6 +5971,8 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
         if (args[i].rest) {
           setLocalWithType(func, argName, false, Local('#rest', T.jsval), false, TYPES.array);
           if (hasClosureOwnEnv(func) && func.closureOwnLocals?.[argName]) mirrorToClosureEnv(func, argName);
+          // ...[a, ...b] / ...{ length }: the rest array destructured into the pattern's names
+          if (destr) generateVarDstr(func, 'var', destr, { type: 'Identifier', name: argName }, undefined, false);
           continue;
         }
 

@@ -4134,6 +4134,11 @@ ${st}void porf_gc_collect_idle(void) {
 ` : ''}\
 
 ${st}void porf_gc_collect(int minor) {
+#ifdef PORF_GC_OFF
+  // debugging: never collect (the heap only grows), to tell a GC bug from any other
+  (void)minor;
+  return;
+#endif
   if (porf_heap_base == 0) return;
   for (i32 ci = 0; ci < PORF_GC_NCLASSES; ci++) porf_gc_publish_window(ci);
   porf_gc_minor_mode = minor;
@@ -4396,7 +4401,9 @@ PORF_NORETURN static void porf_stack_overflow(void) {
 // wasi's malloc-backed mmap ignores fixed hints and cannot change protections
 // or decommit, so use a small, fully committed arena
 #define PORF_ARENA_HINT NULL
+#ifndef PORF_ARENA_RESERVE
 #define PORF_ARENA_RESERVE (1ull << 26)
+#endif
 #define PORF_MMAP_RESERVE_PROT (PROT_READ | PROT_WRITE)
 #define PORF_CAN_DECOMMIT 0
 #else
