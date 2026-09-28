@@ -4448,7 +4448,7 @@ const printStaticStr = (scope, str) => {
   if (str.length === 0) return [];
   let literal = '';
   for (let i = 0; i < str.length; i++) literal += '\\' + str.charCodeAt(i).toString(8).padStart(3, '0');
-  return [ RawC(`printf("%.*s", ${str.length}, "${literal}")`) ];
+  return [ RawC(`porf_out("${literal}", ${str.length})`) ];
 };
 
 const byteStringable = str => {
@@ -4617,10 +4617,15 @@ const literalString = (scope, str) => {
   return { type: v[N_B][N_A], seg: v[N_A][N_A] };
 };
 
-// the template for an object or array literal, { type, seg }, or null if it is not all constant
-const literalTemplate = (scope, node) => {
+// the template for an object or array literal, { type, seg }, or null if it is not all constant.
+// With shape, an object literal's values need not be constant: each one that is not is left
+// undefined in the template and listed in dynamic ({ slot, x }, its property), for the code
+// that clones the template to evaluate and store
+const literalTemplate = (scope, node, shape = false) => {
   if (globalThis.precompile) return null;
+  if (shape && node.type !== 'ObjectExpression') return null;
   const relocs = [];
+  const dynamic = [];
   let bytes;
 
   if (node.type === 'ArrayExpression') {
@@ -4648,18 +4653,24 @@ const literalTemplate = (scope, node) => {
     const entries = [];
     const keys = new Set();
     for (const x of node.properties) {
-      if (x.type !== 'Property' || x.kind !== 'init' || x.computed || x.method || x.shorthand) return null;
+      if (x.type !== 'Property' || x.kind !== 'init' || x.computed || x.method || (x.shorthand && !shape)) return null;
       const key = getProperty(x, true).value;
       if (typeof key !== 'string' || key === '__proto__' || keys.has(key)) return null;
       keys.add(key);
       // a key with no hash known now (the empty key, a two-byte one) is set at run time
       const hash = ctHash({ property: { name: key } });
       if (hash == null) return null;
-      const v = literalConstant(scope, x.value);
-      if (v == null) return null;
+      let v = x.shorthand ? null : literalConstant(scope, x.value);
+      if (v == null) {
+        if (!shape) return null;
+        dynamic.push({ slot: entries.length, x });
+        v = { type: TYPES.undefined, payload: 0 };
+      }
       entries.push({ key, keyString: literalString(scope, key), hash, v });
     }
-    if (entries.length === 0) return null;
+    if (entries.length === 0 || entries.length > 0xffff) return null;
+    // (all dynamic, or nothing: no shape to share, or the plain constant template)
+    if (shape && dynamic.length === 0) return null;
     const capacity = Math.max(entries.length, 2);
     bytes = [ entries.length & 0xff, entries.length >> 8, capacity & 0xff, capacity >> 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ];
     for (let i = 0; i < capacity; i++) {
@@ -4677,15 +4688,59 @@ const literalTemplate = (scope, node) => {
   }
 
   const type = node.type === 'ArrayExpression' ? TYPES.array : TYPES.object;
+  if (shape && type !== TYPES.object) return null;
   const key = `#tmpl:${type}:${bytes.join(',')}:${relocs.map(r => `${r.off}.${r.seg}.${r.kind}.${r.type}`).join(',')}`;
   bytes.relocs = relocs;
   typeUsed(scope, type);
-  return { type, seg: dataSeg(unitOf(scope), key, bytes) };
+  return { type, seg: dataSeg(unitOf(scope), key, bytes), dynamic };
+};
+
+// an object literal's property value as it is generated: a function is named after its key
+// and a method is no constructor
+const objectPropertyValue = (x, key) => {
+  let { kind, value, method } = x;
+  if (method) {
+    value._method = true;
+    value._noGlobalThis = true;
+  }
+  if (isFuncType(value.type)) {
+    let id = value.id;
+    let noFuncIndex = false;
+
+    // todo: support computed names properly
+    if (typeof key.value === 'string' && !id) {
+      id = { type: 'Identifier', name: key.value };
+      noFuncIndex = true;
+    }
+
+    // keep closure owner identity for semantic capture resolution; an accessor's name is
+    // "get x" / "set x"
+    value = { ...value, id, _noFuncIndex: noFuncIndex, _closureSource: value._closureSource ?? value,
+      ...((kind === 'get' || kind === 'set') && typeof key.value === 'string' ? { _jsName: kind + ' ' + key.value } : {}) };
+  }
+  return value;
 };
 
 const generateObject = (scope, decl) => {
   const template = literalTemplate(scope, decl);
   if (template) return valOf(reuse(scope, Clone(DataRef(template.seg), template.type)), template.type);
+
+  // its keys constant: the object is its shape's template cloned (keys, hashes and flags
+  // written once, in data), then each value that is not constant stored in its slot
+  const shape = literalTemplate(scope, decl, true);
+  if (shape) {
+    const obj = reuse(scope, valOf(reuse(scope, Clone(DataRef(shape.seg), TYPES.object)), TYPES.object));
+    const allocated = freshMark(scope);
+    for (const { slot, x } of shape.dynamic) {
+      const val = reuse(scope, coerceValue(generate(scope, objectPropertyValue(x, getProperty(x, true))), T.jsval));
+      const entries = Load('u32', JvPtr(obj), 12);
+      stmt(scope, Store('f64', entries, slot * 20 + 8, JvNum(val), true));
+      stmt(scope, Store('u8', entries, slot * 20 + 17, JvType(val)));
+      if (!stillFresh(scope, allocated)) stmt(scope, If(canReferenceCheck(scope, val), [ GcBarrier(JvPtr(obj), Const(T.i32, TYPES.object)) ]));
+    }
+    typeUsed(scope, TYPES.object);
+    return obj;
+  }
 
   const obj = reuse(scope, builtinCall(scope, '__Porffor_object_new', [ Const(T.i32, Math.max(decl.properties.length, 2)) ]));
   // __Porffor_object_new allocates it as an object: fresh, as makeArrayFromValues' array is
@@ -5009,7 +5064,12 @@ const generateMember = (scope, decl, objValue = null) => {
       bc.push([ t, () => callGetter(obj) ]);
     }
 
-    if (known == null) extraBC = bc;
+    // a value of no known type, in a program, reads the getter through the property lookup
+    // (the prototype's accessor) rather than a case per type at every site; but for an
+    // Error's message, which Error.prototype's own '' would shadow, and a typed array's
+    // getters, which live on %TypedArray% (a lookup does not reach)
+    if (known == null) extraBC = globalThis.precompile || decl.property.name === 'message' ? bc
+      : bc.filter(([ t ]) => t !== TYPES.array && TYPE_NAMES[t]?.endsWith('Array'));
   }
 
   const hash = ctHash(decl);
@@ -5109,8 +5169,15 @@ const generateMember = (scope, decl, objValue = null) => {
 
   if (decl.property.name === 'length') return lengthMemberGet();
 
+  // o[i] on a value of no known type, in a program: an array's element and a bytestring's
+  // character inline, every other type's through one shared builtin (a UTF-16 string's
+  // character, a typed array's element, a property): the rare cases, once, not at every site
+  const indexedMemberGetShared = [
+    indexedMemberGetBC[0], indexedMemberGetBC[2],
+    [ 'default', () => builtinCall(scope, '__Porffor_object_indexGet', [ obj, prop ]) ]
+  ];
   if (decl.computed) return typeSwitch(scope, prop, propertyKnown, {
-    [TYPES.number]: () => typeSwitch(scope, obj, known, indexedMemberGetBC),
+    [TYPES.number]: () => typeSwitch(scope, obj, known, known == null && !globalThis.precompile ? indexedMemberGetShared : indexedMemberGetBC),
     default: () => typeSwitch(scope, obj, known, genericMemberGetBC)
   });
 

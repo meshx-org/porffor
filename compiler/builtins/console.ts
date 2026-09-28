@@ -12,7 +12,7 @@ export const __Porffor_printString = (arg: bytestring|string): void => {
       break;
     }
     if (ascii) {
-      Porffor.c`printf("%.*s", len, (char*)(MEM + ptr + 4));`;
+      Porffor.c`porf_out((const char*)(MEM + ptr + 4), (int)len);`;
       return;
     }
     for (let i: i32 = 0; i < len; i++) {
@@ -45,7 +45,7 @@ export const __Porffor_printHexDigit = (arg: number): void => {
     case 0xb: Porffor.printStatic('b'); return;
     case 0xa: Porffor.printStatic('a'); return;
 
-    default: Porffor.c`printf("%.15g", arg.val);`;
+    default: Porffor.c`{ const jsval _s = porf_num_to_str(arg.val); porf_out((const char*)(MEM + (u32)_s.val + 4), (int)*(u32*)(MEM + (u32)_s.val)); }`;
   }
 };
 
@@ -54,7 +54,7 @@ export const __Porffor_print = (arg: any, colors: boolean = true, depth: number 
     const arrLen: i32 = arg.length;
     if (length) {
       Porffor.printStatic('(');
-      Porffor.c`printf("%d", arrLen);`;
+      Porffor.c`porf_out_int(arrLen);`;
       Porffor.printStatic(') ');
     }
 
@@ -75,7 +75,7 @@ export const __Porffor_print = (arg: any, colors: boolean = true, depth: number 
     case Porffor.TYPES.number:
       if (colors) Porffor.printStatic('\x1b[33m'); // yellow
       // as Number::toString (%.15g lost digits: 0.1 + 0.2 printed 0.3), and -0 as -0 as Node
-      Porffor.c`if (arg.val == 0 && signbit(arg.val)) printf("-0"); else { const jsval s = porf_num_to_str(arg.val); printf("%.*s", (int)*(u32*)(MEM + (u32)s.val), (const char*)(MEM + (u32)s.val + 4)); }`;
+      Porffor.c`if (arg.val == 0 && signbit(arg.val)) porf_out("-0", 2); else { const jsval s = porf_num_to_str(arg.val); porf_out((const char*)(MEM + (u32)s.val + 4), (int)*(u32*)(MEM + (u32)s.val)); }`;
       if (colors) Porffor.printStatic('\x1b[0m');
       return;
 
@@ -266,7 +266,7 @@ export const __Porffor_print = (arg: any, colors: boolean = true, depth: number 
       Porffor.printStatic('>,\n  byteLength: ');
       if (colors) Porffor.printStatic('\x1b[33m'); // yellow
       const byteLength: number = arg.byteLength;
-      Porffor.c`printf("%.15g", byteLength);`;
+      Porffor.c`{ const jsval _s = porf_num_to_str(byteLength); porf_out((const char*)(MEM + (u32)_s.val + 4), (int)*(u32*)(MEM + (u32)_s.val)); }`;
       if (colors) Porffor.printStatic('\x1b[0m');
       Porffor.printStatic('\n}');
       return;
@@ -290,7 +290,7 @@ export const __Porffor_print = (arg: any, colors: boolean = true, depth: number 
 
       const map: any[] = Porffor.callThis(__Porffor_map_keysArray, arg);
       const mapLen: i32 = map.length - 1;
-      Porffor.c`printf("%d", mapLen + 1);`;
+      Porffor.c`porf_out_int(mapLen + 1);`;
       Porffor.printStatic(') { ');
 
       for (let i: i32 = 0; i < mapLen; i++) {
@@ -312,7 +312,7 @@ export const __Porffor_print = (arg: any, colors: boolean = true, depth: number 
 
       const set: any[] = Porffor.callThis(__Porffor_set_valuesArray, arg);
       const setLen: i32 = set.length - 1;
-      Porffor.c`printf("%d", setLen + 1);`;
+      Porffor.c`porf_out_int(setLen + 1);`;
       Porffor.printStatic(') { ');
 
       for (let i: i32 = 0; i <= setLen; i++) {
@@ -534,7 +534,7 @@ export const __console_count = (label: any): void => {
   __Porffor_consoleIndent();
   __Porffor_consolePrint(label);
   Porffor.printStatic(': ');
-  Porffor.c`printf("%.15g", val.val);`;
+  Porffor.c`{ const jsval _s = porf_num_to_str(val.val); porf_out((const char*)(MEM + (u32)_s.val + 4), (int)*(u32*)(MEM + (u32)_s.val)); }`;
   Porffor.printStatic('\n');
 };
 
@@ -574,7 +574,7 @@ export const __console_timeLog = (label: any): void => {
   Porffor.printStatic(': ');
 
   const elapsed: number = performance.now() - val;
-  Porffor.c`printf("%.15g", elapsed);`;
+  Porffor.c`{ const jsval _s = porf_num_to_str(elapsed); porf_out((const char*)(MEM + (u32)_s.val + 4), (int)*(u32*)(MEM + (u32)_s.val)); }`;
   Porffor.printStatic(' ms\n');
 };
 

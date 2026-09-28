@@ -748,6 +748,10 @@ export const __Porffor_object_speciesGet = (receiver: any): any => {
   return undefined;
 };
 
+// o[i] for a number i, on any value (a program's shared path for the types it does not
+// inline at the site: builtins/codegen.js indexedMemberGetShared)
+export const __Porffor_object_indexGet = (obj: any, index: number): any => obj[index];
+
 // a function's arguments object (an array marked in its header's last word)
 export const __Porffor_array_isArguments = (arr: any): boolean => Porffor.IR.loadI32(arr, 12) == 0x41524753;
 

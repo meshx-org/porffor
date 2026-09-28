@@ -1365,9 +1365,12 @@ ${st}jsval porf_call3(jsval fn, jsval thisv, jsval a0, jsval a1, jsval a2);
   if (gcEnabled) {
     const markGlobalRootLines = [];
     const markGlobalRawLines = [];
+    // the value globals: a table of their addresses, walked by one loop (a call per global
+    // would be code for each)
+    const jsvalRoots = [];
     for (const g of globals) {
       const name = sanitize(g.name);
-      if (g.type === T.jsval) markGlobalRootLines.push(`  porf_gc_mark_js(${name}.val, ${name}.type);`);
+      if (g.type === T.jsval) jsvalRoots.push(`&${name}`);
       // (builtin globals holding a raw block: the miss cache is marked like any other)
       else if (g.type === T.ptr || (g.type === T.i32 && /(?:underlyingStore|underlyingBuckets|__Porffor_regex_cache|missCache|__Porffor_json_buf)$/.test(g.name))) {
         if (/underlyingStore$/.test(g.name)) {
@@ -1383,6 +1386,10 @@ ${st}jsval porf_call3(jsval fn, jsval thisv, jsval a0, jsval a1, jsval a2);
         }
         else markGlobalRawLines.push(`  porf_gc_mark_raw((i32)${name});`);
       }
+    }
+    if (jsvalRoots.length) {
+      link.push(`static jsval* const porf_gc_jsval_roots[] = { ${jsvalRoots.join(', ')} };\n`);
+      markGlobalRootLines.unshift(`  for (u32 i = 0; i < ${jsvalRoots.length}u; i++) porf_gc_mark_js(porf_gc_jsval_roots[i]->val, porf_gc_jsval_roots[i]->type);`);
     }
     link.push(`${st}void porf_gc_mark_global_roots(void) {\n${markGlobalRootLines.join('\n') || '  (void)0;'}\n}\n\n`);
     link.push(`${st}void porf_gc_mark_global_raw_roots(void) {\n${markGlobalRawLines.join('\n') || '  (void)0;'}\n}\n\n`);
@@ -1996,7 +2003,7 @@ u32 porf_native_fetch_alloc_bytestring(const char* input, size_t len) {
 
 void porf_native_fetch_runtime_init(void) {
 #ifdef _WIN32
-  fprintf(stderr, "Porffor native fetch server is not yet implemented on Windows\\n");
+  porf_err("Porffor native fetch server is not yet implemented on Windows\\n");
   exit(1);
 #else
   signal(SIGPIPE, SIG_IGN);
@@ -2238,7 +2245,7 @@ static void porf_commit(u32 end) {
   if (end <= porf_heap_committed) return;
   u32 want = (end + (1u << 20)) & ~((1u << 20) - 1);
   if (!PORF_CAN_DECOMMIT || mprotect(MEM, want, PROT_READ | PROT_WRITE) != 0) {
-    fprintf(stderr, "porffor: out of memory (commit %u)\\n", want);
+    porf_err("porffor: out of memory (commit "); porf_err_int(want); porf_err(")\\n");
     exit(1);
   }
   porf_heap_committed = want;
@@ -2248,7 +2255,7 @@ static void porf_arena_init(void) {
   void* got = mmap(PORF_ARENA_HINT, PORF_ARENA_RESERVE, PORF_MMAP_RESERVE_PROT,
     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (got == MAP_FAILED) {
-    fprintf(stderr, "porffor: failed to reserve arena\\n");
+    porf_err("porffor: failed to reserve arena\\n");
     exit(1);
   }
   porf_mem = (u8*)got;
@@ -2453,11 +2460,11 @@ static void porf_commit(u64 end) {
   if (end <= porf_heap_committed) return;
   const u64 want = (end + (1ull << 20)) & ~((1ull << 20) - 1ull);
   if (want > PORF_ARENA_RESERVE) {
-    fprintf(stderr, "porffor: out of memory (commit %llu)\\n", (unsigned long long)want);
+    porf_err("porffor: out of memory (commit "); porf_err_int((long long)want); porf_err(")\\n");
     exit(1);
   }
   if (PORF_CAN_DECOMMIT && mprotect(MEM + porf_heap_committed, (size_t)(want - porf_heap_committed), PROT_READ | PROT_WRITE) != 0) {
-    fprintf(stderr, "porffor: out of memory (commit %llu)\\n", (unsigned long long)want);
+    porf_err("porffor: out of memory (commit "); porf_err_int((long long)want); porf_err(")\\n");
     exit(1);
   }
   porf_heap_committed = want;
@@ -2467,7 +2474,7 @@ static void porf_arena_init(void) {
   void* got = mmap(PORF_ARENA_HINT, PORF_ARENA_RESERVE, PORF_MMAP_RESERVE_PROT,
     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (got == MAP_FAILED) {
-    fprintf(stderr, "porffor: failed to reserve arena\\n");
+    porf_err("porffor: failed to reserve arena\\n");
     exit(1);
   }
   porf_mem = (u8*)got;
@@ -2485,7 +2492,7 @@ static void porf_arena_init(void) {
   u8* side = (u8*)mmap(NULL, side_bytes, PROT_READ | PROT_WRITE,
     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (side == MAP_FAILED) {
-    fprintf(stderr, "porffor: failed to reserve gc metadata\\n");
+    porf_err("porffor: failed to reserve gc metadata\\n");
     exit(1);
   }
   porf_gc_kinds = side; side += kinds_bytes;
@@ -2804,8 +2811,9 @@ ${minorsEnabled ? `  if (porf_gc_window_bytes >= (i64)PORF_GC_NURSERY_BYTES || p
   if (bytes > PORF_GC_MAX_SMALL) return porf_gc_span_alloc(bytes, typeId);
   const u32 ci = porf_gc_cls_lut[(bytes + 7u) >> 3];
   if (porf_gc_refill_window((i32)ci)) return porf_alloc(bytes, typeId);
-  fprintf(stderr, "porffor: out of memory (gc heap limit; req=%u live=%lluMB heap_top=%u)\\n",
-    bytes, (unsigned long long)(porf_gc_live_bytes / 1048576ull), porf_heap_top);
+  porf_err("porffor: out of memory (gc heap limit; req="); porf_err_int(bytes);
+  porf_err(" live="); porf_err_int((long long)(porf_gc_live_bytes / 1048576ull));
+  porf_err("MB heap_top="); porf_err_int(porf_heap_top); porf_err(")\\n");
   abort();
 }
 
@@ -2813,7 +2821,8 @@ static u32 porf_gc_span_alloc(u32 bytes, u32 typeId) {
   const u32 npg = (bytes + PORF_GC_SPAGE_MASK) >> PORF_GC_SPAGE_SHIFT;
   const u32 lo = porf_gc_claim_pages(npg);
   if (lo == 0) {
-    fprintf(stderr, "porffor: out of memory (span %u pages; heap_top=%u)\\n", npg, porf_heap_top);
+    porf_err("porffor: out of memory (span "); porf_err_int(npg);
+    porf_err(" pages; heap_top="); porf_err_int(porf_heap_top); porf_err(")\\n");
     abort();
   }
   porf_gc_span_bytes += (i64)npg * (i64)PORF_GC_SPAGE;
@@ -4264,6 +4273,24 @@ ${prefs.repl ? `static int porf_repl_output_enabled = 1;
 #define printf(...) (porf_repl_output_enabled ? fprintf(PORF_PRINT_OUT, __VA_ARGS__) : 0)
 ` : `#define printf(...) fprintf(PORF_PRINT_OUT, __VA_ARGS__)
 `}
+// Output without printf: its formatter is the bulk of libc's code in a component, and a
+// program's printing needs only strings and integers
+static inline void porf_out(const char* s, int n) {
+${prefs.repl ? '  if (!porf_repl_output_enabled) return;\n' : ''}  fwrite(s, 1, (size_t)n, PORF_PRINT_OUT);
+}
+// v in decimal into b (21 bytes suffice), its length returned
+static inline int porf_fmt_int(char* b, long long v) {
+  char r[20];
+  int m = 0, k = 0;
+  unsigned long long u = v < 0 ? 0ull - (unsigned long long)v : (unsigned long long)v;
+  do { r[m++] = (char)('0' + u % 10u); u /= 10u; } while (u);
+  if (v < 0) b[k++] = '-';
+  while (m) b[k++] = r[--m];
+  return k;
+}
+static inline void porf_out_int(long long v) { char b[21]; porf_out(b, porf_fmt_int(b, v)); }
+static inline void porf_err(const char* s) { fputs(s, stderr); }
+static inline void porf_err_int(long long v) { char b[21]; fwrite(b, 1, (size_t)porf_fmt_int(b, v), stderr); }
 // One code point as UTF-8 (a lone surrogate as U+FFFD).
 static void porf_print_utf8(uint32_t c) {
   char b[4];
@@ -4853,17 +4880,17 @@ ${toStr ? `
     const jsval _s = ${toStr}(v);
     const i32 _st = porf_jv_type(_s);
     const u32 _sp = (u32)_s.val;
-    if (_st == ${TYPES.bytestring} && _sp) { fprintf(stderr, "Uncaught %.*s\\n", (int)*(u32*)(MEM + _sp), (const char*)(MEM + _sp + 4)); exit(1); }
+    if (_st == ${TYPES.bytestring} && _sp) { porf_err("Uncaught "); fwrite(MEM + _sp + 4, 1, *(u32*)(MEM + _sp), stderr); porf_err("\\n"); exit(1); }
     if (_st == ${TYPES.string} && _sp) {
       const u32 _sl = *(u32*)(MEM + _sp);
-      fprintf(stderr, "Uncaught ");
+      porf_err("Uncaught ");
       for (u32 _i = 0; _i < _sl; _i++) { const u16 _c = porf_load_un_u16(MEM + _sp + 4 + _i * 2); fputc(_c < 128 ? (int)_c : '?', stderr); }
       fputc('\\n', stderr);
       exit(1);
     }
   }
 ` : ''}\
-  fprintf(stderr, "Uncaught exception\\n");
+  porf_err("Uncaught exception\\n");
   exit(1);
 }
 
@@ -4893,7 +4920,10 @@ PORF_NORETURN ${st}void porf_throw_not_callable(jsval fn) {
     : t == ${TYPES.bigint} ? "a bigint"
     : "an object";
   char text[48];
-  const int n = snprintf(text, sizeof text, "%s is not a function", what);
+  const int w = (int)strlen(what);
+  memcpy(text, what, (size_t)w);
+  memcpy(text + w, " is not a function", 18);
+  const int n = w + 18;
   const u32 s = porf_alloc(4 + (u32)n, ${TYPES.bytestring});
   *(u32*)(MEM + s) = (u32)n;
   memcpy(MEM + s + 4, text, (size_t)n);
@@ -4901,7 +4931,9 @@ PORF_NORETURN ${st}void porf_throw_not_callable(jsval fn) {
 }
 
 PORF_NORETURN ${st}void porf_unreachable(const char* msg) {
-  fprintf(stderr, "porffor: unreachable%s%s\\n", msg ? ": " : "", msg ? msg : "");
+  porf_err("porffor: unreachable");
+  if (msg) { porf_err(": "); porf_err(msg); }
+  porf_err("\\n");
   abort();
 }
 
@@ -5230,6 +5262,13 @@ ${ropes ? `  if (porf_rope_is(pa) || porf_rope_is(pb)) return porf_str_eq(porf_s
 }
 
 ${dtoa === 'libc' ? '' : DTOA[dtoa].c}
+// an exponent as JS writes it (e+21, e-7) into o, its length returned
+static int porf_fmt_exp(char* o, int e) {
+  o[0] = 'e';
+  o[1] = e >= 0 ? '+' : '-';
+  return 2 + porf_fmt_int(o + 2, e >= 0 ? e : -e);
+}
+
 // the shortest digits that round-trip to d (finite, > 0), as --dtoa finds them: into digs,
 // their count returned and *pt the decimal point's position (n in Number::toString)
 static int porf_shortest(f64 d, char* digs, int* pt) {
@@ -5260,9 +5299,9 @@ ${dtoa !== 'libc' ? `  uint64_t bits;
 ${st}jsval porf_num_to_str(f64 d) {
   char buf[32];
   int n;
-  if (d != d) n = snprintf(buf, sizeof buf, "NaN");
-    else if (d == INFINITY) n = snprintf(buf, sizeof buf, "Infinity");
-    else if (d == -INFINITY) n = snprintf(buf, sizeof buf, "-Infinity");
+  if (d != d) { memcpy(buf, "NaN", 3); n = 3; }
+    else if (d == INFINITY) { memcpy(buf, "Infinity", 8); n = 8; }
+    else if (d == -INFINITY) { memcpy(buf, "-Infinity", 9); n = 9; }
     // exact digits are the shortest round-tripping ones only up to 2^53; above it JS
     // prints the shortest digits padded with zeros (2^60 is "1152921504606847000")
     else if (d == trunc(d) && fabs(d) < 9007199254740992.0) {
@@ -5294,7 +5333,7 @@ ${st}jsval porf_num_to_str(f64 d) {
       } else {
         *o++ = digs[0];
         if (k > 1) { *o++ = '.'; memcpy(o, digs + 1, (size_t)(k - 1)); o += k - 1; }
-        o += snprintf(o, 8, "e%c%d", pt - 1 >= 0 ? '+' : '-', pt - 1 >= 0 ? pt - 1 : 1 - pt);
+        o += porf_fmt_exp(o, pt - 1);
       }
       n = (int)(o - buf);
     }
@@ -5313,7 +5352,7 @@ ${st}jsval porf_num_to_exp(f64 d) {
   if (d != 0) k = porf_shortest(d, digs, &pt);
   *o++ = digs[0];
   if (k > 1) { *o++ = '.'; memcpy(o, digs + 1, (size_t)(k - 1)); o += k - 1; }
-  o += snprintf(o, 8, "e%c%d", pt - 1 >= 0 ? '+' : '-', pt - 1 >= 0 ? pt - 1 : 1 - pt);
+  o += porf_fmt_exp(o, pt - 1);
   const int n = (int)(o - buf);
   const u32 s = porf_bstr_new((u32)n);
   memcpy(MEM + s + 4, buf, (size_t)n);
@@ -5376,7 +5415,13 @@ ${st}jsval porf_tz_id(void) {
   if (n <= 0) {
     const i32 off = (i32)(porf_tz_offset_ms(porf_performance_time_origin() + porf_performance_now()) / 60000.0);
     if (off == 0) { memcpy(buf, "UTC", 3); n = 3; }
-      else n = snprintf(buf, sizeof buf, "%c%02d:%02d", off < 0 ? '-' : '+', abs(off) / 60, abs(off) % 60);
+      else {
+        const i32 h = abs(off) / 60, m = abs(off) % 60;
+        buf[0] = off < 0 ? '-' : '+';
+        buf[1] = (char)('0' + h / 10 % 10); buf[2] = (char)('0' + h % 10); buf[3] = ':';
+        buf[4] = (char)('0' + m / 10); buf[5] = (char)('0' + m % 10);
+        n = 6;
+      }
   }
   const u32 s = porf_bstr_new((u32)n);
   memcpy(MEM + s + 4, buf, (size_t)n);
@@ -6659,7 +6704,7 @@ static void porf_coro_stack_ensure(porf_coro* c) {
   // nothing else can be allocated in (PORF_STACK_CHECK traps on reaching it)
   char* block = (char*)malloc((size_t)PORF_CORO_STACK_SIZE + PORF_STACK_GUARD);
   if (!block) {
-    fprintf(stderr, "porffor: failed to allocate coroutine stack\\n");
+    porf_err("porffor: failed to allocate coroutine stack\\n");
     abort();
   }
   c->stack_map = block;
@@ -6675,13 +6720,13 @@ static void porf_coro_stack_ensure(porf_coro* c) {
   const size_t map_size = usable + page;
   void* mem = mmap(NULL, map_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (mem == MAP_FAILED) {
-    fprintf(stderr, "porffor: failed to reserve coroutine stack\\n");
+    porf_err("porffor: failed to reserve coroutine stack\\n");
     abort();
   }
   char* lo = (char*)mem + page;
   if (mprotect(lo, usable, PROT_READ | PROT_WRITE) != 0) {
     munmap(mem, map_size);
-    fprintf(stderr, "porffor: failed to commit coroutine stack\\n");
+    porf_err("porffor: failed to commit coroutine stack\\n");
     abort();
   }
   c->stack_map = (char*)mem;
