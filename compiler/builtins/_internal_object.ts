@@ -256,7 +256,14 @@ export const __Porffor_object_numberKey = (_obj: any): any => {
 export const __Porffor_object_underlyingFind = (_obj: any): any => {
   const objType: i32 = Porffor.type(_obj);
   if (objType == Porffor.TYPES.numberobject) _obj = __Porffor_object_numberKey(_obj);
-  if (Porffor.fastOr(underlyingStore == 0, underlyingBuckets == 0)) return null;
+  if (underlyingStore == 0) return null;
+  // a collection that compacted the store dropped its buckets: rebuilt here as by
+  // __Porffor_object_underlying, or every value's properties would read as missing until
+  // something next wrote one
+  if (underlyingBuckets == 0) {
+    if (Porffor.IR.loadI32(underlyingStore, 0) == 0) return null;
+    __Porffor_underlyingRebuild();
+  }
   let lookupHash: i32 = Porffor.IR.ptr(_obj);
   lookupHash = lookupHash >>> 3;
   lookupHash ^= lookupHash >>> 16;

@@ -283,7 +283,7 @@ const f64Lit = value => {
   return `porf_bits_to_f64(0x${hex}ull)`;
 };
 
-export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, prefs = {}, usedTypes = null, units = null }) => {
+export default ({ funcs, data = [], dataUnits = [], dataRelocs = [], globals = [], entry = null, prefs = {}, usedTypes = null, units = null }) => {
   // split: one C file per unit sharing a header, link-time constants as externs
   const split = !!prefs.split;
   const st = split ? '' : 'static ';
@@ -1274,7 +1274,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
       writeBytes(off, seg);
       // a constant literal's template points at other segments (its strings, nested
       // templates): their addresses, known only now, as a u32, an f64 or a packed jsval
-      for (const r of seg.relocs ?? []) {
+      for (const r of dataRelocs[i] ?? []) {
         const addr = dataOffsets[r.seg];
         if (r.kind === 'u32') writeU32(off + r.off, addr);
           else if (r.kind === 'f64') writeBytes(off + r.off, ieee754_binary64(addr));

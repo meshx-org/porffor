@@ -1783,12 +1783,44 @@ const generateLiteral = (scope, decl) => {
   }
 
   if (decl.regex) {
-    // todo/opt: aot-compile compile-time-known regexes
+    // compiled now when it can be (regexAot): the blob is data, and the program carries no
+    // regex parser or emitter unless something compiles a pattern at run time
+    const aot = regexAot(decl.regex.pattern, decl.regex.flags);
+    if (aot) {
+      const [ bytes, caps, names, flags ] = aot;
+      const seg = dataSeg(unitOf(scope), `#regex:${decl.regex.flags}:${decl.regex.pattern}`, Array.from(bytes));
+      return builtinCall(scope, '__Porffor_regex_fromBlob', [
+        generate(scope, { type: 'Literal', value: decl.regex.pattern }),
+        Const(T.i32, flags),
+        Const(T.i32, caps),
+        DataRef(seg),
+        names == null ? valUndefined() : generate(scope, { type: 'ArrayExpression', elements: Array.from(names).map(value => ({ type: 'Literal', value })) })
+      ]);
+    }
+
     // literals use the intrinsic constructor, not the mutable global RegExp binding
     return builtinCall(scope, '__Porffor_regex_compile', [
       generate(scope, { type: 'Literal', value: decl.regex.pattern }),
       generate(scope, { type: 'Literal', value: decl.regex.flags })
     ]);
+  }
+};
+
+// A regex literal compiled at compile time, by the regex compiler itself: [blob bytes, caps,
+// names, flags], or null to compile it at run time as before. Only the selfhosted compiler (a
+// Porffor program, so the __Porffor_regex_aot builtin is in it) can; under Node there is no
+// such function. Patterns needing tables that compiler binary may not carry (Unicode
+// properties, string sets, v mode) and programs whose flags change what the compiler emits
+// stay at run time, so a blob is always the one the program would have built
+const regexAot = (pattern, flags) => {
+  if (globalThis.precompile || typeof __Porffor_regex_aot !== 'function') return null;
+  if (regexStrings || regexScripts || regexEmoji) return null;
+  if (/\\[pPq]/.test(pattern) || flags.includes('v')) return null;
+  try {
+    return __Porffor_regex_aot(pattern, flags);
+  } catch {
+    // an invalid pattern: the run-time compile throws its SyntaxError as before
+    return null;
   }
 };
 
@@ -4690,9 +4722,11 @@ const literalTemplate = (scope, node, shape = false) => {
   const type = node.type === 'ArrayExpression' ? TYPES.array : TYPES.object;
   if (shape && type !== TYPES.object) return null;
   const key = `#tmpl:${type}:${bytes.join(',')}:${relocs.map(r => `${r.off}.${r.seg}.${r.kind}.${r.type}`).join(',')}`;
-  bytes.relocs = relocs;
   typeUsed(scope, type);
-  return { type, seg: dataSeg(unitOf(scope), key, bytes), dynamic };
+  const seg = dataSeg(unitOf(scope), key, bytes);
+  // (a table beside the segments, which render reads with them)
+  dataRelocs[seg] = relocs;
+  return { type, seg, dynamic };
 };
 
 // an object literal's property value as it is generated: a function is named after its key
@@ -6212,7 +6246,7 @@ const inferDirectCallParamTypes = root => {
   }
 };
 
-let globals, funcs, funcsByIndex, funcIndex, funcNameCollisions, currentFuncIndex, depth, data, dataUnits, dataCache, modular, rawHead, builtinGlobalInits, includedBuiltinGlobalInits, usedTypes, globalInfer, builtinFuncs, builtinVars, builtinPrototypeFuncs, builtinStaticFuncs, builtinPrototypeGetters, builtinPrototypeObjectGetters, topLevelFunc;
+let globals, funcs, funcsByIndex, funcIndex, funcNameCollisions, currentFuncIndex, depth, data, dataUnits, dataRelocs, dataCache, modular, rawHead, builtinGlobalInits, includedBuiltinGlobalInits, usedTypes, globalInfer, builtinFuncs, builtinVars, builtinPrototypeFuncs, builtinStaticFuncs, builtinPrototypeGetters, builtinPrototypeObjectGetters, topLevelFunc;
 
 export default (program, opts = {}) => {
   const entryName = opts.entryName ?? '#main';
@@ -6224,6 +6258,7 @@ export default (program, opts = {}) => {
   depth = [];
   data = [];
   dataUnits = [];
+  dataRelocs = [];
   dataCache = new Map();
   modular = !!program._units;
   rawHead = [];
@@ -6401,6 +6436,7 @@ export default (program, opts = {}) => {
     funcs: renderFuncs,
     data,
     dataUnits,
+    dataRelocs,
     units: program._units ?? null,
     globals: renderGlobals,
     entry: entryName,

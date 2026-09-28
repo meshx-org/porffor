@@ -3849,6 +3849,12 @@ export const __Porffor_regex_compile = (patternStr: bytestring|string, flagsStr:
     __Porffor_regex_mruCaps = caps;
   }
 
+  return __Porffor_regex_make(patternStr, flags, caps, blob, names);
+};
+
+// the RegExp object over a compiled blob: [pattern][flags u16][caps u16][lastIndex][blob]
+// [names][...][pattern type]
+export const __Porffor_regex_make = (patternStr: bytestring|string, flags: i32, caps: i32, blob: i32, names: any): RegExp => {
   const re: i32 = Porffor.malloc(24);
   Porffor.IR.storeI32(re, 0, patternStr);
   Porffor.IR.storeU16(re, 4, flags);
@@ -3859,6 +3865,30 @@ export const __Porffor_regex_compile = (patternStr: bytestring|string, flagsStr:
   Porffor.IR.storeU8(re, 20, 0);
   Porffor.IR.storeU8(re, 22, Porffor.type(patternStr));
   return re as RegExp;
+};
+
+// a regex literal compiled when the program was (codegen.js, under the selfhosted compiler):
+// its blob is data, so the parser and the emitter are not in the program at all
+export const __Porffor_regex_fromBlob = (patternStr: bytestring|string, flags: i32, caps: i32, blob: i32, names: any): RegExp => {
+  const namesArr: any = Porffor.type(names) == Porffor.TYPES.array ? names : 0;
+  return __Porffor_regex_make(patternStr, flags, caps, blob, namesArr);
+};
+
+// compile time (the selfhosted compiler calls this from codegen): pattern + flags compiled
+// into [blob bytes, caps, names or undefined, flags], plain values codegen writes as data
+export const __Porffor_regex_aot = (pattern: any, flagsStr: any): any => {
+  const flags: i32 = __Porffor_regex_parseFlags(flagsStr);
+  const blob: i32 = __Porffor_regex_compileBlob(pattern, flags);
+  const len: i32 = 40 + __Porffor_regex_bcTop;
+  const bytes: any[] = Porffor.array.new(len);
+  for (let i: i32 = 0; i < len; i++) Porffor.array.fastPush(bytes, Porffor.IR.loadU8(blob + i, 0));
+
+  const out: any[] = Porffor.array.new(4);
+  Porffor.array.fastPush(out, bytes);
+  Porffor.array.fastPush(out, __Porffor_regex_cCaps);
+  Porffor.array.fastPush(out, __Porffor_regex_cNames == 0 ? undefined : __Porffor_regex_cNames);
+  Porffor.array.fastPush(out, flags);
+  return out;
 };
 
 // match driver mode: 0 exec result, 1 test boolean, 2 positions only (returns end, sets mStart/mEnd,
