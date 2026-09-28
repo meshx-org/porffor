@@ -124,6 +124,18 @@ export const __Object_prototype_hasOwnProperty = function (this: any, prop: any)
     return Porffor.object.lookup(this, p, __Porffor_object_hash(p)) != 0;
   }
 
+  // a typed array's indices below its length are its own (it has no holes), and none once
+  // its buffer is detached (a length of 0xffffffff; the buffer as the buffer getter finds it)
+  if (__Porffor_object_isTypedArray(this)) {
+    const idx: i32 = __Porffor_array_propertyKeyIndex(p);
+    if (idx != -1) {
+      const ptr: i32 = Porffor.IR.ptr(this);
+      const buffer: i32 = Porffor.IR.loadI32(ptr, 4) - Porffor.IR.loadI32(ptr, 8);
+      if (Porffor.IR.loadI32(buffer, 0) == 4294967295) return false;
+      return idx < Porffor.IR.loadI32(ptr, 0);
+    }
+  }
+
   if (Porffor.type(this) == Porffor.TYPES.array) {
     const idx: i32 = __Porffor_array_propertyKeyIndex(p);
     if (idx != -1) {
@@ -151,11 +163,28 @@ export const __Object_hasOwn = (obj: any, prop: any): boolean => {
   return Porffor.callThis(__Object_prototype_hasOwnProperty, obj, prop);
 };
 
+// whether a value is one of the typed arrays (the kinds, BigInt ones included)
+export const __Porffor_object_isTypedArray = (obj: any): boolean => {
+  const t: i32 = Porffor.type(obj);
+  return Porffor.fastOr(
+    Porffor.fastAnd(t >= Porffor.TYPES.uint8clampedarray, t <= Porffor.TYPES.float64array),
+    t == Porffor.TYPES.bigint64array,
+    t == Porffor.TYPES.biguint64array
+  );
+};
+
 export const __Porffor_object_in = (obj: any, prop: any): boolean => {
   if (Porffor.comptime.flag`hasType.proxy`) {
     if (Porffor.type(obj) == Porffor.TYPES.proxy) return __Porffor_proxy_has(obj, ecma262.ToPropertyKey(prop));
   }
   // todo: throw if obj is not an object
+
+  // %TypedArray%.prototype's accessors: every typed array inherits them, though the program has
+  // that prototype on the chain only where it can observe it (Object.getPrototypeOf)
+  if (__Porffor_object_isTypedArray(obj)) {
+    const key: any = ecma262.ToPropertyKey(prop);
+    if (Porffor.fastOr(key === 'length', key === 'buffer', key === 'byteLength', key === 'byteOffset')) return true;
+  }
 
   if (Porffor.callThis(__Object_prototype_hasOwnProperty, obj, prop)) {
     return true;

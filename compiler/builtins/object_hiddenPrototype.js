@@ -74,8 +74,16 @@ export const __Porffor_object_builtinPrototype = (f: any): any => {`;
 };
 
 // a built-in constructor's own prototype, when it is not Function.prototype: the typed
-// arrays' is %TypedArray%
-export const __Porffor_object_builtinParent = (f: any): any => {
+// arrays' is %TypedArray%, and the native errors' is Error (TypeError's [[Prototype]] is
+// Error, so walking up from a subclass reaches it)
+export const __Porffor_object_builtinParent = (f: any): any => {`;
+  for (const x of [ 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError', 'URIError', 'AggregateError', 'SuppressedError' ]) {
+    out += `
+  if (Porffor.comptime.flag\`hasFunc.${x}\`) {
+    if (f == ${x}) return Error;
+  }`;
+  }
+  out += `
   if (Porffor.comptime.flag\`program.typedArrayCtorValue\`) {`;
   for (const x of typedArrayKinds) {
     out += `

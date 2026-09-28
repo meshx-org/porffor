@@ -449,21 +449,26 @@ const makeClosureEnv = (scope, parent, count, values = null) => {
   return valOf(pointer, TYPES.__porffor_closureenv);
 };
 
+// the env a closure of func runs with, made here: the current one, under a snapshot of its
+// per-iteration captures when it has any (closureEnvNode reads them one level below its own)
+const closureEnvFor = (scope, func) => {
+  const env = currentClosureEnv(scope);
+  const snap = getClosureSnapshotCaptureNames(func);
+  if (snap.length === 0) return env;
+
+  const parent = reuse(scope, env);
+  const values = [];
+  for (const name of snap) {
+    values.push(reuse(scope, generate(scope, { type: 'Identifier', name, _closureFunc: func.closureCaptures?.[name]?.func })));
+  }
+  return reuse(scope, makeClosureEnv(scope, parent, values.length, values));
+};
+
 // closure value: heap [fnIdx][env] record, per-iteration captures get a snapshot env chained to the parent
 const makeClosureRecord = (scope, func, markReferenced = true) => {
   useFunctionValue(func, markReferenced);
 
-  let env = currentClosureEnv(scope);
-  const snap = getClosureSnapshotCaptureNames(func);
-  if (snap.length > 0) {
-    const parent = reuse(scope, env);
-    const values = [];
-    for (const name of snap) {
-      values.push(reuse(scope, generate(scope, { type: 'Identifier', name, _closureFunc: func.closureCaptures?.[name]?.func })));
-    }
-    env = reuse(scope, makeClosureEnv(scope, parent, values.length, values));
-  }
-
+  const env = closureEnvFor(scope, func);
   const rec = reuse(scope, FnAlloc(FuncIdx(func.index), JvPtr(env)));
   return valOf(rec, TYPES.function);
 };
@@ -1344,6 +1349,15 @@ const generateBinaryExp = (scope, decl) => {
   }
 
   if (decl.operator === 'in') {
+    // 'size' in set: a use of the property, as a read is: its method, or its getter (a read
+    // calls that directly, so nothing else puts it on the prototype), once its type is in
+    if (decl.left.type === 'Literal' && typeof decl.left.value === 'string') {
+      demandMember(decl.left.value);
+      for (const x of builtinPrototypeGetters.get(decl.left.value) ?? []) {
+        const t = TYPES[x.split('_prototype_')[0].slice(2).toLowerCase()];
+        if (t != null) whenFact([ [ 'hasType', t ] ], () => includeBuiltin(topLevelFunc, x));
+      }
+    }
     return generate(scope, {
       type: 'CallExpression',
       callee: { type: 'Identifier', name: '__Porffor_object_in' },
@@ -1417,6 +1431,9 @@ const irBuiltinHelpers = (scope, name, def) => ({
         if (name[0] === '#' || seen.has(name)) continue;
         const func = topLevelFunc.namedFuncBindings[name];
         if (!func || func.internal) continue;
+        // a function whose name is also a variable (written: f = …, globalThis.f = …) is
+        // the variable's current value, which the loop below reads
+        if (globals[name]?.metadata?.kind === 'var') continue;
         push(name, funcRef(func));
       }
 
@@ -2009,7 +2026,7 @@ const buildDirectArgs = (scope, decl, func, userArgs, newTargetVal, thisVal, env
   for (const p of func.params) {
     switch (p.name) {
       case '#callee': out.push(materializeFunctionValue(scope, func, false)); break;
-      case '#env': out.push(JvPtr(envVal ?? currentClosureEnv(scope))); break;
+      case '#env': out.push(JvPtr(envVal ?? closureEnvFor(scope, func))); break;
       case '#newtarget': out.push(newTargetVal ?? valUndefined()); break;
       case '#this': out.push(coerceValue(thisVal ?? createThisArg(scope, decl), p.type)); break;
       case '#allargs': out.push(makeArrayFromValues(scope, userArgs)); break;
@@ -2190,6 +2207,13 @@ const generateCall = (scope, decl) => {
       const targetTmp = reuseNamed(scope, targetVal);
       const targetIdent = { type: 'Identifier', name: targetTmp[N_A] };
 
+      // a function written as an argument (xs.forEach(function (x) {…})) is made once, here:
+      // each type's branch below generating it again would compile it once per branch, and a
+      // callback nested in another's once per branch per level (6^depth copies)
+      const callArgs = decl.arguments.map(arg => isFuncType(arg.type)
+        ? { type: 'Identifier', name: reuseNamed(scope, generate(scope, arg))[N_A] }
+        : arg);
+
       const protoBC = {};
       for (const x of builtinProtoCands) {
         const tn = x.split('_prototype_')[0].toLowerCase();
@@ -2228,7 +2252,7 @@ const generateCall = (scope, decl) => {
           continue;
         }
 
-        protoBC[t] = () => builtinCall(decl.arguments);
+        protoBC[t] = () => builtinCall(callArgs);
       }
 
       // the fallback call reads the object through targetTmp too: regenerating decl as-is
@@ -2240,7 +2264,7 @@ const generateCall = (scope, decl) => {
 
       protoBC.default = () => Prefs.neverFallbackBuiltinProto && !decl.optional
         ? internalThrow(scope, 'TypeError', `'${protoName}' proto func tried to be called on a type without an impl`)
-        : generate(scope, { ...decl, callee: fallbackCallee, _protoInternalCall: true });
+        : generate(scope, { ...decl, callee: fallbackCallee, arguments: callArgs, _protoInternalCall: true });
 
       aliasPrimObjsBC(protoBC);
 
@@ -3317,7 +3341,9 @@ const generateAssign = (scope, decl, valueUnused = false) => {
     const env = reuse(scope, generate(scope, decl.left.object));
     const previous = op === '=' ? null : reuse(scope, generateMember(scope, decl.left, env));
     const right = generate(scope, decl.right);
-    const value = reuse(scope, op === '=' ? right : performOp(scope, op, previous, right, null, getNodeType(scope, decl.right)));
+    const result = op === '=' ? right : performOp(scope, op, previous, right, null, getNodeType(scope, decl.right));
+    // a slot holds a jsval: a raw number (parseInt's f64, an i32 count) is boxed as one
+    const value = reuse(scope, isRawNum(result) ? valNumber(numValue(result)) : result);
     stmt(scope, Store('f64', JvPtr(env), 8 + slot * 16, JvNum(value)));
     stmt(scope, Store('u8', JvPtr(env), 16 + slot * 16, JvType(value)));
     const freshEnv = env[N_KIND] === K.Local && env[N_A] === '#closure_env_local' && stillFresh(scope, scope.freshEnv);
@@ -3441,7 +3467,10 @@ const generateAssign = (scope, decl, valueUnused = false) => {
       const v = reuse(scope, op === '=' ? simpleValue
         : performOp(scope, op, Box(Convert(T.f64, Load(ctype, addr, 4)), Const(T.i32, TYPES.number)), generate(scope, decl.right), TYPES.number, getNodeType(scope, decl.right)));
       const f = numValue(v);
-      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' || ctype === 'f16' ? f : signed ? Convert(T.i32, f) : Convert(T.u32, f, 0)));
+      // an integer element is the low bits of ToUint32 (wrapped modulo 2^32, never
+      // saturated: u32[i] = -1 stores 0xffffffff, i8[i] = 200 stores -56)
+      const int = () => toUint32(scope, f);
+      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' || ctype === 'f16' ? f : signed ? Convert(T.i32, int(), 0) : int()));
       return v[N_TYPE] === T.jsval ? v : valNumber(v);
     };
     const taSetClamped = () => {
@@ -5356,6 +5385,12 @@ const generateClass = (scope, decl) => {
   const classRoot = reuseNamed(scope, materializeFunctionValue(scope, func));
   const rootIdent = { type: 'Identifier', name: classRoot[N_A] };
 
+  // a closure's view of the class: the class itself, not a read of its name (an outer
+  // binding of the same name, var C; class C {} in parse.js's wrapper, would answer that).
+  // Before the elements, as the spec binds the class's inner name: a static initialiser
+  // that reads the name through the closure env (static BASE = new C()) sees the class
+  if (!expr && scope.closureOwnLocals?.[name]) mirrorToClosureEnv(scope, name, rootIdent);
+
   const classProto = reuse(scope, generate(scope, getObjProp(rootIdent, 'prototype')));
 
   // wire constructor + prototype chains to the superclass, null superclass included
@@ -5444,10 +5479,6 @@ const generateClass = (scope, decl) => {
   if (markerIdx !== -1) func.body.splice(markerIdx, 1, ...fieldInits);
   else func.body.unshift(...fieldInits);
   func.body.unshift(...guard);
-
-  // the class itself, not a read of its name: an outer binding of the same name (var C;
-  // class C {} in parse.js's wrapper) would answer that
-  if (!expr && scope.closureOwnLocals?.[name]) mirrorToClosureEnv(scope, name, rootIdent);
 
   return expr ? classRoot : valUndefined();
 };
@@ -6371,6 +6402,11 @@ export default (program, opts = {}) => {
   // assignment: a function generated before it (a bundle's library code, ahead of the shim
   // that installs setTimeout) would compile its reads of x as not defined. Every such name
   // is a global from the start.
+  // A top-level function of that name is then that global's first value: its declaration counts
+  // the write, so the hoisted declaration stores the function (as `var f; function f() {}` does)
+  // and its reads see the binding, not an uninitialised global.
+  const topLevelFunctions = new Map();
+  for (const x of program.body) if (x.type === 'FunctionDeclaration' && x.id?.name) topLevelFunctions.set(x.id.name, x);
   const declareGlobalThisNames = node => {
     if (node == null || typeof node !== 'object') return;
     if (Array.isArray(node)) return node.forEach(declareGlobalThisNames);
@@ -6379,6 +6415,8 @@ export default (program, opts = {}) => {
       if (name) {
         allocVar(null, name, true);
         setVarMetadata(null, name, true, { kind: 'var' });
+        const declaration = topLevelFunctions.get(name);
+        if (declaration) declaration._writes = (declaration._writes ?? 0) + 1;
       }
     }
     for (const key in node) {

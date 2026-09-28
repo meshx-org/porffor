@@ -11,7 +11,7 @@ export const __Porffor_uint8array_validate = (ta: any) => {
 };
 
 export const __Uint8Array_prototype_toBase64 = function (this: Uint8Array, options: any = undefined) {
-  let alphabet: string = 'base64';
+  let alphabet: any = 'base64';
   let omitPadding: boolean = false;
 
   if (Porffor.type(options) != Porffor.TYPES.undefined) {
@@ -53,7 +53,7 @@ export const __Uint8Array_prototype_toBase64 = function (this: Uint8Array, optio
   let i: i32 = 0;
   let j: i32 = outPtr;
 
-  const fullChunks: i32 = (len / 3) * 3;
+  const fullChunks: i32 = len - len % 3;
   while (i < fullChunks) {
     const b1: i32 = Porffor.IR.loadU8(bufferPtr + i++, 4);
     const b2: i32 = Porffor.IR.loadU8(bufferPtr + i++, 4);
@@ -446,8 +446,8 @@ export const __Uint8Array_fromBase64 = (str: any, options: any = undefined) => {
     throw new TypeError('First argument must be a string');
   }
 
-  let alphabet: string = 'base64';
-  let lastChunkHandling: string = 'loose';
+  let alphabet: any = 'base64';
+  let lastChunkHandling: any = 'loose';
 
   if (Porffor.type(options) != Porffor.TYPES.undefined) {
     if (Porffor.type(options) != Porffor.TYPES.object) {
@@ -508,8 +508,8 @@ export const __Uint8Array_prototype_setFromBase64 = function (this: Uint8Array, 
     throw new TypeError('First argument must be a string');
   }
 
-  let alphabet: string = 'base64';
-  let lastChunkHandling: string = 'loose';
+  let alphabet: any = 'base64';
+  let lastChunkHandling: any = 'loose';
 
   if (Porffor.type(options) != Porffor.TYPES.undefined) {
     if (Porffor.type(options) != Porffor.TYPES.object) {

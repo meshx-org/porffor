@@ -4905,6 +4905,11 @@ ${toStr ? `
 // builtins) so a caught internal error behaves identically to a \`new X(msg)\` one
 ${sti}u32 porf_alloc(u32 bytes, u32 typeId);
 PORF_NORETURN ${st}void porf_throw_new(i32 errType, u32 msgId) {
+#ifdef PORF_TRAP_INTERNAL_THROW
+  // debugging: stop at the Nth of the runtime's own throws (a null property read, a bad
+  // call), caught or not, so the host shows where (a backtrace); PORF_TRACE_THROW lists them
+  { static u32 _seen = 0; if (++_seen == (u32)(PORF_TRAP_INTERNAL_THROW)) __builtin_trap(); }
+#endif
   const u32 p = porf_alloc(8, (u32)errType);
   *(jsbits*)(MEM + p) = JV_PATTERN | ((u64)${TYPES.bytestring} << 43) | msgId;
   porf_throw(porf_box((f64)p, errType));
