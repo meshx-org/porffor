@@ -3390,7 +3390,7 @@ const generateAssign = (scope, decl, valueUnused = false) => {
       const res = tmp(scope, T.jsval);
       emitIf(scope, valid, () => {
         const v = reuse(scope, op === '=' ? simpleValue
-          : performOp(scope, op, ArrGet(arr, idx), generate(scope, decl.right), null, getNodeType(scope, decl.right)));
+          : performOp(scope, op, arrGet(scope, arr, idx), generate(scope, decl.right), null, getNodeType(scope, decl.right)));
         stmt(scope, ArrSet(arr, idx, v));
         assign(scope, res, v[N_TYPE] === T.jsval ? v : valNumber(v));
       }, () => assign(scope, res, genericMemberSet()));
@@ -3860,6 +3860,9 @@ const awaitValue = (scope, value) => {
 };
 
 // Array.prototype methods that change this, and those that return it (#this guard)
+// the Array.prototype methods with a version of their own for a receiver that is no array
+const ARRAY_GENERIC = new Set([ 'forEach', 'map', 'filter', 'some', 'every', 'reduce', 'reduceRight',
+  'find', 'findIndex', 'findLast', 'findLastIndex', 'indexOf', 'lastIndexOf', 'includes', 'concat', 'slice', 'splice' ]);
 const ARRAY_MUTATORS = new Set([ 'push', 'pop', 'shift', 'unshift', 'splice', 'reverse', 'sort', 'fill', 'copyWithin' ]);
 const ARRAY_RETURNS_THIS = new Set([ 'reverse', 'sort', 'fill', 'copyWithin' ]);
 
@@ -4014,7 +4017,7 @@ const generateForOfCore = (scope, decl) => {
     const nextVal = typeSwitch(scope, root, rootKnown, [
       [ [ TYPES.array ], () => {
         emitIf(scope, Bin('>=', T.i32, counter, LenGet(pointer)), () => stmt(scope, Break(L)));
-        const v = reuse(scope, ArrGet(pointer, counter));
+        const v = reuse(scope, arrGet(scope, pointer, counter));
         assign(scope, counter, Bin('+', T.i32, counter, Const(T.i32, 1)));
         return v;
       } ],
@@ -4945,6 +4948,14 @@ const markInBoundsIndexes = program => {
   walk(program);
 };
 
+// an array element read: a stored one directly, a hole or one past the end through the spec's
+// Get (the runtime's porf_arr_get hands those to __Porffor_array_holeGet)
+const arrGet = (scope, arr, index) => {
+  // (a builtin's reads include it when the builtin is: precompile's walk)
+  if (!globalThis.precompile && '__Porffor_array_holeGet' in builtinFuncs) includeBuiltin(scope, '__Porffor_array_holeGet');
+  return ArrGet(arr, index);
+};
+
 const generateMember = (scope, decl, objValue = null) => {
   if (!globalThis.precompile) demandMemberRead(decl);
   const closureSlot = decl._closureSlot;
@@ -5073,7 +5084,7 @@ const generateMember = (scope, decl, objValue = null) => {
       const { idx, valid } = denseArrayIndexKey(scope, prop);
       const res = tmp(scope, T.jsval);
       emitIf(scope, valid,
-        () => assign(scope, res, ArrGet(JvPtr(obj), idx)),
+        () => assign(scope, res, arrGet(scope, JvPtr(obj), idx)),
         () => assign(scope, res, genericMemberGet()));
       return res;
     } ],
@@ -5243,6 +5254,8 @@ const generateClass = (scope, decl) => {
 
   // wire constructor + prototype chains to the superclass, null superclass included
   if (decl.superClass) {
+    // a subclass (of Array, maybe) is a constructor an array's methods may have to species-create
+    if (!globalThis.precompile) demandMember('species');
     const sup = reuseNamed(scope, generate(scope, decl.superClass));
     const supIdent = { type: 'Identifier', name: sup[N_A] };
 
@@ -5769,6 +5782,14 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
           // what changed back through [[Set]] and [[Delete]], and gives back the object where
           // it returns this. The final state is the spec's; the order of the traps is not
           emitIf(func, Bin('!=', T.i32, JvType(thisRef()), Const(T.i32, TYPES.array)), () => {
+            // an iteration method runs the spec's steps on the object itself
+            // (builtins/array_generic.ts): what a callback or a getter changes as it goes counts
+            if (ARRAY_GENERIC.has(method)) {
+              // (a rest parameter goes as the array it is)
+              const userParams = func.params.filter(p => p.name[0] !== '#' || p.name === '#rest').map(p => Local(p.name, p.type));
+              stmt(func, Return(builtinCall(func, `__Porffor_arrayGeneric_${method}`, [ thisRef(), ...userParams ])));
+              return;
+            }
             if (!ARRAY_MUTATORS.has(method)) {
               assign(func, thisRef(), builtinCall(func, '__Porffor_array_snapshot', [ thisRef() ]));
               return;

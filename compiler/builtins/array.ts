@@ -62,7 +62,37 @@ export const __Array_of = function (this: any, ...items: any[]): any {
   return out;
 };
 
-export const __Array_from = (arg: any, mapFn: any, thisArg: any = undefined): any[] => {
+// Array.from on a constructor other than Array (a subclass, Array.from.call(C, ...)): the
+// elements, gathered as for Array, then defined on what C constructs
+export const __Array_from = function (this: any, arg: any, mapFn: any, thisArg: any): any {
+  const items: any[] = __Porffor_array_from(arg, mapFn, thisArg);
+  // (a subclass names species; another receiver comes by Array.from.call. An apply or a
+  // bind of it is not looked for: the check would cost every program that applies anything)
+  if (Porffor.comptime.flag`member.species`) return __Porffor_array_fromConstruct(this, arg, items);
+  if (Porffor.comptime.flag`member.call`) return __Porffor_array_fromConstruct(this, arg, items);
+  return items;
+};
+
+export const __Porffor_array_fromConstruct = (C: any, arg: any, items: any[]): any => {
+  if (C === Array) return items;
+  if (!__ecma262_IsConstructor(C)) return items;
+
+  const len: i32 = items.length;
+  const args: any[] = Porffor.array.new(1);
+  args[0] = len;
+  // an array-like gives C its length, an iterable nothing
+  let iterable: boolean = Porffor.fastOr(Porffor.type(arg) != Porffor.TYPES.object, arg.__kind !== undefined);
+  if (Porffor.comptime.flag`program.usesIterProtocol`) {
+    if (!iterable) iterable = typeof arg[Symbol.iterator] === 'function';
+  }
+  if (iterable) args.length = 0;
+  const out: any = Porffor.call(C, args, null, C);
+  for (let k: i32 = 0; k < len; k++) __Porffor_object_createDataProperty(out, k, items[k]);
+  __Porffor_arrayGeneric_setLength(out, len);
+  return out;
+};
+
+export const __Porffor_array_from = (arg: any, mapFn: any, thisArg: any): any[] => {
   if (arg == null) throw new TypeError('Argument cannot be nullish');
 
   const out: any[] = Porffor.array.new(4);
@@ -357,7 +387,7 @@ export const __Array_prototype_shift = function (this: any[]) {
   const element: any = this[0];
   const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
   for (let i: i32 = 1; i < len; i++) {
-    if (Porffor.fastOr(!isArray, __Porffor_array_has(this, i))) this[i - 1] = this[i];
+    if (__Porffor_array_hasIndex(this, i)) this[i - 1] = this[i];
       else __Porffor_array_delete(this, i - 1);
   }
   __Porffor_array_setLength(this, len - 1);
@@ -373,7 +403,7 @@ export const __Array_prototype_unshift = function (this: any[], ...items: any[])
   let i: i32 = len;
   while (i > 0) {
     i--;
-    if (Porffor.fastOr(!isArray, __Porffor_array_has(this, i))) this[i + itemsLen] = this[i];
+    if (__Porffor_array_hasIndex(this, i)) this[i + itemsLen] = this[i];
       else __Porffor_array_delete(this, i + itemsLen);
   }
 
@@ -387,6 +417,11 @@ export const __Array_prototype_unshift = function (this: any[], ...items: any[])
 };
 
 export const __Array_prototype_slice = function (this: any[], _start: any, _end: any) {
+  // a subclass's species, or a constructor of its own, can be in a program that names them
+  if (Porffor.type(this) == Porffor.TYPES.array) {
+    if (Porffor.comptime.flag`member.species`) return __Porffor_arrayGeneric_slice(this, _start, _end);
+    if (Porffor.comptime.flag`member.constructor`) return __Porffor_arrayGeneric_slice(this, _start, _end);
+  }
   const len: i32 = this.length;
   if (Porffor.type(_end) == Porffor.TYPES.undefined) _end = len;
 
@@ -416,7 +451,7 @@ export const __Array_prototype_slice = function (this: any[], _start: any, _end:
   const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
   let j: i32 = 0;
   for (let i: i32 = start; i < end; i++) {
-    if (Porffor.fastOr(!isArray, __Porffor_array_has(this, i))) out[j] = this[i];
+    if (__Porffor_array_hasIndex(this, i)) out[j] = this[i];
     j++;
   }
 
@@ -425,6 +460,11 @@ export const __Array_prototype_slice = function (this: any[], _start: any, _end:
 };
 
 export const __Array_prototype_splice = function (this: any[], _start: any, _deleteCount: any, ...items: any[]) {
+  // a subclass's species, or a constructor of its own, can be in a program that names them
+  if (Porffor.type(this) == Porffor.TYPES.array) {
+    if (Porffor.comptime.flag`member.species`) return __Porffor_arrayGeneric_splice(this, _start, _deleteCount, items);
+    if (Porffor.comptime.flag`member.constructor`) return __Porffor_arrayGeneric_splice(this, _start, _deleteCount, items);
+  }
   const len: i32 = this.length;
 
   let start: i32 = ecma262.ToIntegerOrInfinity(_start);
@@ -440,6 +480,12 @@ export const __Array_prototype_splice = function (this: any[], _start: any, _del
   if (deleteCount < 0) deleteCount = 0;
   if (deleteCount > len - start) deleteCount = len - start;
 
+  return __Porffor_array_spliceElements(this, start, deleteCount, items);
+};
+
+// splice's moves on an array's elements, the removed ones handed back as an array
+export const __Porffor_array_spliceElements = (arr: any[], start: i32, deleteCount: i32, items: any[]): any[] => {
+  const len: i32 = arr.length;
   let outCapacity: i32 = deleteCount;
   if (outCapacity < 4) outCapacity = 4;
 
@@ -448,7 +494,7 @@ export const __Array_prototype_splice = function (this: any[], _start: any, _del
   const itemsLen: i32 = items.length;
   const newLen: i32 = len - deleteCount + itemsLen;
   const tailLen: i32 = len - start - deleteCount;
-  const entries: i32 = __Porffor_array_ensure(this, newLen);
+  const entries: i32 = __Porffor_array_ensure(arr, newLen);
 
   if (deleteCount > 0) {
     const outEntries: i32 = Porffor.IR.loadI32(out, 4);
@@ -465,10 +511,10 @@ export const __Array_prototype_splice = function (this: any[], _start: any, _del
   if (itemsLen > 0) {
     const itemsEntries: i32 = __Porffor_array_ensure(items, 0);
     Porffor.IR.copy(entries + start * 8, itemsEntries, itemsLen * 8);
-    Porffor.IR.gcBarrier(this, Porffor.TYPES.array);
+    Porffor.IR.gcBarrier(arr, Porffor.TYPES.array);
   }
 
-  __Porffor_array_setLength(this, newLen);
+  __Porffor_array_setLength(arr, newLen);
 
   return out;
 };
@@ -516,7 +562,7 @@ export const __Array_prototype_indexOf = function (this: any[], searchElement: a
 
   const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
   for (let i: i32 = position; i < len; i++) {
-    if (Porffor.fastAnd(isArray, !__Porffor_array_has(this, i))) continue;
+    if (!__Porffor_array_hasIndex(this, i)) continue;
     if (this[i] === searchElement) return i;
   }
 
@@ -537,7 +583,7 @@ export const __Array_prototype_lastIndexOf = function (this: any[], searchElemen
 
   const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
   for (let i: i32 = position; i >= 0; i--) {
-    if (Porffor.fastAnd(isArray, !__Porffor_array_has(this, i))) continue;
+    if (!__Porffor_array_hasIndex(this, i)) continue;
     if (this[i] === searchElement) return i;
   }
 
@@ -637,7 +683,7 @@ export const __Array_prototype_copyWithin = function (this: any[], _target: any,
   }
 
   while (count > 0) {
-    if (Porffor.fastOr(!isArray, __Porffor_array_has(this, start))) this[target] = this[start];
+    if (__Porffor_array_hasIndex(this, start)) this[target] = this[start];
       else __Porffor_array_delete(this, target);
     start += direction;
     target += direction;
@@ -649,12 +695,17 @@ export const __Array_prototype_copyWithin = function (this: any[], _target: any,
 
 // @porf-typed-array
 export const __Array_prototype_concat = function (this: any[], ...vals: any[]) {
+  // a spreadable object or a species of its own can be in a program that names them: the
+  // spec's steps (builtins/array_generic.ts)
+  if (Porffor.comptime.flag`member.isConcatSpreadable`) return __Porffor_arrayGeneric_concat(this, vals);
+  if (Porffor.comptime.flag`member.species`) return __Porffor_arrayGeneric_concat(this, vals);
+  if (Porffor.comptime.flag`member.constructor`) return __Porffor_arrayGeneric_concat(this, vals);
   let len: i32 = this.length;
   const out: any[] = Porffor.array.new(len);
 
   out.length = len;
   for (let i: i32 = 0; i < len; i++) {
-    if (Porffor.type(this) != Porffor.TYPES.array || __Porffor_array_has(this, i)) out[i] = this[i];
+    if (__Porffor_array_hasIndex(this, i)) out[i] = this[i];
   }
 
   for (const x of vals) {
@@ -662,7 +713,7 @@ export const __Array_prototype_concat = function (this: any[], ...vals: any[]) {
       // todo: for..of is broken here because ??
       const l: i32 = x.length;
       for (let i: i32 = 0; i < l; i++) {
-        if (__Porffor_array_has(x, i)) out[len] = x[i];
+        if (__Porffor_array_hasIndex(x, i)) out[len] = x[i];
         len++;
       }
     } else {
@@ -709,6 +760,17 @@ export const __Array_prototype_reverse = function (this: any[]) {
 };
 
 
+// HasProperty(O, index) for the iteration methods: an array's stored element (the fast case)
+// or a typed array's index (every one below its length exists), else the spec's lookup: an
+// accessor defined on the index, the prototype chain, an array-like's own keys
+export const __Porffor_array_hasIndex = (obj: any, index: i32): boolean => {
+  const t: i32 = Porffor.type(obj);
+  if (t == Porffor.TYPES.array) {
+    if (__Porffor_array_has(obj, index)) return true;
+  } else if (Porffor.fastAnd(t >= Porffor.TYPES.uint8clampedarray, t <= Porffor.TYPES.float64array)) return true;
+  return __Porffor_object_in(obj, index);
+};
+
 // @porf-typed-array
 export const __Array_prototype_forEach = function (this: any[], callbackFn: any, thisArg: any) {
   if (Porffor.type(callbackFn) != Porffor.TYPES.function) throw new TypeError('Callback must be a function');
@@ -716,7 +778,7 @@ export const __Array_prototype_forEach = function (this: any[], callbackFn: any,
   let i: i32 = 0;
   const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
   while (i < len) {
-    if (Porffor.fastAnd(isArray, !__Porffor_array_has(this, i))) {
+    if (!__Porffor_array_hasIndex(this, i)) {
       i++;
       continue;
     }
@@ -726,6 +788,11 @@ export const __Array_prototype_forEach = function (this: any[], callbackFn: any,
 
 // @porf-typed-array
 export const __Array_prototype_filter = function (this: any[], callbackFn: any, thisArg: any) {
+  // a subclass's species, or a constructor of its own, can be in a program that names them
+  if (Porffor.type(this) == Porffor.TYPES.array) {
+    if (Porffor.comptime.flag`member.species`) return __Porffor_arrayGeneric_filter(this, callbackFn, thisArg);
+    if (Porffor.comptime.flag`member.constructor`) return __Porffor_arrayGeneric_filter(this, callbackFn, thisArg);
+  }
   if (Porffor.type(callbackFn) != Porffor.TYPES.function) throw new TypeError('Callback must be a function');
   const len: i32 = this.length;
   if (len == 0) {
@@ -738,7 +805,7 @@ export const __Array_prototype_filter = function (this: any[], callbackFn: any, 
   let j: i32 = 0;
   const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
   while (i < len) {
-    if (Porffor.fastAnd(isArray, !__Porffor_array_has(this, i))) {
+    if (!__Porffor_array_hasIndex(this, i)) {
       i++;
       continue;
     }
@@ -752,6 +819,11 @@ export const __Array_prototype_filter = function (this: any[], callbackFn: any, 
 
 // @porf-typed-array
 export const __Array_prototype_map = function (this: any[], callbackFn: any, thisArg: any) {
+  // a subclass's species, or a constructor of its own, can be in a program that names them
+  if (Porffor.type(this) == Porffor.TYPES.array) {
+    if (Porffor.comptime.flag`member.species`) return __Porffor_arrayGeneric_map(this, callbackFn, thisArg);
+    if (Porffor.comptime.flag`member.constructor`) return __Porffor_arrayGeneric_map(this, callbackFn, thisArg);
+  }
   if (Porffor.type(callbackFn) != Porffor.TYPES.function) throw new TypeError('Callback must be a function');
   const len: i32 = this.length;
   if (len == 0) {
@@ -765,7 +837,7 @@ export const __Array_prototype_map = function (this: any[], callbackFn: any, thi
   let i: i32 = 0;
   const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
   while (i < len) {
-    if (Porffor.fastAnd(isArray, !__Porffor_array_has(this, i))) {
+    if (!__Porffor_array_hasIndex(this, i)) {
       i++;
       continue;
     }
@@ -788,7 +860,7 @@ export const __Array_prototype_flatMap = function (this: any[], callbackFn: any,
   let i: i32 = 0, j: i32 = 0;
   const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
   while (i < len) {
-    if (Porffor.fastAnd(isArray, !__Porffor_array_has(this, i))) {
+    if (!__Porffor_array_hasIndex(this, i)) {
       i++;
       continue;
     }
@@ -852,7 +924,7 @@ export const __Array_prototype_every = function (this: any[], callbackFn: any, t
   let i: i32 = 0;
   const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
   while (i < len) {
-    if (Porffor.fastAnd(isArray, !__Porffor_array_has(this, i))) {
+    if (!__Porffor_array_hasIndex(this, i)) {
       i++;
       continue;
     }
@@ -870,7 +942,7 @@ export const __Array_prototype_some = function (this: any[], callbackFn: any, th
   let i: i32 = 0;
   const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
   while (i < len) {
-    if (Porffor.fastAnd(isArray, !__Porffor_array_has(this, i))) {
+    if (!__Porffor_array_hasIndex(this, i)) {
       i++;
       continue;
     }
@@ -888,13 +960,13 @@ export const __Array_prototype_reduce = function (this: any[], callbackFn: any, 
   let i: i32 = 0;
   const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
   if (acc === undefined) {
-    while (Porffor.fastAnd(i < len, isArray, !__Porffor_array_has(this, i))) i++;
+    while (Porffor.fastAnd(i < len, !__Porffor_array_hasIndex(this, i))) i++;
     if (i == len) throw new TypeError('Reduce of empty array with no initial value');
     acc = this[i++];
   }
 
   while (i < len) {
-    if (Porffor.fastAnd(isArray, !__Porffor_array_has(this, i))) {
+    if (!__Porffor_array_hasIndex(this, i)) {
       i++;
       continue;
     }
@@ -912,13 +984,13 @@ export const __Array_prototype_reduceRight = function (this: any[], callbackFn: 
   let i: i32 = len;
   const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
   if (acc === undefined) {
-    while (Porffor.fastAnd(i > 0, isArray, !__Porffor_array_has(this, i - 1))) i--;
+    while (Porffor.fastAnd(i > 0, !__Porffor_array_hasIndex(this, i - 1))) i--;
     if (i == 0) throw new TypeError('Reduce of empty array with no initial value');
     acc = this[--i];
   }
 
   while (i > 0) {
-    if (Porffor.fastAnd(isArray, !__Porffor_array_has(this, i - 1))) {
+    if (!__Porffor_array_hasIndex(this, i - 1)) {
       i--;
       continue;
     }
@@ -1272,7 +1344,7 @@ export const __Array_prototype_flat = function (this: any[], _depth: any) {
     out.length = len;
     const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
     for (let i: i32 = 0; i < len; i++) {
-      if (Porffor.fastOr(!isArray, __Porffor_array_has(this, i))) out[i] = this[i];
+      if (__Porffor_array_hasIndex(this, i)) out[i] = this[i];
     }
     return out;
   }
@@ -1280,7 +1352,7 @@ export const __Array_prototype_flat = function (this: any[], _depth: any) {
   let i: i32 = 0, j: i32 = 0;
   const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
   while (i < len) {
-    if (Porffor.fastAnd(isArray, !__Porffor_array_has(this, i))) {
+    if (!__Porffor_array_hasIndex(this, i)) {
       i++;
       continue;
     }

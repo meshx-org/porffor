@@ -1216,9 +1216,12 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
   // what < and friends make of an object operand (hint "number"), when a comparison can see one
   const toPrimNumber = funcs.find(x => x && x.name === '__ecma262_ToPrimitive_Number' && x.body);
   if (toPrimNumber) runtimeRefs.push(toPrimNumber);
+  // what an array read finds where no element is stored (the prototype chain, an accessor)
+  const arrHole = funcs.find(x => x && x.name === '__Porffor_array_holeGet' && x.body);
+  if (arrHole) runtimeRefs.push(arrHole);
   if (promiseResolveFunc) runtimeRefs.push(promiseResolveFunc);
   const stackful = funcs.some(f => needsCoro(f) && !stackless.has(f));
-  prelude.push(RUNTIME_HEAD(prefs, usesCoro, toStr ? fnSym(toStr) : null, !usedTypes || usedTypes.has(TYPES.bigint), stackful, toNum ? fnSym(toNum) : null, toPrimDefault ? fnSym(toPrimDefault) : null, toPrimNumber ? fnSym(toPrimNumber) : null));
+  prelude.push(RUNTIME_HEAD(prefs, usesCoro, toStr ? fnSym(toStr) : null, !usedTypes || usedTypes.has(TYPES.bigint), stackful, toNum ? fnSym(toNum) : null, toPrimDefault ? fnSym(toPrimDefault) : null, toPrimNumber ? fnSym(toPrimNumber) : null, arrHole ? fnSym(arrHole) : null));
   if (usesCoro) prelude.push(CORO_RUNTIME());
 
   // link unit head: static data image, globals, gc roots, per-function tables
@@ -1771,6 +1774,8 @@ ${st}jsval porf_coro_start(u8 flags, u32 idx, jsval callee, u32 env, jsval thisv
 ${st}jsval porf_call_dynamic_arr(jsval fn, jsval thisv, jsval newtv, jsval arr) {
   const u32 a = (u32)arr.val;
   const i32 argc = PORF_ARR_LEN(a);
+  // (every entry up to the length read, so allocated)
+  porf_arr_grow(a, argc);
   jsbits* argv = (jsbits*)(MEM + PORF_ARR_ENT(a));
   for (i32 i = 0; i < argc; i++) {
     if (argv[i] == 0) {
@@ -4198,7 +4203,7 @@ ${st}void porf_gc_collect(int minor) {
 // sign-set NaNs from raw bytes are canonicalized at Float64Array/DataView reads (porf_canon)
 // bigintUsed: the program can hold a BigInt, which packs specially (porf_pack)
 // stackful: some coroutine runs on a stack of its own (not stackless, see stackless.js)
-const RUNTIME_HEAD = (prefs, usesCoro = false, toStr = null, bigintUsed = true, stackful = false, toNum = null, toPrimDefault = null, toPrimNumber = null) => {
+const RUNTIME_HEAD = (prefs, usesCoro = false, toStr = null, bigintUsed = true, stackful = false, toNum = null, toPrimDefault = null, toPrimNumber = null, arrHole = null) => {
   const st = 'static ';
   const sti = 'static inline ';
   // --ropes: string concatenation builds ropes (needs the GC to trace them)
@@ -4817,6 +4822,7 @@ ${toStr ? `jsval ${toStr}(jsval);
 ` : ''}${toNum ? `jsval ${toNum}(jsval);
 ` : ''}${toPrimDefault ? `jsval ${toPrimDefault}(jsval);
 ` : ''}${toPrimNumber ? `jsval ${toPrimNumber}(jsval);
+` : ''}${arrHole ? `jsval ${arrHole}(jsval, jsval);
 ` : ''}\
 PORF_NORETURN ${st}void porf_throw(jsval v) {
   porf_exception = v;
@@ -4988,15 +4994,22 @@ ${st}u32 porf_arr_new(i32 len, i32 cap) {
   return a;
 }
 
+// (a length set past the capacity, a.length = 100, leaves the entries beyond it unallocated:
+// they read as holes)
 ${sti}int porf_arr_has_own(u32 a, u32 i) {
-  if (i >= (u32)PORF_ARR_LEN(a)) return 0;
+  if (i >= (u32)PORF_ARR_LEN(a) || i >= (u32)PORF_ARR_CAP(a)) return 0;
   return *(jsbits*)(MEM + PORF_ARR_ENT(a) + ((u64)i << 3)) != 0;
 }
 
+${arrHole ? `// a hole or an index past the end: what the spec's Get finds (out of line: rare)
+PORF_NOINLINE ${st}jsval porf_arr_hole(u32 a, u32 i) {
+  return ${arrHole}(porf_box((f64)a, ${TYPES.array}), porf_box_num((f64)i));
+}
+` : ''}\
 ${sti}jsval porf_arr_get(u32 a, u32 i) {
-  if (i >= (u32)PORF_ARR_LEN(a)) return JV_UNDEFINED;
+  if (i >= (u32)PORF_ARR_LEN(a) || i >= (u32)PORF_ARR_CAP(a)) return ${arrHole ? 'porf_arr_hole(a, i)' : 'JV_UNDEFINED'};
   const jsbits b = *(jsbits*)(MEM + PORF_ARR_ENT(a) + ((u64)i << 3));
-  if (b == 0) return JV_UNDEFINED;
+  if (b == 0) return ${arrHole ? 'porf_arr_hole(a, i)' : 'JV_UNDEFINED'};
   return porf_unpack(b);
 }
 
@@ -5022,7 +5035,7 @@ ${st}void porf_arr_set(u32 a, u32 i, jsval v) {
 }
 
 ${st}void porf_arr_delete(u32 a, u32 i) {
-  if (i >= (u32)PORF_ARR_LEN(a)) return;
+  if (i >= (u32)PORF_ARR_LEN(a) || i >= (u32)PORF_ARR_CAP(a)) return;
   *(jsbits*)(MEM + PORF_ARR_ENT(a) + ((u64)i << 3)) = 0;
 }
 

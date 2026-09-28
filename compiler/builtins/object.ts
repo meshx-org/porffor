@@ -140,8 +140,11 @@ export const __Object_prototype_hasOwnProperty = function (this: any, prop: any)
     if (Porffor.object.lookup(obj, p, __Porffor_object_hash(p)) != 0) return true;
   }
 
+  // (keys are strings and symbols: === is SameValue for them)
   const keys: any[] = __Object_keys(this);
-  return Porffor.callThis(__Array_prototype_includes, keys, p);
+  const len: i32 = keys.length;
+  for (let i: i32 = 0; i < len; i++) if (keys[i] === p) return true;
+  return false;
 };
 
 export const __Object_hasOwn = (obj: any, prop: any): boolean => {
@@ -271,8 +274,11 @@ export const __Object_prototype_propertyIsEnumerable = function (this: any, prop
     if (entryPtr != 0) return Porffor.object.isEnumerable(entryPtr);
   }
 
+  // (keys are strings and symbols: === is SameValue for them)
   const keys: any[] = __Object_keys(this);
-  return Porffor.callThis(__Array_prototype_includes, keys, p);
+  const len: i32 = keys.length;
+  for (let i: i32 = 0; i < len; i++) if (keys[i] === p) return true;
+  return false;
 };
 
 

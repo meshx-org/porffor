@@ -714,7 +714,14 @@ export const __Porffor_object_get = (_obj: any, key: any): any => {
       if (obj == null) break;
     }
 
-    if (entryPtr == 0) return undefined;
+    if (entryPtr == 0) {
+      // get [Symbol.species] of the built-in constructors (which carry no symbol keys) returns
+      // this, a subclass's included: only in a program that names species or subclasses
+      if (Porffor.comptime.flag`member.species`) {
+        if (Porffor.type(key) == Porffor.TYPES.symbol) if (key === Symbol.species) return __Porffor_object_speciesGet(_obj);
+      }
+      return undefined;
+    }
   }
 
   const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
@@ -728,6 +735,21 @@ export const __Porffor_object_get = (_obj: any, key: any): any => {
 
   return __Porffor_object_readValue(entryPtr);
 };
+
+// the receiver, when a built-in constructor with a [Symbol.species] getter is on its chain
+export const __Porffor_object_speciesGet = (receiver: any): any => {
+  let c: any = receiver;
+  while (Porffor.type(c) == Porffor.TYPES.function) {
+    if (Porffor.fastOr(c === Array, c === Map, c === Set, c === Promise, c === RegExp, c === ArrayBuffer)) return receiver;
+    c = Object.getPrototypeOf(c);
+  }
+  return undefined;
+};
+
+// an array element that is not stored (a hole, or past the end): what the spec's Get finds
+// for it, an own property (an accessor defined on the index) or the prototype chain's
+// (porf_arr_get's slow path)
+export const __Porffor_array_holeGet = (arr: any, index: any): any => __Porffor_object_get(arr, index);
 
 // per-call-site slot cache stores byte offsets into object entries
 // IC_EMPTY is i32 max so unset and stale slots fail the bounds/hash checks. The key is a
