@@ -701,6 +701,11 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
         if (spreadArr) {
           return [`porf_call_dynamic_arr(${rx(node[N_A], P_COMMA)}, ${rx(node[N_B], P_COMMA)}, ${newt}, ${rx(spreadArr, P_COMMA)})`, P_POSTFIX];
         }
+        // a plain call (no new.target) with up to 3 arguments: PORF_CALLn, which a size build
+        // turns into a call to porf_callN (the packing emitted once, not at every site)
+        if (args.length <= 3 && (newt === 'JV_UNDEFINED' || newt === `porf_box((f64)0u, ${TYPES.undefined})`)) {
+          return [`PORF_CALL${args.length}(${[ node[N_A], node[N_B] ].map(x => rx(x, P_COMMA)).concat(args.map(jsArg)).join(', ')})`, P_POSTFIX];
+        }
         const argv = args.length === 0 ? '(jsbits[]){JV_UNDEFINED_BITS}'
           : `(jsbits[]){ ${args.map(packArg).join(', ')} }`;
         return [`porf_call_dynamic(${rx(node[N_A], P_COMMA)}, ${rx(node[N_B], P_COMMA)}, ${newt}, ${args.length}, ${argv})`, P_POSTFIX];
@@ -1297,7 +1302,27 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
   const proto = f => `${CT[f.retType]} ${fnSym(f)}(${f.params.map(p => CT[p.type]).join(', ') || 'void'});\n`;
   const linkProtos = [
     `${st}jsval porf_call_dynamic(jsval fn, jsval thisv, jsval newtv, i32 argc, jsbits* argv);\n`,
-    `${st}jsval porf_call_dynamic_arr(jsval fn, jsval thisv, jsval newtv, jsval arr);\n`
+    `${st}jsval porf_call_dynamic_arr(jsval fn, jsval thisv, jsval newtv, jsval arr);\n`,
+    // plain dynamic calls of up to 3 arguments: a size build (-Os/-Oz) calls porf_callN,
+    // which packs the arguments, so no site carries the packing; a speed build packs them
+    // at the site as any other call, where clang is free to inline the dispatch (going
+    // through porf_callN costs richards 1.6%)
+    `#ifdef __OPTIMIZE_SIZE__
+${st}jsval porf_call0(jsval fn, jsval thisv);
+${st}jsval porf_call1(jsval fn, jsval thisv, jsval a0);
+${st}jsval porf_call2(jsval fn, jsval thisv, jsval a0, jsval a1);
+${st}jsval porf_call3(jsval fn, jsval thisv, jsval a0, jsval a1, jsval a2);
+#define PORF_CALL0(fn, thisv) porf_call0(fn, thisv)
+#define PORF_CALL1(fn, thisv, a0) porf_call1(fn, thisv, a0)
+#define PORF_CALL2(fn, thisv, a0, a1) porf_call2(fn, thisv, a0, a1)
+#define PORF_CALL3(fn, thisv, a0, a1, a2) porf_call3(fn, thisv, a0, a1, a2)
+#else
+#define PORF_CALL0(fn, thisv) porf_call_dynamic(fn, thisv, JV_UNDEFINED, 0, (jsbits[]){ JV_UNDEFINED_BITS })
+#define PORF_CALL1(fn, thisv, a0) porf_call_dynamic(fn, thisv, JV_UNDEFINED, 1, (jsbits[]){ porf_pack(a0) })
+#define PORF_CALL2(fn, thisv, a0, a1) porf_call_dynamic(fn, thisv, JV_UNDEFINED, 2, (jsbits[]){ porf_pack(a0), porf_pack(a1) })
+#define PORF_CALL3(fn, thisv, a0, a1, a2) porf_call_dynamic(fn, thisv, JV_UNDEFINED, 3, (jsbits[]){ porf_pack(a0), porf_pack(a1), porf_pack(a2) })
+#endif
+`
   ];
   if (usesSyncAsync) linkProtos.push(`${st}jsval porf_async_call_sync(u32 idx, jsval callee, u32 env, jsval thisv, jsval newtv, i32 argc, jsbits* argv);\n`);
   if (usesCoro) {
@@ -1745,7 +1770,26 @@ ${st}jsval porf_call_dynamic_arr(jsval fn, jsval thisv, jsval newtv, jsval arr) 
     }
   }
   return porf_call_dynamic(fn, thisv, newtv, argc, argv);
-}\n`);
+}
+#ifdef __OPTIMIZE_SIZE__
+// plain calls (no new.target) of up to 3 arguments, packed here rather than at each site
+PORF_NOINLINE ${st}jsval porf_call0(jsval fn, jsval thisv) {
+  jsbits argv[1] = { JV_UNDEFINED_BITS };
+  return porf_call_dynamic(fn, thisv, JV_UNDEFINED, 0, argv);
+}
+PORF_NOINLINE ${st}jsval porf_call1(jsval fn, jsval thisv, jsval a0) {
+  jsbits argv[1] = { porf_pack(a0) };
+  return porf_call_dynamic(fn, thisv, JV_UNDEFINED, 1, argv);
+}
+PORF_NOINLINE ${st}jsval porf_call2(jsval fn, jsval thisv, jsval a0, jsval a1) {
+  jsbits argv[2] = { porf_pack(a0), porf_pack(a1) };
+  return porf_call_dynamic(fn, thisv, JV_UNDEFINED, 2, argv);
+}
+PORF_NOINLINE ${st}jsval porf_call3(jsval fn, jsval thisv, jsval a0, jsval a1, jsval a2) {
+  jsbits argv[3] = { porf_pack(a0), porf_pack(a1), porf_pack(a2) };
+  return porf_call_dynamic(fn, thisv, JV_UNDEFINED, 3, argv);
+}
+#endif\n`);
 
   if (prefs.nativeFetch) {
     const main = funcByName.get(entry);
