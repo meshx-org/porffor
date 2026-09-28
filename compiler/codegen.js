@@ -1722,11 +1722,10 @@ const getNodeType = (scope, node) => {
     else {
       const objType = getNodeType(scope, node.object);
       if (objType != null) {
+        // (s[i] is a string within the length, undefined past it: known only where the
+        // index is, markInBoundsIndexes)
         if (name === 'length' && (objType & TYPE_FLAGS.length) !== 0) ret = TYPES.number;
-        else if (node.computed) {
-          if (objType === TYPES.string) ret = TYPES.string;
-          else if (objType === TYPES.bytestring) ret = TYPES.bytestring;
-        }
+        else if (node.computed && node._inBounds && (objType === TYPES.string || objType === TYPES.bytestring)) ret = objType;
       }
     }
   }
@@ -4858,6 +4857,88 @@ const startMemberDemands = () => {
 
 let icSites;
 
+// s[i] is a string only for an index below the length. In the loop that checks exactly that,
+//   for (let i = <integer >= 0>; i < s.length; i++) ... s[i] ...
+// it always is, when nothing in the body can change i or s (no write to either, no
+// declaration of either name, no eval, with or arguments) and s is assigned nowhere in the
+// program (by name: over-counting writes only leaves a loop unmarked). Those s[i] are marked
+// _inBounds, and type inference and codegen both read the mark: a string, with no check
+const astChildren = node => {
+  const out = [];
+  for (const k in node) {
+    if (k[0] === '_' || k === 'loc') continue;
+    const v = node[k];
+    if (Array.isArray(v)) { for (const x of v) if (x && typeof x.type === 'string') out.push(x); }
+    else if (v && typeof v.type === 'string') out.push(v);
+  }
+  return out;
+};
+
+const patternNames = (node, out) => {
+  if (!node) return;
+  if (node.type === 'Identifier') out.add(node.name);
+  else if (node.type === 'ArrayPattern') for (const x of node.elements) patternNames(x, out);
+  else if (node.type === 'ObjectPattern') for (const x of node.properties) patternNames(x.type === 'RestElement' ? x.argument : x.value, out);
+  else if (node.type === 'AssignmentPattern') patternNames(node.left, out);
+  else if (node.type === 'RestElement') patternNames(node.argument, out);
+};
+
+// every name a node writes (assignments, updates, for-in/of targets) or declares
+const writtenNames = node => {
+  const written = new Set(), declared = new Set();
+  let opaque = false;
+  const walk = n => {
+    switch (n.type) {
+      case 'AssignmentExpression': patternNames(n.left, written); break;
+      case 'UpdateExpression': patternNames(n.argument, written); break;
+      case 'ForInStatement': case 'ForOfStatement': if (n.left.type !== 'VariableDeclaration') patternNames(n.left, written); break;
+      case 'VariableDeclarator': patternNames(n.id, declared); break;
+      case 'FunctionDeclaration': case 'FunctionExpression': case 'ArrowFunctionExpression':
+        if (n.id) declared.add(n.id.name);
+        for (const x of n.params) patternNames(x, declared);
+        break;
+      case 'ClassDeclaration': case 'ClassExpression': if (n.id) declared.add(n.id.name); break;
+      case 'CatchClause': patternNames(n.param, declared); break;
+      case 'WithStatement': opaque = true; break;
+      case 'Identifier': if (n.name === 'arguments' || n.name === 'eval') opaque = true; break;
+    }
+    for (const x of astChildren(n)) walk(x);
+  };
+  walk(node);
+  return { written, declared, opaque };
+};
+
+const markInBoundsIndexes = program => {
+  const programWrites = writtenNames(program).written;
+  const walk = n => {
+    if (n.type === 'ForStatement') {
+      const { init, test, update, body } = n;
+      const decl = init?.type === 'VariableDeclaration' && init.kind === 'let' && init.declarations.length === 1 ? init.declarations[0] : null;
+      const i = decl?.id.type === 'Identifier' ? decl.id.name : null;
+      const start = decl?.init;
+      const str = test?.type === 'BinaryExpression' && test.operator === '<' && test.left.type === 'Identifier' && test.left.name === i &&
+        test.right.type === 'MemberExpression' && !test.right.computed && test.right.property.name === 'length' &&
+        test.right.object.type === 'Identifier' ? test.right.object.name : null;
+      const steps = update && ((update.type === 'UpdateExpression' && update.operator === '++' && update.argument.type === 'Identifier' && update.argument.name === i) ||
+        (update.type === 'AssignmentExpression' && update.operator === '+=' && update.left.type === 'Identifier' && update.left.name === i &&
+          update.right.type === 'Literal' && update.right.value === 1));
+      if (i && str && i !== str && steps && start?.type === 'Literal' && Number.isInteger(start.value) && start.value >= 0 && !programWrites.has(str)) {
+        const { written, declared, opaque } = writtenNames(body);
+        if (!opaque && !written.has(i) && !written.has(str) && !declared.has(i) && !declared.has(str)) {
+          const mark = m => {
+            if (m.type === 'MemberExpression' && m.computed && m.object.type === 'Identifier' && m.object.name === str &&
+              m.property.type === 'Identifier' && m.property.name === i) m._inBounds = true;
+            for (const x of astChildren(m)) mark(x);
+          };
+          mark(body);
+        }
+      }
+    }
+    for (const x of astChildren(n)) walk(x);
+  };
+  walk(program);
+};
+
 const generateMember = (scope, decl, objValue = null) => {
   if (!globalThis.precompile) demandMemberRead(decl);
   const closureSlot = decl._closureSlot;
@@ -4961,17 +5042,24 @@ const generateMember = (scope, decl, objValue = null) => {
   const taGetBig = signed => () =>
     builtinCall(scope, signed ? '__Porffor_bigint_fromS64' : '__Porffor_bigint_fromU64', [ Load('i64', taAddr(8), 4) ]);
 
+  // s[i]: a character only for an integer index below the length (s[99], s[-1] and s[1.5]
+  // are property reads, which find nothing on a string but what its prototype has)
   const strGet = (ctype, size, strType) => () => {
     // --ropes: its characters are read directly, so a rope is flattened first
     const str = Prefs.ropes ? reuse(scope, builtinCall(scope, '__Porffor_string_flat', [ obj ])) : obj;
-    if (size === 1) return oneCharString(scope, Load('u8', Bin('+', T.u32, Bin('+', T.u32, JvPtr(str), Const(T.u32, 4)),
-      Convert(T.u32, numValue(prop), 0)), 0));
-    const out = reuse(scope, Alloc(Const(T.i32, 8), strType));
-    stmt(scope, Store('u32', out, 0, Const(T.u32, 1)));
-    const src = Bin('+', T.u32, Bin('+', T.u32, JvPtr(str), Const(T.u32, 4)),
-      size === 1 ? Convert(T.u32, numValue(prop), 0) : Bin('*', T.u32, Convert(T.u32, numValue(prop), 0), Const(T.u32, size)));
-    stmt(scope, Store(ctype, out, 4, Load(ctype, src, 0)));
-    return valOf(out, strType);
+    const { idx, valid } = denseArrayIndexKey(scope, prop);
+    const res = tmp(scope, T.jsval);
+    // an index known to be in bounds (markInBoundsIndexes) needs no check
+    emitIf(scope, decl._inBounds ? Const(T.i32, 1) : Bin('&&', T.i32, valid, Bin('<', T.u32, idx, Load('u32', JvPtr(str), 0))), () => {
+      const src = Bin('+', T.u32, Bin('+', T.u32, JvPtr(str), Const(T.u32, 4)),
+        size === 1 ? idx : Bin('*', T.u32, idx, Const(T.u32, size)));
+      if (size === 1) return assign(scope, res, oneCharString(scope, Load('u8', src, 0)));
+      const out = reuse(scope, Alloc(Const(T.i32, 8), strType));
+      stmt(scope, Store('u32', out, 0, Const(T.u32, 1)));
+      stmt(scope, Store(ctype, out, 4, Load(ctype, src, 0)));
+      assign(scope, res, valOf(out, strType));
+    }, () => assign(scope, res, genericMemberGet()));
+    return res;
   };
 
   const indexedMemberGetBC = [
@@ -6091,6 +6179,7 @@ export default (program, opts = {}) => {
     objectHackers = userDecls.size > 0 ? allObjectHackers.filter(x => !userDecls.has(x)) : allObjectHackers;
     semantic.objectHackers = objectHackers;
   }
+  markInBoundsIndexes(program);
   if (program._usesTemporal) {
     const polyfill = parse(temporalPolyfillSource).body;
     if (program._units) for (const x of polyfill) x._unit = 'temporal';
