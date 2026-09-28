@@ -724,6 +724,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
       case K.ArrAlloc: return [`porf_arr_alloc(${rx(node[N_A], P_COMMA)})`, P_POSTFIX];
       case K.EnvAlloc: return [`porf_env_alloc(${rx(node[N_A], P_COMMA)}, ${rx(node[N_B], P_COMMA)})`, P_POSTFIX];
       case K.FnAlloc: return [`porf_fn_alloc(${rx(node[N_A], P_COMMA)}, ${rx(node[N_B], P_COMMA)})`, P_POSTFIX];
+      case K.Clone: return [`porf_tmpl_clone(${rx(node[N_A], P_COMMA)}, ${node[N_B]})`, P_POSTFIX];
 
       case K.ArrGet: return [`porf_arr_get(${rx(node[N_A], P_COMMA)}, ${rx(node[N_B], P_COMMA)})`, P_POSTFIX];
       case K.LenGet: return [`*(i32*)(MEM + ${rx(node[N_A], P_ADD)})`, P_UNARY];
@@ -1259,6 +1260,14 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
         continue;
       }
       writeBytes(off, seg);
+      // a constant literal's template points at other segments (its strings, nested
+      // templates): their addresses, known only now, as a u32, an f64 or a packed jsval
+      for (const r of seg.relocs ?? []) {
+        const addr = dataOffsets[r.seg];
+        if (r.kind === 'u32') writeU32(off + r.off, addr);
+          else if (r.kind === 'f64') writeBytes(off + r.off, ieee754_binary64(addr));
+          else writeU64(off + r.off, jvConstBits(r.type, addr));
+      }
     }
 
     let blob = image, blobLen = image.length;
@@ -4913,6 +4922,49 @@ ${st}u32 porf_env_alloc(u32 parent, i32 count) {
     *(u8*)(MEM + e + 16 + (i << 4)) = ${TYPES.undefined};
   }
   return e;
+}
+
+// a fresh copy of a constant literal's template (K.Clone): the object's entries or the
+// array's storage repointed into the copy, and each nested template (an object or array
+// value) copied in turn
+${st}u32 porf_tmpl_clone(u32 t, i32 type) {
+  if (type == ${TYPES.array}) {
+    const i32 len = PORF_ARR_LEN(t);
+    const u32 bytes = 16 + ((u32)PORF_ARR_CAP(t) << 3);
+    const u32 a = porf_alloc(bytes, ${TYPES.array});
+    memcpy(MEM + a, MEM + t, bytes);
+    PORF_ARR_ENT(a) = a + 16;
+    int nested = 0;
+    for (i32 i = 0; i < len; i++) {
+      jsbits* slot = (jsbits*)(MEM + a + 16 + ((u32)i << 3));
+      const jsval v = porf_unpack(*slot);
+      if ((v.type == ${TYPES.object} || v.type == ${TYPES.array}) && v.val != 0) {
+        *slot = porf_pack(porf_box((f64)porf_tmpl_clone((u32)v.val, v.type), v.type));
+        nested = 1;
+      }
+    }
+    if (nested) porf_gc_barrier(a, ${TYPES.array});
+    return a;
+  }
+  const u32 count = *(u16*)(MEM + t);
+  const u32 bytes = 16 + (u32)*(u16*)(MEM + t + 2) * 20;
+  const u32 o = porf_alloc(bytes, ${TYPES.object});
+  memcpy(MEM + o, MEM + t, bytes);
+  *(u32*)(MEM + o + 12) = o + 16;
+  int nested = 0;
+  for (u32 i = 0; i < count; i++) {
+    const u32 e = o + 16 + i * 20;
+    const u8 vt = *(u8*)(MEM + e + 17);
+    f64 payload;
+    memcpy(&payload, MEM + e + 8, 8);
+    if ((vt == ${TYPES.object} || vt == ${TYPES.array}) && payload != 0) {
+      payload = (f64)porf_tmpl_clone((u32)payload, vt);
+      memcpy(MEM + e + 8, &payload, 8);
+      nested = 1;
+    }
+  }
+  if (nested) porf_gc_barrier(o, ${TYPES.object});
+  return o;
 }
 
 // a function value's record: [func link index u32][env u32] (K.FnAlloc)

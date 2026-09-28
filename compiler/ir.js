@@ -122,7 +122,8 @@ export const K = {
   // porf_env_alloc) rather than a store per field at each site
   ArrAlloc: k++, // a: capacity (i32) -> ptr to an empty array, its slots zeroed
   EnvAlloc: k++, // a: parent env (u32), b: slot count (i32) -> ptr to an env, its slots undefined
-  FnAlloc: k++   // a: func link index (u32), b: env (u32) -> ptr to a function value's record
+  FnAlloc: k++,  // a: func link index (u32), b: env (u32) -> ptr to a function value's record
+  Clone: k++     // a: template ptr (a constant literal's data), b: type id (object or array) -> ptr to a fresh copy
 };
 
 export const KNames = [];
@@ -390,5 +391,6 @@ export const FuncRec = func => [K.FuncRec, T.ptr, FX.none, func, 0, 0];
 export const ArrAlloc = cap => [K.ArrAlloc, T.ptr, FX.call | fxOf(cap), cap, 0, 0];
 export const EnvAlloc = (parent, count) => [K.EnvAlloc, T.ptr, FX.call | fxOf(parent) | fxOf(count), parent, count, 0];
 export const FnAlloc = (idx, env) => [K.FnAlloc, T.ptr, FX.call | fxOf(idx) | fxOf(env), idx, env, 0];
+export const Clone = (template, typeId) => [K.Clone, T.ptr, FX.call | fxOf(template), template, typeId, 0];
 
 export const FN_ASYNC = 1, FN_GENERATOR = 2, FN_ASYNC_GENERATOR = 4;

@@ -304,7 +304,7 @@ const unflatten = cur => {
 
 // IR node kinds the dynamic walk cares about (mirrors ir.js K.*).
 const K_DataRef = ${K.DataRef}, K_Global = ${K.Global}, K_TypeSwitch = ${K.TypeSwitch}, K_Call = ${K.Call}, K_Alloc = ${K.Alloc}, K_ThrowNew = ${K.ThrowNew}, K_FuncIdx = ${K.FuncIdx}, K_FuncRec = ${K.FuncRec};
-const K_ArrAlloc = ${K.ArrAlloc}, K_EnvAlloc = ${K.EnvAlloc}, K_FnAlloc = ${K.FnAlloc}, TYPE_array = ${TYPES.array}, TYPE_closureenv = ${TYPES.__porffor_closureenv}, TYPE_function = ${TYPES.function};
+const K_ArrAlloc = ${K.ArrAlloc}, K_EnvAlloc = ${K.EnvAlloc}, K_FnAlloc = ${K.FnAlloc}, K_Clone = ${K.Clone}, TYPE_array = ${TYPES.array}, TYPE_closureenv = ${TYPES.__porffor_closureenv}, TYPE_function = ${TYPES.function};
 
 // is \`v\` an IR node array (defensive: length-6, numeric kind/type/fx)? a value-array such as a
 // case tuple or a list of type ids fails this, and the per-kind guards below disambiguate the
@@ -379,6 +379,7 @@ const walk = (node, h) => {
   else if (kind === K_ArrAlloc) h.typeUsed(TYPE_array);
   else if (kind === K_EnvAlloc) h.typeUsed(TYPE_closureenv);
   else if (kind === K_FnAlloc) h.typeUsed(TYPE_function);
+  else if (kind === K_Clone) h.typeUsed(node[4]);
   else if (kind === K_FuncIdx || kind === K_FuncRec) {
     const func = h.includeBuiltin(node[3]);
     func.indirect = true;

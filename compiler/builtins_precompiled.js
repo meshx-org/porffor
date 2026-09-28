@@ -68,7 +68,7 @@ const unflatten = cur => {
 
 // IR node kinds the dynamic walk cares about (mirrors ir.js K.*).
 const K_DataRef = 2, K_Global = 4, K_TypeSwitch = 33, K_Call = 36, K_Alloc = 43, K_ThrowNew = 40, K_FuncIdx = 54, K_FuncRec = 55;
-const K_ArrAlloc = 56, K_EnvAlloc = 57, K_FnAlloc = 58, TYPE_array = 72, TYPE_closureenv = 35, TYPE_function = 6;
+const K_ArrAlloc = 56, K_EnvAlloc = 57, K_FnAlloc = 58, K_Clone = 59, TYPE_array = 72, TYPE_closureenv = 35, TYPE_function = 6;
 
 // is `v` an IR node array (defensive: length-6, numeric kind/type/fx)? a value-array such as a
 // case tuple or a list of type ids fails this, and the per-kind guards below disambiguate the
@@ -143,6 +143,7 @@ const walk = (node, h) => {
   else if (kind === K_ArrAlloc) h.typeUsed(TYPE_array);
   else if (kind === K_EnvAlloc) h.typeUsed(TYPE_closureenv);
   else if (kind === K_FnAlloc) h.typeUsed(TYPE_function);
+  else if (kind === K_Clone) h.typeUsed(node[4]);
   else if (kind === K_FuncIdx || kind === K_FuncRec) {
     const func = h.includeBuiltin(node[3]);
     func.indirect = true;

@@ -6,7 +6,7 @@ import {
   Load, Store, MemCopy, MemFill,
   If, Loop, Break, Continue, BlockStmt, TypeSwitch, Return, Unreachable,
   Call, CallDynamic, Try, Throw, ThrowNew, Await, Yield,
-  Alloc, GcBarrier, ArrGet, ArrSet, ArrLenSet, LenGet, LenSet, RawC, FuncIdx, FuncRec, ArrAlloc, EnvAlloc, FnAlloc
+  Alloc, GcBarrier, ArrGet, ArrSet, ArrLenSet, LenGet, LenSet, RawC, FuncIdx, FuncRec, ArrAlloc, EnvAlloc, FnAlloc, Clone
 } from './ir.js';
 import { BuiltinFuncs, BuiltinVars, fullPrototypes } from './builtins.js';
 import { memberIndex, TYPED_ARRAY_KINDS } from './builtinDescriptors.js';
@@ -4461,6 +4461,10 @@ const makeString = (scope, str, bytestring = true) => {
 };
 
 const generateArray = (scope, decl, name = '$undeclared', staticAlloc = false) => {
+  if (!staticAlloc && !decl._staticAlloc) {
+    const template = literalTemplate(scope, decl);
+    if (template) return valOf(reuse(scope, Clone(DataRef(template.seg), template.type)), template.type);
+  }
   const elements = decl.elements;
   const length = elements.length;
   const capacity = Math.max(length, 2);
@@ -4548,7 +4552,114 @@ const denseArrayIndexKey = (scope, prop) => {
   };
 };
 
+// Constant literals as data: an object or array literal of nothing but numbers, strings,
+// booleans, null and more such literals is a template in the data section, in the runtime's
+// own layout, which porf_tmpl_clone copies (a fresh object each time it is evaluated),
+// rather than code storing each value. Its strings and nested templates are relocations,
+// written once the data is laid out. Not in builtins: their precompiled data is remapped
+// segment by segment, which relocations inside a segment would not survive.
+const JV_PATTERN_BITS = 0xFFF8000000000000n;
+const constBits = (typeId, payload) => JV_PATTERN_BITS | (BigInt(typeId & 0xFF) << 43n) | BigInt(payload >>> 0);
+const f64Bytes = n => [ ...new Uint8Array(new Float64Array([ n ]).buffer) ];
+const u64Bytes = b => Array.from({ length: 8 }, (_, i) => Number((b >> BigInt(i * 8)) & 0xFFn));
+const u32Bytes = n => [ n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff, (n >>> 24) & 0xff ];
+
+// a constant value: { num }, { type, payload } (a boolean, null), { type, seg } (a string or a
+// nested template, by its segment), or null when the node is not a constant
+const literalConstant = (scope, node) => {
+  if (node == null) return null;
+  if (node.type === 'Literal') {
+    if (typeof node.value === 'number') return { num: node.value };
+    if (typeof node.value === 'boolean') return { type: TYPES.boolean, payload: node.value ? 1 : 0 };
+    if (node.value === null && node.raw === 'null') return { type: TYPES.object, payload: 0 };
+    if (typeof node.value === 'string') return literalString(scope, node.value);
+    return null;
+  }
+  if (node.type === 'UnaryExpression' && node.operator === '-' && node.argument.type === 'Literal' && typeof node.argument.value === 'number')
+    return { num: -node.argument.value };
+  if (node.type === 'TemplateLiteral' && node.expressions.length === 0 && node.quasis[0].value.cooked != null)
+    return literalString(scope, node.quasis[0].value.cooked);
+  if (node.type === 'ObjectExpression' || node.type === 'ArrayExpression') return literalTemplate(scope, node);
+  return null;
+};
+
+const literalString = (scope, str) => {
+  const v = makeString(scope, str);
+  // the empty string folds to a constant (its type and a null pointer); the rest point at data
+  if (v[N_KIND] === K.JvConst) return { type: v[N_A], payload: v[N_B] };
+  return { type: v[N_B][N_A], seg: v[N_A][N_A] };
+};
+
+// the template for an object or array literal, { type, seg }, or null if it is not all constant
+const literalTemplate = (scope, node) => {
+  if (globalThis.precompile) return null;
+  const relocs = [];
+  let bytes;
+
+  if (node.type === 'ArrayExpression') {
+    const values = [];
+    for (const x of node.elements) {
+      if (x == null || x.type === 'SpreadElement') return null;
+      const v = literalConstant(scope, x);
+      if (v == null) return null;
+      values.push(v);
+    }
+    if (values.length === 0) return null;
+    const capacity = Math.max(values.length, 2);
+    bytes = [ ...u32Bytes(values.length), 0, 0, 0, 0, ...u32Bytes(capacity), 0, 0, 0, 0 ];
+    for (let i = 0; i < capacity; i++) {
+      const v = values[i];
+      const off = 16 + i * 8;
+      // an empty slot is 0 bits (a hole); +0 is its own pattern, as a stored number's
+      if (v == null) bytes.push(0, 0, 0, 0, 0, 0, 0, 0);
+      else if (v.num !== undefined) bytes.push(...u64Bytes(Object.is(v.num, 0) ? constBits(TYPES.number, 0)
+        : Number.isNaN(v.num) ? 0x7FF8000000000000n : new BigUint64Array(new Float64Array([ v.num ]).buffer)[0]));
+      else if (v.seg != null) { bytes.push(0, 0, 0, 0, 0, 0, 0, 0); relocs.push({ off, seg: v.seg, kind: 'bits', type: v.type }); }
+      else bytes.push(...u64Bytes(constBits(v.type, v.payload)));
+    }
+  } else {
+    const entries = [];
+    const keys = new Set();
+    for (const x of node.properties) {
+      if (x.type !== 'Property' || x.kind !== 'init' || x.computed || x.method || x.shorthand) return null;
+      const key = getProperty(x, true).value;
+      if (typeof key !== 'string' || key === '__proto__' || keys.has(key)) return null;
+      keys.add(key);
+      // a key with no hash known now (the empty key, a two-byte one) is set at run time
+      const hash = ctHash({ property: { name: key } });
+      if (hash == null) return null;
+      const v = literalConstant(scope, x.value);
+      if (v == null) return null;
+      entries.push({ key, keyString: literalString(scope, key), hash, v });
+    }
+    if (entries.length === 0) return null;
+    const capacity = Math.max(entries.length, 2);
+    bytes = [ entries.length & 0xff, entries.length >> 8, capacity & 0xff, capacity >> 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ];
+    for (let i = 0; i < capacity; i++) {
+      const e = entries[i];
+      const off = 16 + i * 20;
+      if (e == null) { bytes.push(...new Array(20).fill(0)); continue; }
+      const { v, keyString } = e;
+      bytes.push(...u32Bytes(e.hash | 0), 0, 0, 0, 0);
+      if (keyString.seg != null) relocs.push({ off: off + 4, seg: keyString.seg, kind: 'u32' });
+      if (v.num !== undefined) bytes.push(...f64Bytes(v.num));
+      else if (v.seg != null) { bytes.push(0, 0, 0, 0, 0, 0, 0, 0); relocs.push({ off: off + 8, seg: v.seg, kind: 'f64' }); }
+      else bytes.push(...f64Bytes(v.payload));
+      bytes.push(14, v.num !== undefined ? TYPES.number : v.type, keyString.type, 0);
+    }
+  }
+
+  const type = node.type === 'ArrayExpression' ? TYPES.array : TYPES.object;
+  const key = `#tmpl:${type}:${bytes.join(',')}:${relocs.map(r => `${r.off}.${r.seg}.${r.kind}.${r.type}`).join(',')}`;
+  bytes.relocs = relocs;
+  typeUsed(scope, type);
+  return { type, seg: dataSeg(unitOf(scope), key, bytes) };
+};
+
 const generateObject = (scope, decl) => {
+  const template = literalTemplate(scope, decl);
+  if (template) return valOf(reuse(scope, Clone(DataRef(template.seg), template.type)), template.type);
+
   const obj = reuse(scope, builtinCall(scope, '__Porffor_object_new', [ Const(T.i32, Math.max(decl.properties.length, 2)) ]));
   // __Porffor_object_new allocates it as an object: fresh, as makeArrayFromValues' array is
   const allocated = freshMark(scope);
