@@ -1379,6 +1379,8 @@ const irBuiltinHelpers = (scope, name, def) => ({
   onFinalize,
   remapData: id => {
     if (!def.data || !Object.hasOwn(def.data, id)) throw new Error(`${name}: missing precompiled data segment ${id}`);
+    // the one-character strings are shared, never written: one table, not one per builtin
+    if (isOneCharStrings(def.data[id])) return oneCharStringsSeg();
     return dataSeg('builtins', `builtin:${name}:${id}`, def.data[id]);
   },
   remapAllocSite: id => id,
@@ -3981,6 +3983,11 @@ const generateForOfCore = (scope, decl) => {
   };
   const strNext = (ctype, size, strType) => () => {
     emitIf(scope, Bin('==', T.i32, counter, length), () => stmt(scope, Break(L)));
+    if (size === 1) {
+      const code = reuse(scope, Load('u8', Bin('+', T.u32, Bin('+', T.u32, JvPtr(root), Const(T.u32, 4)), counter), 0));
+      assign(scope, counter, Bin('+', T.i32, counter, Const(T.i32, 1)));
+      return oneCharString(scope, code);
+    }
     const out = reuse(scope, Alloc(Const(T.i32, 8), strType));
     stmt(scope, Store('u32', out, 0, Const(T.u32, 1)));
     const src = Bin('+', T.u32, Bin('+', T.u32, JvPtr(root), Const(T.u32, 4)),
@@ -4443,6 +4450,18 @@ const byteStringable = str => {
 
   return true;
 };
+
+// every one-byte character as a string of its own, 256 in a row of 8 bytes each ([length 1
+// u32][char u8][pad]): a one-byte string's s[i] or iteration reads its character's string
+// here instead of allocating one (as V8's single character string table). Strings are never
+// written to once made, so all can share them
+// (one table for the whole program: a builtin's precompiled copy is mapped back to it)
+const ONE_CHAR_STRINGS = Array.from({ length: 256 }, (_, c) => [ 1, 0, 0, 0, c, 0, 0, 0 ]).flat();
+const isOneCharStrings = bytes => bytes.length === ONE_CHAR_STRINGS.length && bytes.every((x, i) => x === ONE_CHAR_STRINGS[i]);
+const oneCharStringsSeg = () => dataSeg('builtins', '#chars:b', ONE_CHAR_STRINGS);
+const oneCharStrings = scope => DataRef(globalThis.precompile ? dataSeg(unitOf(scope), '#chars:b', ONE_CHAR_STRINGS) : oneCharStringsSeg());
+const oneCharString = (scope, code) =>
+  valOf(Bin('+', T.u32, oneCharStrings(scope), Bin('*', T.u32, code, Const(T.u32, 8))), TYPES.bytestring);
 
 const makeString = (scope, str, bytestring = true) => {
   for (let i = 0; i < str.length; i++) if (str.charCodeAt(i) > 0xFF) { bytestring = false; break; }
@@ -4945,6 +4964,8 @@ const generateMember = (scope, decl, objValue = null) => {
   const strGet = (ctype, size, strType) => () => {
     // --ropes: its characters are read directly, so a rope is flattened first
     const str = Prefs.ropes ? reuse(scope, builtinCall(scope, '__Porffor_string_flat', [ obj ])) : obj;
+    if (size === 1) return oneCharString(scope, Load('u8', Bin('+', T.u32, Bin('+', T.u32, JvPtr(str), Const(T.u32, 4)),
+      Convert(T.u32, numValue(prop), 0)), 0));
     const out = reuse(scope, Alloc(Const(T.i32, 8), strType));
     stmt(scope, Store('u32', out, 0, Const(T.u32, 1)));
     const src = Bin('+', T.u32, Bin('+', T.u32, JvPtr(str), Const(T.u32, 4)),
