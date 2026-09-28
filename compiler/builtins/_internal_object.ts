@@ -1439,6 +1439,17 @@ export const __Porffor_object_defineAccessor = (obj: any, key: any, get: any, se
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, set);
 };
 
+// an own property removed whatever its attributes: the runtime's own objects (a bound
+// function has no prototype property, though every function is given one)
+export const __Porffor_object_removeOwn = (_obj: any, key: any): void => {
+  const obj: any = __Porffor_object_underlying(_obj);
+  if (Porffor.type(obj) != Porffor.TYPES.object) return;
+  const entryPtr: i32 = __Porffor_object_lookup(obj, key, __Porffor_object_hash(key));
+  if (entryPtr == 0) return;
+  Porffor.IR.storeU16(entryPtr, 16, Porffor.IR.loadU16(entryPtr, 16) | 0b0010);
+  __Porffor_object_delete(obj, key);
+};
+
 export const __Porffor_object_delete = (obj: any, key: any): boolean => {
   if (Porffor.comptime.flag`hasType.proxy`) {
     if (Porffor.type(obj) == Porffor.TYPES.proxy) return __Porffor_proxy_deleteProperty(obj, ecma262.ToPropertyKey(key), false);

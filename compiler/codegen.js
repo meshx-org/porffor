@@ -1232,6 +1232,12 @@ const performOp = (scope, op, left, right, leftType, rightType) => {
     const rawInt = rawIntType(left, right);
     if (rawInt != null) return boolBox(Bin(op, rawInt, rawIntValue(rawInt, left), rawIntValue(rawInt, right)));
     if ((knownLeft === TYPES.number || isRawNum(left)) && (knownRight === TYPES.number || isRawNum(right))) return boolBox(Bin(op, T.f64, numValue(left), numValue(right)));
+    // an operand that may be an object is made a primitive first (the runtime's porf_cmp
+    // calls the builtin for it)
+    const primitive = ty => ty === TYPES.number || ty === TYPES.bigint || ty === TYPES.boolean || ty === TYPES.undefined || isStr(ty) && ty !== TYPES.stringobject;
+    if ((!primitive(knownLeft) && !isRawNum(left)) || (!primitive(knownRight) && !isRawNum(right))) {
+      if ('__ecma262_ToPrimitive_Number' in builtinFuncs) includeBuiltin(scope, '__ecma262_ToPrimitive_Number');
+    }
     const c = reuse(scope, Cmp(left, right));
     let r;
     if (op === '<') r = Bin('==', T.i32, c, Const(T.i32, -1));
@@ -6181,9 +6187,19 @@ export default (program, opts = {}) => {
   }
   markInBoundsIndexes(program);
   if (program._usesTemporal) {
-    const polyfill = parse(temporalPolyfillSource).body;
+    const polyfillAst = parse(temporalPolyfillSource);
+    const polyfill = polyfillAst.body;
     if (program._units) for (const x of polyfill) x._unit = 'temporal';
     program.body = polyfill.concat(program.body);
+    // what the prelude's own code needs (its BigInts, its regexes), as the program's parse
+    // would have found had it been there, and what depends on it
+    for (const flag of [ '_usesBigInt', '_usesIterProtocol', '_regexScripts', '_regexStrings', '_regexEmoji' ])
+      if (polyfillAst[flag]) program[flag] = true;
+    usesIterProtocol = !!program._usesIterProtocol;
+    usesBigInt = !globalThis.precompile && !!program._usesBigInt;
+    regexScripts = !globalThis.precompile && !!program._regexScripts;
+    regexStrings = !globalThis.precompile && !!program._regexStrings;
+    regexEmoji = !globalThis.precompile && !!program._regexEmoji;
   }
 
   // todo/perf: make this lazy per func (again)

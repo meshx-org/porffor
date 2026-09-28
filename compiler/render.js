@@ -1213,9 +1213,12 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
   if (toNum) runtimeRefs.push(toNum);
   const toPrimDefault = funcs.find(x => x && x.name === '__ecma262_ToPrimitive_Default' && x.body);
   if (toPrimDefault) runtimeRefs.push(toPrimDefault);
+  // what < and friends make of an object operand (hint "number"), when a comparison can see one
+  const toPrimNumber = funcs.find(x => x && x.name === '__ecma262_ToPrimitive_Number' && x.body);
+  if (toPrimNumber) runtimeRefs.push(toPrimNumber);
   if (promiseResolveFunc) runtimeRefs.push(promiseResolveFunc);
   const stackful = funcs.some(f => needsCoro(f) && !stackless.has(f));
-  prelude.push(RUNTIME_HEAD(prefs, usesCoro, toStr ? fnSym(toStr) : null, !usedTypes || usedTypes.has(TYPES.bigint), stackful, toNum ? fnSym(toNum) : null, toPrimDefault ? fnSym(toPrimDefault) : null));
+  prelude.push(RUNTIME_HEAD(prefs, usesCoro, toStr ? fnSym(toStr) : null, !usedTypes || usedTypes.has(TYPES.bigint), stackful, toNum ? fnSym(toNum) : null, toPrimDefault ? fnSym(toPrimDefault) : null, toPrimNumber ? fnSym(toPrimNumber) : null));
   if (usesCoro) prelude.push(CORO_RUNTIME());
 
   // link unit head: static data image, globals, gc roots, per-function tables
@@ -4195,7 +4198,7 @@ ${st}void porf_gc_collect(int minor) {
 // sign-set NaNs from raw bytes are canonicalized at Float64Array/DataView reads (porf_canon)
 // bigintUsed: the program can hold a BigInt, which packs specially (porf_pack)
 // stackful: some coroutine runs on a stack of its own (not stackless, see stackless.js)
-const RUNTIME_HEAD = (prefs, usesCoro = false, toStr = null, bigintUsed = true, stackful = false, toNum = null, toPrimDefault = null) => {
+const RUNTIME_HEAD = (prefs, usesCoro = false, toStr = null, bigintUsed = true, stackful = false, toNum = null, toPrimDefault = null, toPrimNumber = null) => {
   const st = 'static ';
   const sti = 'static inline ';
   // --ropes: string concatenation builds ropes (needs the GC to trace them)
@@ -4813,6 +4816,7 @@ ${sti}jmp_buf* porf_try_ensure(void) {
 ${toStr ? `jsval ${toStr}(jsval);
 ` : ''}${toNum ? `jsval ${toNum}(jsval);
 ` : ''}${toPrimDefault ? `jsval ${toPrimDefault}(jsval);
+` : ''}${toPrimNumber ? `jsval ${toPrimNumber}(jsval);
 ` : ''}\
 PORF_NORETURN ${st}void porf_throw(jsval v) {
   porf_exception = v;
@@ -6151,7 +6155,7 @@ ${sti}int porf_is_strlike(jsval v) {
 }
 
 // JS + : string-ish on either side concats; else numeric coercion
-${toPrimDefault ? `// not a primitive (what ToPrimitive calls a method on): the primitive types are all at most
+${toPrimDefault || toPrimNumber ? `// not a primitive (what ToPrimitive calls a method on): the primitive types are all at most
 // ${TYPES.symbol} but the two string ones, and null is an object with no pointer
 static inline int porf_is_object(jsval v) {
   const i32 t = porf_jv_type(v);
@@ -6202,6 +6206,10 @@ ${sti}jsval porf_div(jsval a, jsval b) {
 // numeric coercion, or lexicographic when both sides are strings.
 // twin helper: dies when string.ts/coercion builtins port (step 3).
 ${sti}i32 porf_cmp(jsval a, jsval b) {
+${toPrimNumber ? `  // IsLessThan: an object operand is a primitive first (hint "number"), the left one first
+  if (porf_is_object(a)) a = ${toPrimNumber}(a);
+  if (porf_is_object(b)) b = ${toPrimNumber}(b);
+` : ''}\
   const i32 ta = porf_jv_type(a), tb = porf_jv_type(b);
 ${bigintUsed ? `  if (ta == ${TYPES.bigint}) return porf_bigint_cmp_any(a, b);
   if (tb == ${TYPES.bigint}) {

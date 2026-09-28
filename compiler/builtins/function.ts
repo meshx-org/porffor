@@ -46,5 +46,8 @@ export const __Function_prototype_bind = function (this: Function, thisArg: any,
   if (length < 0) length = 0;
   Object.defineProperty(bound, 'length', { value: length, configurable: true });
 
+  // a bound function has no prototype property (constructing it uses the target's)
+  __Porffor_object_removeOwn(bound, 'prototype');
+
   return bound;
 };
