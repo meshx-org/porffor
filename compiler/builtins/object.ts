@@ -166,6 +166,10 @@ export const __Porffor_object_in = (obj: any, prop: any): boolean => {
     obj = Porffor.object.getPrototypeWithHidden(obj, Porffor.type(obj));
     if (Porffor.fastOr(obj == null, Porffor.IR.ptr(obj) == Porffor.IR.ptr(lastProto))) break;
 
+    // a proxy on the chain answers the rest of the walk ([[HasProperty]], its has trap)
+    if (Porffor.comptime.flag`hasType.proxy`) {
+      if (Porffor.type(obj) == Porffor.TYPES.proxy) return __Porffor_proxy_has(obj, ecma262.ToPropertyKey(prop));
+    }
     if (Porffor.callThis(__Object_prototype_hasOwnProperty, obj, prop)) return true;
     lastProto = obj;
   }
@@ -679,7 +683,7 @@ export const __Object_prototype_toString = function (this: any) {
     if ((Porffor.type(tag) | 0b10000000) == Porffor.TYPES.bytestring) return '[object ' + tag + ']';
   }
 
-  if (Porffor.type(this) == Porffor.TYPES.array) return '[object Array]';
+  if (Porffor.type(this) == Porffor.TYPES.array) return __Porffor_array_isArguments(this) ? '[object Arguments]' : '[object Array]';
   if (Porffor.type(this) == Porffor.TYPES.function) return '[object Function]';
   if (Porffor.fastOr(
     Porffor.type(this) == Porffor.TYPES.boolean,

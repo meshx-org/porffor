@@ -9,8 +9,6 @@ import type {} from './porffor.d.ts';
 // ToObject(this) and LengthOfArrayLike
 export const __Porffor_arrayGeneric_object = (value: any): any => {
   if (value == null) throw new TypeError('Array.prototype method called on null or undefined');
-  // (a string's wrapper, so its indices are properties: ToObject only relabels a bytestring)
-  if ((Porffor.type(value) | 0b10000000) == Porffor.TYPES.bytestring) return Object(value);
   return ecma262.ToObject(value);
 };
 
@@ -274,6 +272,19 @@ export const __Porffor_array_createDataProperty = (target: any, index: number, v
 export const __Porffor_object_createDataProperty = (target: any, key: any, value: any): void => {
   if (Porffor.type(target) == Porffor.TYPES.array) {
     if (Porffor.type(key) == Porffor.TYPES.number) if (key < 4294967295) {
+      // (an array with a side table may hold a property of its own there, a non-writable one
+      // included, that the definition replaces)
+      const table: any = __Porffor_object_underlyingFind(target);
+      if (Porffor.IR.ptr(table) != 0) {
+        const p: any = ecma262.ToPropertyKey(key);
+        if (__Porffor_object_lookup(table, p, __Porffor_object_hash(p)) != 0) {
+          // redefined where it is (a non-configurable one throws), as defineProperty does
+          __Porffor_object_define(target, p, value, 0b1110);
+          if (key >= (target as any[]).length) __Porffor_array_setLength(target as any[], key + 1);
+          __Porffor_array_delete(target as any[], key);
+          return;
+        }
+      }
       target[key] = value;
       return;
     }

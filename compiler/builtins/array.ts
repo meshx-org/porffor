@@ -33,7 +33,7 @@ export const Array = function (...args: any[]): any[] {
 };
 
 export const __Array_isArray = (x: unknown): boolean => {
-  if (Porffor.type(x) == Porffor.TYPES.array) return true;
+  if (Porffor.type(x) == Porffor.TYPES.array) return !__Porffor_array_isArguments(x);
   // a proxy is an array when its target is (a revoked one throws)
   if (Porffor.comptime.flag`hasType.proxy`) {
     if (Porffor.type(x) == Porffor.TYPES.proxy) {
@@ -629,9 +629,8 @@ export const __Array_prototype_with = function (this: any[], _index: any, value:
   const out: any[] = Porffor.array.new(len);
 
   out.length = len;
-  for (let i: i32 = 0; i < len; i++) out[i] = this[i];
-
-  out[index] = value;
+  // (the replaced index is never read: a getter on it does not run)
+  for (let i: i32 = 0; i < len; i++) out[i] = i == index ? value : this[i];
 
   return out;
 };

@@ -800,7 +800,7 @@ export const __Porffor_json_revive = (holder: any, key: any, reviver: any): any 
     for (let i: i32 = 0; i < len; i++) {
       const k: any = Porffor.callThis(__Number_prototype_toString, i, 10);
       const el: any = __Porffor_json_revive(val, k, reviver);
-      if (el === undefined) delete val[k];
+      if (el === undefined) __Porffor_object_delete(val, k); // ([[Delete]]: a false result is not thrown)
         else val[k] = el;
     }
   } else if (Porffor.fastAnd(Porffor.type(val) == Porffor.TYPES.object, val !== null)) {
@@ -809,7 +809,7 @@ export const __Porffor_json_revive = (holder: any, key: any, reviver: any): any 
     for (let i: i32 = 0; i < len; i++) {
       const k: any = keys[i];
       const el: any = __Porffor_json_revive(val, k, reviver);
-      if (el === undefined) delete val[k];
+      if (el === undefined) __Porffor_object_delete(val, k); // ([[Delete]]: a false result is not thrown)
         else val[k] = el;
     }
   }

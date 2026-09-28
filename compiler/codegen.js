@@ -5841,6 +5841,10 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
       if (hasClosureOwnEnv(func) && func.closureOwnNewTarget) mirrorToClosureEnv(func, '#newtarget', { type: 'MetaProperty', meta: { type: 'Identifier', name: 'new' }, property: { type: 'Identifier', name: 'target' } });
       if (hasClosureOwnEnv(func) && func.closureOwnCallee) mirrorToClosureEnv(func, '#callee', { type: 'Identifier', name: '#callee' });
 
+      // a program's arguments object: marked, for its Object.prototype and non-array identity
+      if (func.usesArguments && !globalThis.precompile)
+        exprStmt(func, Call('porf_arr_mark_arguments', [ JvPtr(Local('#allargs', T.jsval)) ], T.none));
+
       for (let i = 0; i < args.length; i++) {
         const { name: argName, def, destr, type, inferredType } = args[i];
         if (args[i].rest) allocVar(func, argName);

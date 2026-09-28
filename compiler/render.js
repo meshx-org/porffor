@@ -137,8 +137,14 @@ const NEVER_INLINE = new Set([
   // each built-in prototype's getters are added through it (inlined, one per prototype)
   '__Porffor_object_fastAddAccessor',
   // every RegExp getter's guard path
-  '__Porffor_regexp_offTypeGetter'
+  '__Porffor_regexp_offTypeGetter',
+  // an array's species and a result that is not a plain array: rare, and each inlined copy
+  // would sit in every array method that can make one
+  '__Porffor_object_createDataProperty', '__Porffor_array_speciesConstruct'
 ]);
+// the array methods' steps on a non-array this or for a species (builtins/array_generic.ts):
+// the cold side of each method, compiled for size and kept out of its fast one
+const coldBuiltin = name => name.startsWith('__Porffor_arrayGeneric_');
 
 const sanitizeMemo = new Map();
 const sanitizeUsed = new Set();
@@ -1180,7 +1186,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     }
     const ret = CT[f.retType];
     const params = f.params.map(p => `${CT[p.type]} ${sanitize(p.name)}`).join(', ');
-    emit(`${needsCoro(f) ? 'PORF_CORO_BODY ' : f.ast?._module ? 'PORF_ONCE ' : NEVER_INLINE.has(f.name) ? 'PORF_NOINLINE ' : ''}${ret} ${fnSym(f)}(${params || 'void'}) {\n`);
+    emit(`${needsCoro(f) ? 'PORF_CORO_BODY ' : f.ast?._module ? 'PORF_ONCE ' : coldBuiltin(f.name) ? 'PORF_COLD ' : NEVER_INLINE.has(f.name) ? 'PORF_NOINLINE ' : ''}${ret} ${fnSym(f)}(${params || 'void'}) {\n`);
     depth = 1;
     activeTryDepth = 0;
     loopStack.length = 0;
@@ -1538,7 +1544,7 @@ ${st}jsval porf_async_call_sync(u32 idx, jsval callee, u32 env, jsval thisv, jsv
 	  if (cap < 4) cap = 4;
 	  const u32 a = porf_alloc(16 + ((u32)cap << 3), type);
 	  PORF_ARR_LEN(a) = len; PORF_ARR_ENT(a) = a + 16; PORF_ARR_CAP(a) = cap;
-	  memset(MEM + PORF_ARR_ENT(a), 0, (size_t)cap << 3);
+	  memset(MEM + a + 12, 0, 4 + ((size_t)cap << 3)); // (PORF_ARR_KIND and the entries)
 	  return a;
 	}
 
@@ -4912,12 +4918,16 @@ ${prefs.gc === false ? PORF_BUMP_ALLOC() : PORF_GC_ALLOC(prefs)}
 #define PORF_ARR_LEN(a) (*(i32*)(MEM + (a)))
 #define PORF_ARR_ENT(a) (*(u32*)(MEM + (a) + 4))
 #define PORF_ARR_CAP(a) (*(i32*)(MEM + (a) + 8))
+// the header's last word: PORF_ARR_ARGUMENTS marks a function's arguments object (an array
+// underneath, with Object.prototype and no Array identity); 0 for any other array
+#define PORF_ARR_KIND(a) (*(u32*)(MEM + (a) + 12))
+#define PORF_ARR_ARGUMENTS 0x41524753u
 
 // an array literal's storage: exactly cap slots, zeroed, no elements yet (K.ArrAlloc)
 ${st}u32 porf_arr_alloc(i32 cap) {
   const u32 a = porf_alloc(16 + ((u32)cap << 3), ${TYPES.array});
   PORF_ARR_LEN(a) = 0; PORF_ARR_ENT(a) = a + 16; PORF_ARR_CAP(a) = cap;
-  memset(MEM + a + 16, 0, (size_t)cap << 3);
+  memset(MEM + a + 12, 0, 4 + ((size_t)cap << 3)); // (PORF_ARR_KIND and the entries)
   return a;
 }
 
@@ -4990,7 +5000,7 @@ ${st}u32 porf_arr_new(i32 len, i32 cap) {
   if (cap < 4) cap = 4;
   const u32 a = porf_alloc(16 + ((u32)cap << 3), ${TYPES.array});
   PORF_ARR_LEN(a) = len; PORF_ARR_ENT(a) = a + 16; PORF_ARR_CAP(a) = cap;
-  memset(MEM + PORF_ARR_ENT(a), 0, (size_t)cap << 3);
+  memset(MEM + a + 12, 0, 4 + ((size_t)cap << 3)); // (PORF_ARR_KIND and the entries)
   return a;
 }
 
@@ -5032,6 +5042,10 @@ ${st}void porf_arr_set(u32 a, u32 i, jsval v) {
   if (i >= (u32)len) PORF_ARR_LEN(a) = (i32)i + 1;
   *(jsbits*)(MEM + PORF_ARR_ENT(a) + ((u64)i << 3)) = porf_arr_pack(v);
   if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(a, ${TYPES.array});
+}
+
+${st}void porf_arr_mark_arguments(u32 a) {
+  PORF_ARR_KIND(a) = PORF_ARR_ARGUMENTS;
 }
 
 ${st}void porf_arr_delete(u32 a, u32 i) {

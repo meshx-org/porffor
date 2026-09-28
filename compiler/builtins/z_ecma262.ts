@@ -249,7 +249,12 @@ export const __ecma262_ToPropertyKey = (argument: any): any => {
 export const __ecma262_ToObject = (argument: any): any => {
   if (Porffor.type(argument) == Porffor.TYPES.number) return Porffor.as(argument, Porffor.TYPES.numberobject);
   if (Porffor.type(argument) == Porffor.TYPES.boolean) return argument as BooleanObject;
-  if ((Porffor.type(argument) | 0b10000000) == Porffor.TYPES.bytestring) return argument as StringObject;
+  // (a String object is a string relabelled: a bytestring is widened first)
+  if (Porffor.type(argument) == Porffor.TYPES.string) return argument as StringObject;
+  if (Porffor.type(argument) == Porffor.TYPES.bytestring) {
+    const s: string = Porffor.bytestringToString(argument);
+    return s as StringObject;
+  }
   return argument;
 };
 

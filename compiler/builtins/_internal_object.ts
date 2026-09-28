@@ -523,6 +523,8 @@ export const __Porffor_object_getPrototypeWithHidden = (obj: any, trueType: i32)
   const objectProto: any = __Porffor_object_getPrototype(obj);
   if (Porffor.type(objectProto) != Porffor.TYPES.undefined) return objectProto;
 
+  // an arguments object is an array whose prototype is Object.prototype
+  if (trueType == Porffor.TYPES.array) if (Porffor.IR.loadI32(obj, 12) == 0x41524753) return __Porffor_object_getHiddenPrototype(Porffor.TYPES.object);
   return __Porffor_object_getHiddenPrototype(trueType);
 };
 
@@ -687,7 +689,7 @@ export const __Porffor_object_get = (_obj: any, key: any): any => {
       obj = __Porffor_object_getPrototype(obj);
       // if undefined, prototype is object.prototype
       if (Porffor.type(obj) == Porffor.TYPES.undefined) obj = __Object_prototype;
-    } else obj = __Porffor_object_getPrototypeWithHidden(obj, trueType);
+    } else obj = __Porffor_object_getPrototypeWithHidden(trueType == Porffor.TYPES.array ? _obj : obj, trueType);
 
     // todo/opt: put this behind comptime flag if only __proto__ is used
     if (hash == 212292208) if (Porffor.strcmp(key, '__proto__')) {
@@ -745,6 +747,9 @@ export const __Porffor_object_speciesGet = (receiver: any): any => {
   }
   return undefined;
 };
+
+// a function's arguments object (an array marked in its header's last word)
+export const __Porffor_array_isArguments = (arr: any): boolean => Porffor.IR.loadI32(arr, 12) == 0x41524753;
 
 // an array element that is not stored (a hole, or past the end): what the spec's Get finds
 // for it, an own property (an accessor defined on the index) or the prototype chain's
@@ -879,6 +884,11 @@ export const __Porffor_object_get_withHash = (_obj: any, key: any, hash: i32): a
   if (own) if (Porffor.type(obj) == Porffor.TYPES.object) entryPtr = __Porffor_object_lookup(obj, key, hash);
   if (entryPtr == 0) {
     // missing from this type's default chain the last time it was walked, unchanged since
+    // (an arguments object's chain is Object.prototype's, not its type's)
+    if (trueType == Porffor.TYPES.array) if (__Porffor_array_isArguments(_obj)) {
+      defaultChain = false;
+      own = true;
+    }
     if (defaultChain) if (__Porffor_object_missCached(hash, trueType)) return undefined;
 
     // check prototype chain
@@ -887,7 +897,7 @@ export const __Porffor_object_get_withHash = (_obj: any, key: any, hash: i32): a
       // if undefined, prototype is object.prototype
       if (Porffor.type(obj) == Porffor.TYPES.undefined) obj = __Object_prototype;
     } else if (!own) obj = __Porffor_object_getHiddenPrototype(trueType);
-      else obj = __Porffor_object_getPrototypeWithHidden(obj, trueType);
+      else obj = __Porffor_object_getPrototypeWithHidden(trueType == Porffor.TYPES.array ? _obj : obj, trueType);
 
     let proto: any = obj;
     if (Porffor.type(obj) != Porffor.TYPES.object) obj = __Porffor_object_underlying(obj);
@@ -1483,7 +1493,8 @@ export const __Porffor_object_delete = (obj: any, key: any): boolean => {
     const index: i32 = __Porffor_array_propertyKeyIndex(ecma262.ToPropertyKey(key));
     if (index != -1) {
       __Porffor_array_delete(obj as any[], index);
-      return true;
+      // (an accessor defined on the index lives in the property store: it goes too)
+      key = ecma262.ToPropertyKey(key);
     }
   }
 
@@ -1528,7 +1539,8 @@ export const __Porffor_object_deleteStrict = (obj: any, key: any): boolean => {
     const index: i32 = __Porffor_array_propertyKeyIndex(ecma262.ToPropertyKey(key));
     if (index != -1) {
       __Porffor_array_delete(obj as any[], index);
-      return true;
+      // (an accessor defined on the index lives in the property store: it goes too)
+      key = ecma262.ToPropertyKey(key);
     }
   }
 
