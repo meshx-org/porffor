@@ -267,14 +267,28 @@ export const __Porffor_stn_float = (str: unknown, i: i32, strict: boolean): f64 
 
 // 7.1.4.1.1 StringToNumber (str)
 // https://tc39.es/ecma262/#sec-stringtonumber
-export const __ecma262_StringToNumber = (str: string|bytestring): number => {
-  // trim whitespace
-  str = str.trim();
+// StrWhiteSpaceChar: WhiteSpace and LineTerminator
+export const __Porffor_stn_isWhitespace = (c: i32): boolean => {
+  if (c <= 32) return Porffor.fastOr(c == 32, Porffor.fastAnd(c >= 9, c <= 13));
+  if (c < 160) return false;
+  return Porffor.fastOr(c == 160, c == 5760, Porffor.fastAnd(c >= 8192, c <= 8202),
+    c == 8232, c == 8233, c == 8239, c == 8287, c == 12288, c == 65279);
+};
 
+export const __ecma262_StringToNumber = (str: string|bytestring): number => {
   if (str.length == 0) return 0;
+
+  // trim whitespace, only when there is some at either end (a trim makes a new string)
+  if (Porffor.fastOr(__Porffor_stn_isWhitespace(str.charCodeAt(0)), __Porffor_stn_isWhitespace(str.charCodeAt(str.length - 1)))) {
+    str = str.trim();
+    if (str.length == 0) return 0;
+  }
 
   // check 0x, 0o, 0b prefixes
   const first: i32 = str.charCodeAt(0);
+
+  // a numeric string starts with a digit, a point, a sign or Infinity: anything else is NaN
+  if (Porffor.fastAnd(Porffor.fastOr(first < 48, first > 57), first != 46, first != 43, first != 45, first != 73)) return NaN;
   const second: i32 = str.charCodeAt(1);
 
   if (first == 48) {

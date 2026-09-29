@@ -283,6 +283,77 @@ const f64Lit = value => {
   return `porf_bits_to_f64(0x${hex}ull)`;
 };
 
+const ALLOC_PROFILE_C = `// PORF_ALLOC_PROFILE: every allocation counted by where it came from, dumped to stderr at
+// exit as "ALLOC <site> <allocator> <type> <count> <bytes>": the site is the nearest compiled
+// JS function on the stack (its return address, so each call in it is its own site), the
+// allocator the C function that called porf_alloc (a builtin, or the site itself). For
+// measuring, not shipping: a stack walk per allocation.
+#ifdef PORF_ALLOC_PROFILE
+#ifndef PORF_AP_DEFINED
+#define PORF_AP_DEFINED
+#include <execinfo.h>
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+typedef struct { void* site; void* alloc; u32 type; u64 count, bytes; } porf_ap_entry;
+#define PORF_AP_SLOTS 65536u
+static porf_ap_entry porf_ap[PORF_AP_SLOTS];
+typedef struct { void* addr; int user; } porf_ap_kind;
+static porf_ap_kind porf_ap_kinds[PORF_AP_SLOTS];
+static int porf_ap_started = 0;
+// compiled JS: p_<module>_name or p__main_name, not a builtin (p_builtins_...)
+static int porf_ap_is_user(void* addr) {
+  const u32 h = (u32)(((uintptr_t)addr >> 2) * 2654435761u) & (PORF_AP_SLOTS - 1u);
+  for (u32 i = h;; i = (i + 1u) & (PORF_AP_SLOTS - 1u)) {
+    if (porf_ap_kinds[i].addr == addr) return porf_ap_kinds[i].user;
+    if (porf_ap_kinds[i].addr == NULL) {
+      Dl_info info;
+      int user = 0;
+      if (dladdr(addr, &info) && info.dli_sname) {
+        const char* n = info.dli_sname;
+        if (n[0] == '_') n++;
+        user = n[0] == 'p' && n[1] == '_' && strncmp(n, "p_builtins", 10) != 0;
+      }
+      porf_ap_kinds[i].addr = addr;
+      porf_ap_kinds[i].user = user;
+      return user;
+    }
+  }
+}
+static void porf_ap_dump(void) {
+  for (u32 i = 0; i < PORF_AP_SLOTS; i++) {
+    const porf_ap_entry* e = &porf_ap[i];
+    if (e->count == 0) continue;
+    Dl_info a, b;
+    const char* site = dladdr(e->site, &a) && a.dli_sname ? a.dli_sname : "?";
+    const char* alloc = dladdr(e->alloc, &b) && b.dli_sname ? b.dli_sname : "?";
+    fprintf(stderr, "ALLOC %s+%lu %p %s %u %llu %llu\\n", site, (unsigned long)((char*)e->site - (char*)a.dli_saddr),
+      e->site, alloc, e->type, (unsigned long long)e->count, (unsigned long long)e->bytes);
+  }
+}
+__attribute__((noinline)) static void porf_ap_record(u32 bytes, u32 typeId) {
+  if (!porf_ap_started) { porf_ap_started = 1; atexit(porf_ap_dump); }
+  void* frames[24];
+  const int n = backtrace(frames, 24);
+  // frames[0] is this, frames[1] the function porf_alloc is inlined into
+  void* alloc = n > 1 ? frames[1] : NULL;
+  void* site = alloc;
+  for (int i = 1; i < n; i++) if (porf_ap_is_user(frames[i])) { site = frames[i]; break; }
+  const u32 h = (u32)((((uintptr_t)site >> 2) ^ ((uintptr_t)alloc >> 4) ^ typeId) * 2654435761u) & (PORF_AP_SLOTS - 1u);
+  for (u32 i = h;; i = (i + 1u) & (PORF_AP_SLOTS - 1u)) {
+    porf_ap_entry* e = &porf_ap[i];
+    if (e->count == 0) { e->site = site; e->alloc = alloc; e->type = typeId; }
+    if (e->site == site && e->alloc == alloc && e->type == typeId) { e->count++; e->bytes += bytes; return; }
+  }
+}
+#define PORF_AP_RECORD(bytes, typeId) porf_ap_record(bytes, typeId)
+#endif
+#else
+#define PORF_AP_RECORD(bytes, typeId) ((void)0)
+#endif
+`;
+
 export default ({ funcs, data = [], dataUnits = [], dataRelocs = [], globals = [], entry = null, prefs = {}, usedTypes = null, units = null }) => {
   // split: one C file per unit sharing a header, link-time constants as externs
   const split = !!prefs.split;
@@ -398,10 +469,47 @@ export default ({ funcs, data = [], dataUnits = [], dataRelocs = [], globals = [
     __Porffor_object_set_ic: 'value', __Porffor_object_set_icMiss: 'value',
     __Map_prototype_set: 'value', __WeakMap_prototype_set: 'value'
   };
+  // whether a builtin reads a parameter's characters itself, so needs it flat on entry. A use
+  // that only looks at the value does not: its type and truthiness, == and + and relational
+  // compares (their helpers flatten), a call (the callee flattens what it reads), returning,
+  // throwing or storing it, and its length (a rope keeps it where a flat string does). A copy
+  // into a local is the parameter too. Anything else (its pointer or payload, raw C naming
+  // it) reads the string: ToNumber flattening on entry kept clang from folding its type
+  // checks at every number call site (3.7x on a numeric loop)
+  const readsString = (f, param) => {
+    const names = new Set([ param ]);
+    const isOurs = n => isNode(n) && (n[N_KIND] === K.Local) && names.has(n[N_A]);
+    const SAFE = new Set([ K.JvType, K.JvIsNum, K.JvTruthy, K.JvFalsy, K.JvNullish, K.Eq, K.Add, K.Cmp,
+      K.Call, K.CallDynamic, K.Return, K.Throw, K.TypeSwitch, K.If, K.Loop, K.Block, K.Switch, K.Try ]);
+    let unsafe = false, grew = true;
+    const visit = (node, parent, slot) => {
+      if (unsafe || !Array.isArray(node)) return;
+      if (!isNode(node)) { for (const x of node) visit(x, parent, slot); return; }
+      const k = node[N_KIND];
+      if (k === K.RawC) { for (const n of names) if (String(node[N_A]).includes(sanitize(n))) unsafe = true; return; }
+      if (isOurs(node)) {
+        const pk = parent?.[N_KIND];
+        if (pk === K.Assign) {
+          // copied into a local: that is the parameter too (writing the parameter reads nothing)
+          if (slot === N_B && parent[N_A][N_KIND] === K.Local && !names.has(parent[N_A][N_A])) { names.add(parent[N_A][N_A]); grew = true; }
+          else if (slot === N_B && parent[N_A][N_KIND] !== K.Local) unsafe = true;
+        } else if (pk === K.ArrSet ? slot !== N_C : !SAFE.has(pk)) unsafe = true;
+        return;
+      }
+      // a length read through the pointer is fine
+      if (k === K.LenGet && isNode(node[N_A]) && node[N_A][N_KIND] === K.JvPtr && isOurs(node[N_A][N_A])) return;
+      for (const slotIdx of [ N_A, N_B, N_C ]) visit(node[slotIdx], node, slotIdx);
+    };
+    while (grew && !unsafe) {
+      grew = false;
+      visit(f.body, null, null);
+    }
+    return unsafe;
+  };
   const ropeFlatten = f => {
     if (!ropesOn || !f.internal) return '';
     const keep = ROPE_KEEPS[f.name];
-    return f.params.filter(p => p.type === T.jsval && p.name !== keep)
+    return f.params.filter(p => p.type === T.jsval && p.name !== keep && readsString(f, p.name))
       .map(p => `  ${sanitize(p.name)} = porf_str_flat(${sanitize(p.name)});\n`).join('');
   };
   for (const f of funcs) {
@@ -611,6 +719,19 @@ export default ({ funcs, data = [], dataUnits = [], dataRelocs = [], globals = [
             ((to === T.i32 && v[N_A] === T.u32) || (to === T.u32 && v[N_A] === T.i32))) {
           return [`(${CT[to]})${rx(v[N_B], P_CAST)}`, P_CAST];
         }
+        // and back to the same type: every 32-bit integer is exact as an f64, so the round
+        // trip is the value itself (builtins' stores of i32 values took it on every store)
+        if (from === T.f64 && v[N_KIND] === K.Convert && v[N_TYPE] === T.f64 &&
+            ((to === T.i32 && v[N_A] === T.i32) || (to === T.u32 && v[N_A] === T.u32))) {
+          return renderExpr(v[N_B]);
+        }
+        // (f64)a ± (f64)b back to an integer, a and b 32-bit integers (an i32 counter's i++ in
+        // a builtin): the sum is exact as an f64, so the same saturated result comes from a
+        // 64-bit integer sum, without the round trip through f64
+        if (from === T.f64 && (to === T.i32 || to === T.u32) && !(flags & CONVERT_RANGE_KNOWN) &&
+            v[N_KIND] === K.Bin && (v[N_A] === '+' || v[N_A] === '-') && exactInt(v[N_B]) && exactInt(v[N_C])) {
+          return [`${to === T.i32 ? 'porf_sat_i32' : 'porf_sat_u32'}(${exactInt(v[N_B])} ${v[N_A]} ${exactInt(v[N_C])})`, P_POSTFIX];
+        }
         // f64 -> int without range knowledge: saturate (JS ToInt semantics live above this)
         if (from === T.f64 && (to === T.i32 || to === T.u32 || to === T.ptr) && !(flags & CONVERT_RANGE_KNOWN)) {
           return [`${to === T.i32 ? 'porf_f64_to_i32' : 'porf_f64_to_u32'}(${rx(v, P_COMMA)})`, P_POSTFIX];
@@ -743,6 +864,16 @@ export default ({ funcs, data = [], dataUnits = [], dataRelocs = [], globals = [
   const rx = (node, need) => {
     const [code, prec] = renderExpr(node);
     return paren(code, prec, need);
+  };
+
+  // an f64 that is exactly a 32-bit integer (one widened, or an integral constant in range),
+  // as an i64 operand; null for anything else
+  const exactInt = node => {
+    if (node[N_KIND] === K.Convert && node[N_TYPE] === T.f64 && (node[N_A] === T.i32 || node[N_A] === T.u32))
+      return `(i64)${rx(node[N_B], P_CAST)}`;
+    if (node[N_KIND] === K.Const && typeof node[N_A] === 'number' && Number.isInteger(node[N_A]) &&
+        node[N_A] >= -2147483648 && node[N_A] <= 4294967295 && !Object.is(node[N_A], -0)) return `(i64)${node[N_A]}`;
+    return null;
   };
 
   const renderStmts = stmts => {
@@ -1228,7 +1359,14 @@ export default ({ funcs, data = [], dataUnits = [], dataRelocs = [], globals = [
   if (promiseResolveFunc) runtimeRefs.push(promiseResolveFunc);
   const stackful = funcs.some(f => needsCoro(f) && !stackless.has(f));
   prelude.push(RUNTIME_HEAD(prefs, usesCoro, toStr ? fnSym(toStr) : null, !usedTypes || usedTypes.has(TYPES.bigint), stackful, toNum ? fnSym(toNum) : null, toPrimDefault ? fnSym(toPrimDefault) : null, toPrimNumber ? fnSym(toPrimNumber) : null, arrHole ? fnSym(arrHole) : null));
-  if (usesCoro) prelude.push(CORO_RUNTIME());
+  // the resolver the coroutine runtime calls is declared later with the other functions
+  const resolveDecl = promiseResolveFunc
+    ? `${CT[promiseResolveFunc.retType]} ${fnSym(promiseResolveFunc)}(${promiseResolveFunc.params.map(p => CT[p.type]).join(', ') || 'void'});\n` : '';
+  // without the promise builtins, an awaited object is a promise fulfilled with it (there is
+  // no resolution to call a thenable's then through)
+  const settleAwaited = promiseResolveFunc ? settleAsyncResult : (value, promise) =>
+    `*(jsbits*)(MEM + (u32)${promise}.val + PORF_PROMISE_RESULT) = porf_pack(${value});\n  *(u8*)(MEM + (u32)${promise}.val + PORF_PROMISE_STATE) = 1;`;
+  if (usesCoro) prelude.push(resolveDecl + CORO_RUNTIME(settleAwaited));
 
   // link unit head: static data image, globals, gc roots, per-function tables
   const link = [];
@@ -1324,6 +1462,7 @@ export default ({ funcs, data = [], dataUnits = [], dataRelocs = [], globals = [
   const linkProtos = [
     `${st}jsval porf_call_dynamic(jsval fn, jsval thisv, jsval newtv, i32 argc, jsbits* argv);\n`,
     `${st}jsval porf_call_dynamic_arr(jsval fn, jsval thisv, jsval newtv, jsval arr);\n`,
+    `${st}i32 porf_arr_dense(u32 a);\n`,
     // plain dynamic calls of up to 3 arguments: a size build (-Os/-Oz) calls porf_callN,
     // which packs the arguments, so no site carries the packing; a speed build packs them
     // at the site as any other call, where clang is free to inline the dispatch (going
@@ -1459,17 +1598,41 @@ ${st}jsval porf_call3(jsval fn, jsval thisv, jsval a0, jsval a1, jsval a2);
   };
   const invokable = f => f.indirect || needsCoro(f) || isSyncAsync(f);
 
+  const invokeCase = (f, i) => {
+    const { pre, args, ret } = invokeAdapter(f);
+    const body = ret(`${fnSym(f)}(${args.join(', ')})`);
+    return pre.length ? `    case ${i}: { ${pre.join(' ')} ${body} }\n` : `    case ${i}: ${body}\n`;
+  };
+  // the builtins callable as values (Error, Symbol...) in a dispatch of their own, out of line:
+  // the program's own stay a switch small enough for clang to inline at a call site, where a
+  // known callee then folds to a direct call (run(f) with f a constant)
+  const builtinInvokes = prefs.invokeTable ? [] : linkFuncs.map((f, i) => [ f, i ]).filter(([ f ]) => invokable(f) && f.internal);
+  if (builtinInvokes.length > 0) {
+    emit(`PORF_NOINLINE static jsval porf_invoke_builtin(u32 idx, jsval callee, u32 env, jsval thisv, jsval newtv, i32 argc, jsbits* argv) {\n`);
+    emit('  (void)callee; (void)env; (void)thisv; (void)newtv; (void)argc; (void)argv;\n');
+    emit('  switch (idx) {\n');
+    for (const [ f, i ] of builtinInvokes) emit(invokeCase(f, i));
+    emit('  }\n  porf_unreachable("uncompiled function");\n  return JV_UNDEFINED;\n}\n');
+  }
+
   emit(`${st}jsval porf_invoke(u32 idx, jsval callee, u32 env, jsval thisv, jsval newtv, i32 argc, jsbits* argv) {\n`);
     emit('  (void)callee; (void)env; (void)thisv; (void)newtv; (void)argc; (void)argv;\n');
     if (!prefs.invokeTable) {
       emit('  switch (idx) {\n');
       for (let i = 0; i < linkFuncs.length; i++) {
         const f = linkFuncs[i];
-        if (!invokable(f)) continue;
-        const { pre, args, ret } = invokeAdapter(f);
-        const body = ret(`${fnSym(f)}(${args.join(', ')})`);
-        emit(pre.length ? `    case ${i}: { ${pre.join(' ')} ${body} }\n` : `    case ${i}: ${body}\n`);
+        if (!invokable(f) || f.internal && builtinInvokes.length > 0) continue;
+        emit(invokeCase(f, i));
       }
+      // argv handed on as a copy with constant indices: passed as it is, the call site's
+      // argument array escapes and stays in memory, 16 stores a call, where otherwise clang
+      // keeps it in registers (an argv of more than 16 is passed as it is)
+      if (builtinInvokes.length > 0) emit('    default: {\n' +
+        '      if (argc > 16) return porf_invoke_builtin(idx, callee, env, thisv, newtv, argc, argv);\n' +
+        '      jsbits copy[16];\n' +
+        '      for (i32 k = 0; k < 16; k++) if (k < argc) copy[k] = argv[k];\n' +
+        '      return porf_invoke_builtin(idx, callee, env, thisv, newtv, argc, copy);\n' +
+        '    }\n');
       emit('  }\n');
     } else {
       // a shape is the exact C signature plus how each parameter is fed; call_indirect
@@ -1784,6 +1947,15 @@ ${st}jsval porf_coro_start(u8 flags, u32 idx, jsval callee, u32 env, jsval thisv
   return porf_invoke(idx, fn, env, thisv, newtv, argc, argv);
 }
 // spread calls use array iteration semantics: holes become present undefined values.
+// whether an array stores every entry up to its length (no holes): what apply may pass as
+// it is, a hole being a read through the prototype chain
+${st}i32 porf_arr_dense(u32 a) {
+  const i32 len = PORF_ARR_LEN(a);
+  if (len > PORF_ARR_CAP(a)) return 0;
+  const jsbits* ent = (const jsbits*)(MEM + PORF_ARR_ENT(a));
+  for (i32 i = 0; i < len; i++) if (ent[i] == 0) return 0;
+  return 1;
+}
 ${st}jsval porf_call_dynamic_arr(jsval fn, jsval thisv, jsval newtv, jsval arr) {
   const u32 a = (u32)arr.val;
   const i32 argc = PORF_ARR_LEN(a);
@@ -2265,8 +2437,9 @@ static void porf_arena_init(void) {
   porf_commit(porf_heap_base + 65536u);
 }
 
-${st}u32 porf_alloc_slow(u32 bytes);
+${ALLOC_PROFILE_C}${st}u32 porf_alloc_slow(u32 bytes);
 ${sti}u32 porf_alloc(u32 bytes, u32 typeId) {
+  PORF_AP_RECORD(bytes, typeId);
   const u32 size = (bytes + 7u) & ~7u;
   const u32 p = porf_heap_cur;
   const u32 next = p + size;
@@ -2685,9 +2858,15 @@ static u32 porf_gc_claim_pages(u32 npg) {
     }
     if (lo == 0) {
       if ((u64)porf_heap_top + (u64)npg * PORF_GC_SPAGE >= PORF_ARENA_RESERVE) {
+#ifdef PORF_GC_DEFER
+        // never collect inside an allocation here: values in wasm locals are invisible to
+        // the scan and would be freed while live. Out of memory instead
+        return 0;
+#else
         porf_gc_collect(0);
         lo = porf_gc_pool_run(npg);
         if (lo == 0 && (u64)porf_heap_top + (u64)npg * PORF_GC_SPAGE >= PORF_ARENA_RESERVE) return 0;
+#endif
       }
       if (lo == 0) {
         porf_commit((u64)porf_heap_top + (u64)npg * PORF_GC_SPAGE);
@@ -2775,8 +2954,9 @@ static int porf_gc_refill_window(i32 ci) {
   return 1;
 }
 
-${st}u32 porf_alloc_slow(u32 bytes, u32 typeId);
+${ALLOC_PROFILE_C}${st}u32 porf_alloc_slow(u32 bytes, u32 typeId);
 ${sti}u32 porf_alloc(u32 bytes, u32 typeId) {
+  PORF_AP_RECORD(bytes, typeId);
   if (bytes <= PORF_GC_MAX_SMALL) {
     const u32 ci = porf_gc_cls_lut[(bytes + 7u) >> 3];
     struct porf_gc_window* w = &porf_gc_active[ci];
@@ -3187,10 +3367,18 @@ static void porf_gc_mark_promise_reaction_chain(u32 raw) {
   }
 }
 
+// a reaction's handler, output promise and value. Marking it scans it only when this marks
+// it: a reaction marked by another path (a conservative root) is scanned by its kind
+// (porf_gc_scan_body), which must not go through the mark (already marked, it would return
+// without scanning: its handler, a closure, freed while it waits in a promise's list)
+static void porf_gc_scan_promise_reaction(u32 raw);
 static void porf_gc_mark_promise_reaction(u32 raw) {
   if (raw == 0 || !porf_gc_is_block_start((i32)raw)) return;
   if (!porf_gc_mark_body((i32)raw) && porf_gc_kind((i32)raw) == PORF_GC_KIND_PROMISE_REACTION) return;
   porf_gc_set_kind((i32)raw, PORF_GC_KIND_PROMISE_REACTION);
+  porf_gc_scan_promise_reaction(raw);
+}
+static void porf_gc_scan_promise_reaction(u32 raw) {
   const u8 kind = *(u8*)(MEM + raw + PORF_REACTION_KIND);
   if (kind == 11) porf_gc_mark_coro_handle((uintptr_t)*(u64*)(MEM + raw + PORF_REACTION_HANDLER));
     else if (kind != 12) porf_gc_mark_jsbits(*(jsbits*)(MEM + raw + PORF_REACTION_HANDLER));
@@ -3658,7 +3846,7 @@ static void porf_gc_scan_kind_block(i32 body) {
       porf_gc_scan_regex_cache(body);
       break;
     case PORF_GC_KIND_PROMISE_REACTION:
-      porf_gc_mark_promise_reaction((u32)body);
+      porf_gc_scan_promise_reaction((u32)body);
       break;
 ${Prefs.ropes ? `    case PORF_GC_KIND_ROPE:
       porf_gc_scan_body(body, PORF_GC_KIND_ROPE);
@@ -4247,6 +4435,9 @@ const RUNTIME_HEAD = (prefs, usesCoro = false, toStr = null, bigintUsed = true, 
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef __wasm_simd128__
+#include <wasm_simd128.h>
+#endif
 #ifdef PORF_NO_EH
 // PORF_NO_EH: no setjmp/longjmp (wasm without the exceptions proposal). A throw with no
 // enclosing try still reports and exits; a throw inside a try aborts instead of catching.
@@ -4273,7 +4464,19 @@ typedef unsigned long long jmp_buf[1];
 // Printing (console.*) writes to porf_print_out: stdout, or stderr while console.error
 // and console.warn print.
 static FILE* porf_print_out = NULL;
-#define PORF_PRINT_OUT (porf_print_out ? porf_print_out : stdout)
+// The console's two files: stdout and stderr, or under PORF_CONSOLE_FILES the ones the
+// embedder defines, for one where a write may not block where it is made (a P3
+// component's sync export: wasi-porffor hands in memory streams and writes them out later).
+#ifdef PORF_CONSOLE_FILES
+extern FILE* porf_console_out;
+extern FILE* porf_console_err;
+#define PORF_CONSOLE_OUT porf_console_out
+#define PORF_CONSOLE_ERR porf_console_err
+#else
+#define PORF_CONSOLE_OUT stdout
+#define PORF_CONSOLE_ERR stderr
+#endif
+#define PORF_PRINT_OUT (porf_print_out ? porf_print_out : PORF_CONSOLE_OUT)
 ${prefs.repl ? `static int porf_repl_output_enabled = 1;
 #define printf(...) (porf_repl_output_enabled ? fprintf(PORF_PRINT_OUT, __VA_ARGS__) : 0)
 ` : `#define printf(...) fprintf(PORF_PRINT_OUT, __VA_ARGS__)
@@ -4582,6 +4785,10 @@ static inline i32 porf_nullish(jsval v) {
   return v.type == ${TYPES.undefined} || (v.type == ${TYPES.object} && (u32)v.val == 0u);
 }
 
+// saturating 64-bit integer -> 32-bit, as porf_f64_to_i32/u32 saturate an exact sum
+static inline i32 porf_sat_i32(i64 r) { return r < -2147483648LL ? (i32)-2147483648LL : r > 2147483647LL ? 2147483647 : (i32)r; }
+static inline u32 porf_sat_u32(i64 r) { return r < 0 ? 0u : r > 4294967295LL ? 4294967295u : (u32)r; }
+
 // saturating f64 -> int (JS semantics handled above; this is trunc_sat)
 static inline i32 porf_f64_to_i32(f64 d) {
   if (d != d) return 0;
@@ -4607,6 +4814,628 @@ PORF_COLD static u32 porf_to_u32_slow(f64 d) {
 static inline u32 porf_to_u32(f64 d) {
   if (__builtin_expect(d > -9223372036854775808.0 && d < 9223372036854775808.0, 1)) return (u32)(u64)(i64)d;
   return porf_to_u32_slow(d);
+}
+
+// SIMD scans and copies for the string and byte loops of the builtins (__Porffor_simd_*): with
+// wasm's 128-bit SIMD (-msimd128), 16 bytes or 8 units at a time; on any other target (tcc,
+// native) the scalar loop alone, which also finishes each vector loop's tail. Indices count
+// units from a data pointer's first one: MEM + base + 4.
+static i32 porf_simd_find_u8(u32 base, i32 i, i32 to, u32 c) {
+  const u8* s = MEM + base + 4u;
+#ifdef __wasm_simd128__
+  const v128_t n = wasm_i8x16_splat((int8_t)c);
+  for (; i + 16 <= to; i += 16) {
+    const u32 m = wasm_i8x16_bitmask(wasm_i8x16_eq(wasm_v128_load(s + i), n));
+    if (m) return i + (i32)__builtin_ctz(m);
+  }
+#else
+  // native: libc's memchr, vectorised on every target
+  if (i >= to) return -1;
+  const u8* hit = (const u8*)memchr(s + i, (int)(u8)c, (size_t)(to - i));
+  return hit ? (i32)(hit - s) : -1;
+#endif
+  for (; i < to; i++) if (s[i] == (u8)c) return i;
+  return -1;
+}
+static i32 porf_simd_find_u16(u32 base, i32 i, i32 to, u32 c) {
+  const u8* s = MEM + base + 4u;
+#ifdef __wasm_simd128__
+  const v128_t n = wasm_i16x8_splat((int16_t)c);
+  for (; i + 8 <= to; i += 8) {
+    const u32 m = wasm_i16x8_bitmask(wasm_i16x8_eq(wasm_v128_load(s + i * 2), n));
+    if (m) return i + (i32)__builtin_ctz(m);
+  }
+#else
+  // native: four units a word, a zero unit in (word ^ c * 0x0001000100010001) marking a hit
+  const u64 bcast = 0x0001000100010001ull * (u64)(u16)c;
+  for (; i + 4 <= to; i += 4) {
+    u64 w;
+    memcpy(&w, s + i * 2, 8);
+    w ^= bcast;
+    if (((w - 0x0001000100010001ull) & ~w & 0x8000800080008000ull) != 0ull) break;
+  }
+#endif
+  for (; i < to; i++) if (*(const u16*)(s + i * 2) == (u16)c) return i;
+  return -1;
+}
+// the last index in [from, to) holding c, or -1
+static i32 porf_simd_rfind_u8(u32 base, i32 from, i32 to, u32 c) {
+  const u8* s = MEM + base + 4u;
+  i32 i = to;
+#ifdef __wasm_simd128__
+  const v128_t n = wasm_i8x16_splat((int8_t)c);
+  for (; i - 16 >= from; i -= 16) {
+    const u32 m = wasm_i8x16_bitmask(wasm_i8x16_eq(wasm_v128_load(s + i - 16), n));
+    if (m) return i - 16 + (31 - (i32)__builtin_clz(m));
+  }
+#endif
+  while (i > from) if (s[--i] == (u8)c) return i;
+  return -1;
+}
+// the first index in [i, to) whose unit is in a 256-bit set (a bitmap at MEM + set; a two-byte
+// unit above 0xff is in none), or -1: the regex engine's first-character skip. SIMD looks each
+// byte's bitmap byte up by swizzling the bitmap's two halves, and its bit by a swizzled mask
+static i32 porf_simd_find_set_u8(u32 base, i32 i, i32 to, u32 set) {
+  const u8* s = MEM + base + 4u;
+  const u8* bits = MEM + set;
+#ifdef __wasm_simd128__
+  const v128_t lo = wasm_v128_load(bits), hi = wasm_v128_load(bits + 16);
+  const v128_t bitOf = wasm_i8x16_make(1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128);
+  const v128_t seven = wasm_i8x16_splat(7), sixteen = wasm_i8x16_splat(16), zero = wasm_i8x16_splat(0);
+  for (; i + 16 <= to; i += 16) {
+    const v128_t v = wasm_v128_load(s + i);
+    const v128_t idx = wasm_u8x16_shr(v, 3);
+    const v128_t row = wasm_v128_or(wasm_i8x16_swizzle(lo, idx), wasm_i8x16_swizzle(hi, wasm_i8x16_sub(idx, sixteen)));
+    const v128_t bit = wasm_i8x16_swizzle(bitOf, wasm_v128_and(v, seven));
+    const u32 m = wasm_i8x16_bitmask(wasm_i8x16_ne(wasm_v128_and(row, bit), zero));
+    if (m) return i + (i32)__builtin_ctz(m);
+  }
+#endif
+  for (; i < to; i++) { const u32 u = s[i]; if (bits[u >> 3] & (1u << (u & 7))) return i; }
+  return -1;
+}
+static i32 porf_simd_find_set_u16(u32 base, i32 i, i32 to, u32 set) {
+  const u8* s = MEM + base + 4u;
+  const u8* bits = MEM + set;
+#ifdef __wasm_simd128__
+  const v128_t lo = wasm_v128_load(bits), hi = wasm_v128_load(bits + 16);
+  const v128_t bitOf = wasm_i8x16_make(1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128);
+  const v128_t seven = wasm_i8x16_splat(7), sixteen = wasm_i8x16_splat(16), zero = wasm_i8x16_splat(0);
+  const v128_t byte = wasm_i16x8_splat(0xff);
+  for (; i + 16 <= to; i += 16) {
+    const v128_t a = wasm_v128_load(s + i * 2), b = wasm_v128_load(s + i * 2 + 16);
+    // units above 0xff: in no set (a signed narrow keeps their all-ones mask all ones)
+    const v128_t big = wasm_i8x16_narrow_i16x8(wasm_u16x8_gt(a, byte), wasm_u16x8_gt(b, byte));
+    const v128_t v = wasm_u8x16_narrow_i16x8(wasm_v128_and(a, byte), wasm_v128_and(b, byte));
+    const v128_t idx = wasm_u8x16_shr(v, 3);
+    const v128_t row = wasm_v128_or(wasm_i8x16_swizzle(lo, idx), wasm_i8x16_swizzle(hi, wasm_i8x16_sub(idx, sixteen)));
+    const v128_t bit = wasm_i8x16_swizzle(bitOf, wasm_v128_and(v, seven));
+    const v128_t hit = wasm_v128_andnot(wasm_i8x16_ne(wasm_v128_and(row, bit), zero), big);
+    const u32 m = wasm_i8x16_bitmask(hit);
+    if (m) return i + (i32)__builtin_ctz(m);
+  }
+#endif
+  for (; i < to; i++) { const u32 u = *(const u16*)(s + i * 2); if (u <= 0xff && (bits[u >> 3] & (1u << (u & 7)))) return i; }
+  return -1;
+}
+// the first index in [i, to) whose unit is NOT in the 256-bit set (a two-byte unit above 0xff is
+// in none), or to: the end of a class run (/[a-z]+/)
+static i32 porf_simd_span_set_u8(u32 base, i32 i, i32 to, u32 set) {
+  const u8* s = MEM + base + 4u;
+  const u8* bits = MEM + set;
+#ifdef __wasm_simd128__
+  const v128_t lo = wasm_v128_load(bits), hi = wasm_v128_load(bits + 16);
+  const v128_t bitOf = wasm_i8x16_make(1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128);
+  const v128_t seven = wasm_i8x16_splat(7), sixteen = wasm_i8x16_splat(16), zero = wasm_i8x16_splat(0);
+  for (; i + 16 <= to; i += 16) {
+    const v128_t v = wasm_v128_load(s + i);
+    const v128_t idx = wasm_u8x16_shr(v, 3);
+    const v128_t row = wasm_v128_or(wasm_i8x16_swizzle(lo, idx), wasm_i8x16_swizzle(hi, wasm_i8x16_sub(idx, sixteen)));
+    const v128_t bit = wasm_i8x16_swizzle(bitOf, wasm_v128_and(v, seven));
+    const u32 m = wasm_i8x16_bitmask(wasm_i8x16_eq(wasm_v128_and(row, bit), zero));
+    if (m) return i + (i32)__builtin_ctz(m);
+  }
+#endif
+  for (; i < to; i++) { const u32 u = s[i]; if (!(bits[u >> 3] & (1u << (u & 7)))) return i; }
+  return to;
+}
+static i32 porf_simd_span_set_u16(u32 base, i32 i, i32 to, u32 set) {
+  const u8* s = MEM + base + 4u;
+  const u8* bits = MEM + set;
+#ifdef __wasm_simd128__
+  const v128_t lo = wasm_v128_load(bits), hi = wasm_v128_load(bits + 16);
+  const v128_t bitOf = wasm_i8x16_make(1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128);
+  const v128_t seven = wasm_i8x16_splat(7), sixteen = wasm_i8x16_splat(16), zero = wasm_i8x16_splat(0);
+  const v128_t byte = wasm_i16x8_splat(0xff);
+  for (; i + 16 <= to; i += 16) {
+    const v128_t a = wasm_v128_load(s + i * 2), b = wasm_v128_load(s + i * 2 + 16);
+    const v128_t big = wasm_i8x16_narrow_i16x8(wasm_u16x8_gt(a, byte), wasm_u16x8_gt(b, byte));
+    const v128_t v = wasm_u8x16_narrow_i16x8(wasm_v128_and(a, byte), wasm_v128_and(b, byte));
+    const v128_t idx = wasm_u8x16_shr(v, 3);
+    const v128_t row = wasm_v128_or(wasm_i8x16_swizzle(lo, idx), wasm_i8x16_swizzle(hi, wasm_i8x16_sub(idx, sixteen)));
+    const v128_t bit = wasm_i8x16_swizzle(bitOf, wasm_v128_and(v, seven));
+    const v128_t miss = wasm_v128_or(wasm_i8x16_eq(wasm_v128_and(row, bit), zero), big);
+    const u32 m = wasm_i8x16_bitmask(miss);
+    if (m) return i + (i32)__builtin_ctz(m);
+  }
+#endif
+  for (; i < to; i++) { const u32 u = *(const u16*)(s + i * 2); if (u > 0xff || !(bits[u >> 3] & (1u << (u & 7)))) return i; }
+  return to;
+}
+// the first index from i whose unit is not ASCII (0x80 or above), or to
+static i32 porf_simd_ascii_u8(u32 base, i32 i, i32 to) {
+  const u8* s = MEM + base + 4u;
+#ifdef __wasm_simd128__
+  for (; i + 16 <= to; i += 16) {
+    const u32 m = wasm_i8x16_bitmask(wasm_v128_load(s + i));
+    if (m) return i + (i32)__builtin_ctz(m);
+  }
+#endif
+  for (; i < to; i++) if (s[i] >= 0x80) return i;
+  return to;
+}
+static i32 porf_simd_ascii_u16(u32 base, i32 i, i32 to) {
+  const u8* s = MEM + base + 4u;
+#ifdef __wasm_simd128__
+  const v128_t high = wasm_i16x8_splat((int16_t)0xff80);
+  for (; i + 8 <= to; i += 8) {
+    const v128_t v = wasm_v128_and(wasm_v128_load(s + i * 2), high);
+    const u32 m = wasm_i16x8_bitmask(wasm_i16x8_ne(v, wasm_i16x8_splat(0)));
+    if (m) return i + (i32)__builtin_ctz(m);
+  }
+#endif
+  for (; i < to; i++) if (*(const u16*)(s + i * 2) >= 0x80) return i;
+  return to;
+}
+// JSON: the first index from i whose byte needs an escape (below 0x20, a quote, a backslash), or to
+static i32 porf_simd_json_u8(u32 base, i32 i, i32 to) {
+  const u8* s = MEM + base + 4u;
+#ifdef __wasm_simd128__
+  const v128_t space = wasm_i8x16_splat(0x20), quote = wasm_i8x16_splat(0x22), slash = wasm_i8x16_splat(0x5c);
+  for (; i + 16 <= to; i += 16) {
+    const v128_t v = wasm_v128_load(s + i);
+    const v128_t bad = wasm_v128_or(wasm_u8x16_lt(v, space), wasm_v128_or(wasm_i8x16_eq(v, quote), wasm_i8x16_eq(v, slash)));
+    const u32 m = wasm_i8x16_bitmask(bad);
+    if (m) return i + (i32)__builtin_ctz(m);
+  }
+#endif
+  for (; i < to; i++) { const u8 c = s[i]; if (c < 0x20 || c == 0x22 || c == 0x5c) return i; }
+  return to;
+}
+// JSON, two-byte: the first index from i whose unit needs an escape or is above 0xff, or to
+static i32 porf_simd_json_u16(u32 base, i32 i, i32 to) {
+  const u8* s = MEM + base + 4u;
+#ifdef __wasm_simd128__
+  const v128_t space = wasm_i16x8_splat(0x20), quote = wasm_i16x8_splat(0x22), slash = wasm_i16x8_splat(0x5c), byte = wasm_i16x8_splat(0xff);
+  for (; i + 8 <= to; i += 8) {
+    const v128_t v = wasm_v128_load(s + i * 2);
+    const v128_t bad = wasm_v128_or(wasm_v128_or(wasm_u16x8_lt(v, space), wasm_u16x8_gt(v, byte)),
+      wasm_v128_or(wasm_i16x8_eq(v, quote), wasm_i16x8_eq(v, slash)));
+    const u32 m = wasm_i16x8_bitmask(bad);
+    if (m) return i + (i32)__builtin_ctz(m);
+  }
+#endif
+  for (; i < to; i++) { const u16 c = *(const u16*)(s + i * 2); if (c < 0x20 || c == 0x22 || c == 0x5c || c > 0xff) return i; }
+  return to;
+}
+// n bytes from source unit si to two-byte units from destination unit di
+static void porf_simd_widen(u32 dst, i32 di, u32 src, i32 si, i32 n) {
+  u8* d = MEM + dst + 4u + (u32)di * 2u;
+  const u8* s = MEM + src + 4u + (u32)si;
+  i32 k = 0;
+#ifdef __wasm_simd128__
+  for (; k + 16 <= n; k += 16) {
+    const v128_t v = wasm_v128_load(s + k);
+    wasm_v128_store(d + k * 2, wasm_u16x8_extend_low_u8x16(v));
+    wasm_v128_store(d + k * 2 + 16, wasm_u16x8_extend_high_u8x16(v));
+  }
+#endif
+  for (; k < n; k++) *(u16*)(d + k * 2) = s[k];
+}
+// n two-byte units, each below 0x100, from source unit si to bytes from destination unit di
+static void porf_simd_narrow(u32 dst, i32 di, u32 src, i32 si, i32 n) {
+  u8* d = MEM + dst + 4u + (u32)di;
+  const u8* s = MEM + src + 4u + (u32)si * 2u;
+  i32 k = 0;
+#ifdef __wasm_simd128__
+  for (; k + 16 <= n; k += 16)
+    wasm_v128_store(d + k, wasm_u8x16_narrow_i16x8(wasm_v128_load(s + k * 2), wasm_v128_load(s + k * 2 + 16)));
+#endif
+  for (; k < n; k++) d[k] = (u8)*(const u16*)(s + k * 2);
+}
+// ASCII letters' case flipped (lo is 'a' to upper-case a..z, 'A' to lower-case A..Z), n units
+// that are all ASCII: bytes to bytes, and one- or two-byte units to two-byte ones
+static inline u32 porf_case_ascii(u32 c, u32 lo) { return c - lo < 26u ? c ^ 0x20u : c; }
+static void porf_simd_case_u8(u32 dst, i32 di, u32 src, i32 si, i32 n, u32 lo) {
+  u8* d = MEM + dst + 4u + (u32)di;
+  const u8* s = MEM + src + 4u + (u32)si;
+  i32 k = 0;
+#ifdef __wasm_simd128__
+  const v128_t low = wasm_i8x16_splat((int8_t)lo), bit = wasm_i8x16_splat(0x20), span = wasm_i8x16_splat(25);
+  for (; k + 16 <= n; k += 16) {
+    const v128_t v = wasm_v128_load(s + k);
+    const v128_t letter = wasm_u8x16_le(wasm_i8x16_sub(v, low), span);
+    wasm_v128_store(d + k, wasm_v128_xor(v, wasm_v128_and(letter, bit)));
+  }
+#endif
+  for (; k < n; k++) d[k] = (u8)porf_case_ascii(s[k], lo);
+}
+static void porf_simd_case_u16(u32 dst, i32 di, u32 src, i32 si, i32 n, i32 swide, u32 lo) {
+  u8* d = MEM + dst + 4u + (u32)di * 2u;
+  const u8* s = MEM + src + 4u + (u32)si * (swide ? 2u : 1u);
+  i32 k = 0;
+#ifdef __wasm_simd128__
+  if (swide) {
+    const v128_t low = wasm_i16x8_splat((int16_t)lo), bit = wasm_i16x8_splat(0x20), span = wasm_i16x8_splat(25);
+    for (; k + 8 <= n; k += 8) {
+      const v128_t v = wasm_v128_load(s + k * 2);
+      const v128_t letter = wasm_u16x8_le(wasm_i16x8_sub(v, low), span);
+      wasm_v128_store(d + k * 2, wasm_v128_xor(v, wasm_v128_and(letter, bit)));
+    }
+  } else {
+    const v128_t low = wasm_i8x16_splat((int8_t)lo), bit = wasm_i8x16_splat(0x20), span = wasm_i8x16_splat(25);
+    for (; k + 16 <= n; k += 16) {
+      v128_t v = wasm_v128_load(s + k);
+      v = wasm_v128_xor(v, wasm_v128_and(wasm_u8x16_le(wasm_i8x16_sub(v, low), span), bit));
+      wasm_v128_store(d + k * 2, wasm_u16x8_extend_low_u8x16(v));
+      wasm_v128_store(d + k * 2 + 16, wasm_u16x8_extend_high_u8x16(v));
+    }
+  }
+#endif
+  for (; k < n; k++) *(u16*)(d + k * 2) = (u16)porf_case_ascii(swide ? *(const u16*)(s + k * 2) : s[k], lo);
+}
+
+// Base64 and hex for Uint8Array's toBase64/fromBase64/toHex/fromHex, atob and btoa. Sources
+// and destinations are data pointers (units at MEM + p + 4); a string source has one- or
+// two-byte units (two). With wasm SIMD, 12 bytes to 16 base64 chars (or back), and 16 bytes to
+// 32 hex digits (or back), per step; the scalar loops finish the tails and are all a target
+// without SIMD runs.
+static const u8 porf_b64_std[65] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static const u8 porf_b64_url[65] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+static const u8 porf_hex_digits[17] = "0123456789abcdef";
+static inline u32 porf_unit(const u8* s, i32 two, i32 k) { return two ? (u32)*(const u16*)(s + (u32)k * 2u) : (u32)s[k]; }
+
+// base64 (url: the base64url alphabet; pad: '=' padding) of n bytes at src into dst: the chars
+// written. SIMD swizzles each 3-byte group big-endian into a 32-bit lane, shifts it apart into
+// four 6-bit indices, and adds each the offset to its letter, which a 16-entry table gives by
+// the index's range (0 upper case, 26 lower case, 52 digits, 62, 63)
+static i32 porf_b64_encode(u32 src, i32 n, u32 dst, i32 url, i32 pad) {
+  const u8* s = MEM + src + 4u;
+  u8* d = MEM + dst + 4u;
+  const u8* abc = url ? porf_b64_url : porf_b64_std;
+  i32 i = 0, j = 0;
+#ifdef __wasm_simd128__
+  const v128_t order = wasm_i8x16_make(2, 1, 0, -1, 5, 4, 3, -1, 8, 7, 6, -1, 11, 10, 9, -1);
+  const v128_t offsets = url
+    ? wasm_i8x16_make(71, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -17, 32, 65, 0, 0)
+    : wasm_i8x16_make(71, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -19, -16, 65, 0, 0);
+  const v128_t m0 = wasm_i32x4_splat(0x3f), m1 = wasm_i32x4_splat(0x3f00), m2 = wasm_i32x4_splat(0x3f0000), m3 = wasm_i32x4_splat(0x3f000000);
+  const v128_t c51 = wasm_i8x16_splat(51), c26 = wasm_i8x16_splat(26), c13 = wasm_i8x16_splat(13);
+  for (; i + 16 <= n; i += 12, j += 16) {
+    const v128_t v = wasm_i8x16_swizzle(wasm_v128_load(s + i), order);
+    const v128_t idx = wasm_v128_or(
+      wasm_v128_or(wasm_v128_and(wasm_u32x4_shr(v, 18), m0), wasm_v128_and(wasm_u32x4_shr(v, 4), m1)),
+      wasm_v128_or(wasm_v128_and(wasm_i32x4_shl(v, 10), m2), wasm_v128_and(wasm_i32x4_shl(v, 24), m3)));
+    const v128_t range = wasm_v128_or(wasm_u8x16_sub_sat(idx, c51), wasm_v128_and(wasm_u8x16_lt(idx, c26), c13));
+    wasm_v128_store(d + j, wasm_i8x16_add(idx, wasm_i8x16_swizzle(offsets, range)));
+  }
+#endif
+  for (; i + 3 <= n; i += 3, j += 4) {
+    const u32 v = (u32)s[i] << 16 | (u32)s[i + 1] << 8 | s[i + 2];
+    d[j] = abc[v >> 18]; d[j + 1] = abc[v >> 12 & 63u]; d[j + 2] = abc[v >> 6 & 63u]; d[j + 3] = abc[v & 63u];
+  }
+  if (n - i == 1) {
+    const u32 v = (u32)s[i] << 16;
+    d[j++] = abc[v >> 18]; d[j++] = abc[v >> 12 & 63u];
+    if (pad) { d[j++] = 61; d[j++] = 61; }
+  } else if (n - i == 2) {
+    const u32 v = (u32)s[i] << 16 | (u32)s[i + 1] << 8;
+    d[j++] = abc[v >> 18]; d[j++] = abc[v >> 12 & 63u]; d[j++] = abc[v >> 6 & 63u];
+    if (pad) d[j++] = 61;
+  }
+  return j;
+}
+
+static inline i32 porf_b64_value(u32 c, i32 url) {
+  if (c - 65u < 26u) return (i32)c - 65;
+  if (c - 97u < 26u) return (i32)c - 71;
+  if (c - 48u < 10u) return (i32)c + 4;
+  if (c == (url ? 45u : 43u)) return 62;
+  if (c == (url ? 95u : 47u)) return 63;
+  return -1;
+}
+static inline i32 porf_ascii_space(u32 c) { return c == 32 || c == 9 || c == 10 || c == 12 || c == 13; }
+
+// the units read by the last porf_b64_decode
+static i32 porf_b64_read;
+
+// FromBase64 over len units at src, into at most max bytes at dst (lch, the lastChunkHandling:
+// 0 loose, 1 strict, 2 stop-before-partial): the bytes written, or -1 - written for a
+// SyntaxError; porf_b64_read gets the units read. Whole chunks of 16 alphabet chars with room
+// for their 12 bytes decode by SIMD (range compares to 6-bit values, shifts packing four into
+// three bytes a lane); whitespace, padding, a partial chunk and errors take the scalar path
+static i32 porf_b64_decode(u32 src, i32 two, i32 len, i32 url, i32 lch, u32 dst, i32 max) {
+  const u8* s = MEM + src + 4u;
+  u8* d = MEM + dst + 4u;
+  i32 i = 0, w = 0, n = 0, read = 0;
+  u32 chunk = 0;
+  porf_b64_read = 0;
+  if (max == 0) return 0;
+#ifdef __wasm_simd128__
+  const v128_t cA = wasm_i8x16_splat(65), ca = wasm_i8x16_splat(97), c0 = wasm_i8x16_splat(48);
+  const v128_t c71 = wasm_i8x16_splat(71), c4 = wasm_i8x16_splat(4), c26 = wasm_i8x16_splat(26), c10 = wasm_i8x16_splat(10);
+  const v128_t plus = wasm_i8x16_splat(url ? 45 : 43), slash = wasm_i8x16_splat(url ? 95 : 47);
+  const v128_t c62 = wasm_i8x16_splat(62), c63 = wasm_i8x16_splat(63);
+  const v128_t m0 = wasm_i32x4_splat(0x3f), m1 = wasm_i32x4_splat(0x3f00), m2 = wasm_i32x4_splat(0x3f0000);
+  const v128_t order = wasm_i8x16_make(2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, -1, -1, -1, -1);
+#endif
+  for (;;) {
+#ifdef __wasm_simd128__
+    if (n == 0) {
+      const i32 from = i;
+      for (; i + 16 <= len && max - w >= 12; i += 16, w += 12) {
+        const v128_t v = two
+          ? wasm_u8x16_narrow_i16x8(wasm_v128_load(s + i * 2), wasm_v128_load(s + i * 2 + 16))
+          : wasm_v128_load(s + i);
+        const v128_t up = wasm_u8x16_lt(wasm_i8x16_sub(v, cA), c26), lo = wasm_u8x16_lt(wasm_i8x16_sub(v, ca), c26);
+        const v128_t dg = wasm_u8x16_lt(wasm_i8x16_sub(v, c0), c10);
+        const v128_t pl = wasm_i8x16_eq(v, plus), sl = wasm_i8x16_eq(v, slash);
+        if (!wasm_i8x16_all_true(wasm_v128_or(wasm_v128_or(up, lo), wasm_v128_or(dg, wasm_v128_or(pl, sl))))) break;
+        const v128_t x = wasm_v128_or(
+          wasm_v128_or(wasm_v128_and(up, wasm_i8x16_sub(v, cA)), wasm_v128_and(lo, wasm_i8x16_sub(v, c71))),
+          wasm_v128_or(wasm_v128_and(dg, wasm_i8x16_add(v, c4)), wasm_v128_or(wasm_v128_and(pl, c62), wasm_v128_and(sl, c63))));
+        const v128_t packed = wasm_v128_or(
+          wasm_v128_or(wasm_i32x4_shl(wasm_v128_and(x, m0), 18), wasm_i32x4_shl(wasm_v128_and(x, m1), 4)),
+          wasm_v128_or(wasm_u32x4_shr(wasm_v128_and(x, m2), 10), wasm_u32x4_shr(x, 24)));
+        const v128_t bytes = wasm_i8x16_swizzle(packed, order);
+        wasm_v128_store64_lane(d + w, bytes, 0);
+        wasm_v128_store32_lane(d + w + 8, bytes, 2);
+      }
+      if (i != from) {
+        read = i;
+        if (w == max) { porf_b64_read = read; return w; }
+      }
+    }
+#endif
+    while (i < len && porf_ascii_space(porf_unit(s, two, i))) i++;
+    if (i == len) {
+      if (n > 0) {
+        if (lch == 2) { porf_b64_read = read; return w; }
+        if (lch == 1 || n == 1) goto fail;
+        chunk <<= (u32)(4 - n) * 6u;
+        d[w++] = (u8)(chunk >> 16);
+        if (n == 3) d[w++] = (u8)(chunk >> 8);
+      }
+      porf_b64_read = len;
+      return w;
+    }
+    const u32 c = porf_unit(s, two, i++);
+    if (c == 61) {
+      if (n < 2) goto fail;
+      while (i < len && porf_ascii_space(porf_unit(s, two, i))) i++;
+      if (n == 2) {
+        if (i == len) {
+          if (lch == 2) { porf_b64_read = read; return w; }
+          goto fail;
+        }
+        if (porf_unit(s, two, i) == 61) {
+          i++;
+          while (i < len && porf_ascii_space(porf_unit(s, two, i))) i++;
+        }
+      }
+      if (i < len) goto fail;
+      chunk <<= (u32)(4 - n) * 6u;
+      if (lch == 1 && (chunk & (n == 2 ? 0xffffu : 0xffu)) != 0) goto fail;
+      d[w++] = (u8)(chunk >> 16);
+      if (n == 3) d[w++] = (u8)(chunk >> 8);
+      porf_b64_read = len;
+      return w;
+    }
+    const i32 v = porf_b64_value(c, url);
+    if (v < 0) goto fail;
+    const i32 remaining = max - w;
+    if ((remaining == 1 && n == 2) || (remaining == 2 && n == 3)) { porf_b64_read = read; return w; }
+    chunk = chunk << 6 | (u32)v;
+    if (++n == 4) {
+      d[w++] = (u8)(chunk >> 16); d[w++] = (u8)(chunk >> 8); d[w++] = (u8)chunk;
+      chunk = 0; n = 0; read = i;
+      if (w == max) { porf_b64_read = read; return w; }
+    }
+  }
+fail:
+  porf_b64_read = read;
+  return -1 - w;
+}
+
+// the hex digits of n bytes at src into dst. SIMD swizzles each nibble to its digit and
+// interleaves the high and low digits
+static void porf_hex_encode(u32 src, i32 n, u32 dst) {
+  const u8* s = MEM + src + 4u;
+  u8* d = MEM + dst + 4u;
+  i32 i = 0;
+#ifdef __wasm_simd128__
+  const v128_t digits = wasm_i8x16_make(48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102);
+  const v128_t low = wasm_i8x16_splat(15);
+  for (; i + 16 <= n; i += 16) {
+    const v128_t v = wasm_v128_load(s + i);
+    const v128_t hi = wasm_i8x16_swizzle(digits, wasm_u8x16_shr(v, 4)), lo = wasm_i8x16_swizzle(digits, wasm_v128_and(v, low));
+    wasm_v128_store(d + i * 2, wasm_i8x16_shuffle(hi, lo, 0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23));
+    wasm_v128_store(d + i * 2 + 16, wasm_i8x16_shuffle(hi, lo, 8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31));
+  }
+#endif
+  for (; i < n; i++) { d[i * 2] = porf_hex_digits[s[i] >> 4]; d[i * 2 + 1] = porf_hex_digits[s[i] & 15u]; }
+}
+
+static inline i32 porf_hex_value(u32 c) {
+  if (c - 48u < 10u) return (i32)c - 48;
+  c |= 32u;
+  return c - 97u < 6u ? (i32)c - 87 : -1;
+}
+
+// n bytes from the hex digit pairs at src into dst, stopping at the first pair that is not two
+// hex digits: the bytes written. SIMD splits 32 digits into high and low, range-checks both and
+// packs them; a two-byte unit above 0xff narrows to 0 or 0xff, neither a digit
+static i32 porf_hex_decode(u32 src, i32 two, i32 n, u32 dst) {
+  const u8* s = MEM + src + 4u;
+  u8* d = MEM + dst + 4u;
+  i32 i = 0;
+#ifdef __wasm_simd128__
+  const v128_t c0 = wasm_i8x16_splat(48), ca = wasm_i8x16_splat(97), c32 = wasm_i8x16_splat(32);
+  const v128_t c10 = wasm_i8x16_splat(10), c6 = wasm_i8x16_splat(6);
+  for (; i + 16 <= n; i += 16) {
+    v128_t a, b;
+    if (two) {
+      const u8* p = s + i * 4;
+      a = wasm_u8x16_narrow_i16x8(wasm_v128_load(p), wasm_v128_load(p + 16));
+      b = wasm_u8x16_narrow_i16x8(wasm_v128_load(p + 32), wasm_v128_load(p + 48));
+    } else {
+      a = wasm_v128_load(s + i * 2);
+      b = wasm_v128_load(s + i * 2 + 16);
+    }
+    const v128_t hi = wasm_i8x16_shuffle(a, b, 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
+    const v128_t lo = wasm_i8x16_shuffle(a, b, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31);
+    const v128_t hd = wasm_i8x16_sub(hi, c0), ld = wasm_i8x16_sub(lo, c0);
+    const v128_t hl = wasm_i8x16_sub(wasm_v128_or(hi, c32), ca), ll = wasm_i8x16_sub(wasm_v128_or(lo, c32), ca);
+    const v128_t hdig = wasm_u8x16_lt(hd, c10), ldig = wasm_u8x16_lt(ld, c10);
+    const v128_t ok = wasm_v128_and(wasm_v128_or(hdig, wasm_u8x16_lt(hl, c6)), wasm_v128_or(ldig, wasm_u8x16_lt(ll, c6)));
+    if (!wasm_i8x16_all_true(ok)) break;
+    const v128_t hv = wasm_v128_bitselect(hd, wasm_i8x16_add(hl, c10), hdig), lv = wasm_v128_bitselect(ld, wasm_i8x16_add(ll, c10), ldig);
+    wasm_v128_store(d + i, wasm_v128_or(wasm_i8x16_shl(hv, 4), lv));
+  }
+#endif
+  for (; i < n; i++) {
+    const i32 h = porf_hex_value(porf_unit(s, two, i * 2)), l = porf_hex_value(porf_unit(s, two, i * 2 + 1));
+    if ((h | l) < 0) break;
+    d[i] = (u8)(h << 4 | l);
+  }
+  return i;
+}
+
+// String comparison and search over one- or two-byte units (wa, wb: two-byte), for ===, <,
+// sort and the String.prototype searches. Strings are data pointers (units at MEM + p + 4)
+// with unit offsets; SIMD compares 16 one-byte or 8 two-byte units a step, a one-byte side
+// widened when the widths differ.
+
+// the first k below n where unit ai + k of a differs from unit bi + k of b, or n
+static i32 porf_str_mismatch(u32 a, i32 wa, i32 ai, u32 b, i32 wb, i32 bi, i32 n) {
+  const u8* p = MEM + a + 4u + (u32)ai * (wa ? 2u : 1u);
+  const u8* q = MEM + b + 4u + (u32)bi * (wb ? 2u : 1u);
+  i32 k = 0;
+#ifdef __wasm_simd128__
+  if (!wa && !wb) {
+    for (; k + 16 <= n; k += 16) {
+      const u32 m = wasm_i8x16_bitmask(wasm_i8x16_ne(wasm_v128_load(p + k), wasm_v128_load(q + k)));
+      if (m) return k + (i32)__builtin_ctz(m);
+    }
+  } else if (wa && wb) {
+    for (; k + 8 <= n; k += 8) {
+      const u32 m = wasm_i16x8_bitmask(wasm_i16x8_ne(wasm_v128_load(p + k * 2), wasm_v128_load(q + k * 2)));
+      if (m) return k + (i32)__builtin_ctz(m);
+    }
+  } else {
+    const u8* one = wa ? q : p;
+    const u8* two = wa ? p : q;
+    for (; k + 8 <= n; k += 8) {
+      const u32 m = wasm_i16x8_bitmask(wasm_i16x8_ne(wasm_u16x8_load8x8(one + k), wasm_v128_load(two + k * 2)));
+      if (m) return k + (i32)__builtin_ctz(m);
+    }
+  }
+#endif
+  if (!wa && !wb) {
+    for (; k < n; k++) if (p[k] != q[k]) return k;
+    return n;
+  }
+  for (; k < n; k++) if (porf_unit(p, wa, k) != porf_unit(q, wb, k)) return k;
+  return n;
+}
+
+// whether the needle's n units match the haystack's from at, given its first and last match
+static inline i32 porf_str_middle(u32 hay, i32 wh, i32 at, u32 ndl, i32 wn, i32 n) {
+  return n <= 2 || porf_str_mismatch(hay, wh, at + 1, ndl, wn, 1, n - 2) == n - 2;
+}
+
+// the first index in [at, len - n] where the needle (n units) occurs in the haystack (len
+// units), or -1. SIMD finds where both the needle's first and last units line up, and compares
+// the middle only there
+static i32 porf_str_find(u32 hay, i32 wh, i32 len, u32 ndl, i32 wn, i32 n, i32 at) {
+  if (at < 0) at = 0;
+  const i32 last = len - n;
+  if (at > last) return -1;
+  if (n == 0) return at;
+  const u8* h = MEM + hay + 4u;
+  const u32 f = porf_unit(MEM + ndl + 4u, wn, 0), l = porf_unit(MEM + ndl + 4u, wn, n - 1);
+  if (!wh && (f > 0xffu || l > 0xffu)) return -1;
+#ifdef __wasm_simd128__
+  if (!wh) {
+    const v128_t vf = wasm_i8x16_splat((int8_t)f), vl = wasm_i8x16_splat((int8_t)l);
+    for (; at + 16 <= last + 1; at += 16) {
+      u32 m = wasm_i8x16_bitmask(wasm_v128_and(wasm_i8x16_eq(wasm_v128_load(h + at), vf), wasm_i8x16_eq(wasm_v128_load(h + at + n - 1), vl)));
+      for (; m; m &= m - 1) {
+        const i32 k = at + (i32)__builtin_ctz(m);
+        if (porf_str_middle(hay, wh, k, ndl, wn, n)) return k;
+      }
+    }
+  } else {
+    const v128_t vf = wasm_i16x8_splat((int16_t)f), vl = wasm_i16x8_splat((int16_t)l);
+    for (; at + 8 <= last + 1; at += 8) {
+      u32 m = wasm_i16x8_bitmask(wasm_v128_and(wasm_i16x8_eq(wasm_v128_load(h + at * 2), vf), wasm_i16x8_eq(wasm_v128_load(h + (at + n - 1) * 2), vl)));
+      for (; m; m &= m - 1) {
+        const i32 k = at + (i32)__builtin_ctz(m);
+        if (porf_str_middle(hay, wh, k, ndl, wn, n)) return k;
+      }
+    }
+  }
+#endif
+  for (; at <= last; at++)
+    if (porf_unit(h, wh, at) == f && porf_unit(h, wh, at + n - 1) == l && porf_str_middle(hay, wh, at, ndl, wn, n)) return at;
+  return -1;
+}
+
+// the last index in [0, at] (at clamped to len - n) where the needle occurs, or -1
+static i32 porf_str_rfind(u32 hay, i32 wh, i32 len, u32 ndl, i32 wn, i32 n, i32 at) {
+  if (at > len - n) at = len - n;
+  if (at < 0) return -1;
+  if (n == 0) return at;
+  const u8* h = MEM + hay + 4u;
+  const u32 f = porf_unit(MEM + ndl + 4u, wn, 0), l = porf_unit(MEM + ndl + 4u, wn, n - 1);
+  if (!wh && (f > 0xffu || l > 0xffu)) return -1;
+#ifdef __wasm_simd128__
+  if (!wh) {
+    const v128_t vf = wasm_i8x16_splat((int8_t)f), vl = wasm_i8x16_splat((int8_t)l);
+    for (; at >= 15; at -= 16) {
+      const i32 from = at - 15;
+      u32 m = wasm_i8x16_bitmask(wasm_v128_and(wasm_i8x16_eq(wasm_v128_load(h + from), vf), wasm_i8x16_eq(wasm_v128_load(h + from + n - 1), vl)));
+      while (m) {
+        const i32 bit = 31 - (i32)__builtin_clz(m);
+        if (porf_str_middle(hay, wh, from + bit, ndl, wn, n)) return from + bit;
+        m &= ~(1u << bit);
+      }
+    }
+  } else {
+    const v128_t vf = wasm_i16x8_splat((int16_t)f), vl = wasm_i16x8_splat((int16_t)l);
+    for (; at >= 7; at -= 8) {
+      const i32 from = at - 7;
+      u32 m = wasm_i16x8_bitmask(wasm_v128_and(wasm_i16x8_eq(wasm_v128_load(h + from * 2), vf), wasm_i16x8_eq(wasm_v128_load(h + (from + n - 1) * 2), vl)));
+      while (m) {
+        const i32 bit = 31 - (i32)__builtin_clz(m);
+        if (porf_str_middle(hay, wh, from + bit, ndl, wn, n)) return from + bit;
+        m &= ~(1u << bit);
+      }
+    }
+  }
+#endif
+  for (; at >= 0; at--)
+    if (porf_unit(h, wh, at) == f && porf_unit(h, wh, at + n - 1) == l && porf_str_middle(hay, wh, at, ndl, wn, n)) return at;
+  return -1;
+}
+
+// -1, 0 or 1 as a sorts before, with or after b by UTF-16 code units (IsLessThan's order)
+static i32 porf_str_order(u32 a, i32 wa, u32 b, i32 wb) {
+  const i32 la = (i32)*(u32*)(MEM + a), lb = (i32)*(u32*)(MEM + b);
+  const i32 n = la < lb ? la : lb;
+  const i32 k = porf_str_mismatch(a, wa, 0, b, wb, 0, n);
+  if (k < n) return porf_unit(MEM + a + 4u, wa, k) < porf_unit(MEM + b + 4u, wb, k) ? -1 : 1;
+  return la < lb ? -1 : la > lb ? 1 : 0;
 }
 
 static inline i32 porf_clz32(u32 x) { return x ? __builtin_clz(x) : 32; }
@@ -4770,25 +5599,27 @@ ${ropes ? `  s = porf_str_flat(s);
   const u32 len = *(u32*)(MEM + src);
   const u32 chars = src + 4;
 
-  if (!wide) {
-    u32 i = 0;
-    while (i < len && *(u8*)(MEM + chars + i) < 0x80) i++;
-    if (i == len) {
-      const u32 dst = porf_alloc(4 + len, ${TYPES.bytestring});
-      *(u32*)(MEM + dst) = len;
-      for (u32 k = 0; k < len; k++) {
-        u8 c = *(u8*)(MEM + chars + k);
-        if (upper ? (c >= 'a' && c <= 'z') : (c >= 'A' && c <= 'Z')) c ^= 0x20;
-        *(u8*)(MEM + dst + 4 + k) = c;
-      }
-      return porf_box((f64)dst, ${TYPES.bytestring});
-    }
+  // ASCII has no special mappings: a one-byte string all of ASCII is converted by a SIMD flip
+  const u32 lo = upper ? 'a' : 'A';
+  if (!wide && porf_simd_ascii_u8(src, 0, (i32)len) == (i32)len) {
+    const u32 dst = porf_alloc(4 + len, ${TYPES.bytestring});
+    *(u32*)(MEM + dst) = len;
+    porf_simd_case_u8(dst, 0, src, 0, (i32)len, lo);
+    return porf_box((f64)dst, ${TYPES.bytestring});
   }
 
   // at most 3 units out per unit in (the longest special mapping: 3 BMP code points)
   const u32 dst = porf_alloc(4 + len * 6, ${TYPES.string});
   u32 n = 0;
   for (u32 i = 0; i < len;) {
+    // an ASCII run: flipped (and widened) in one go
+    if ((wide ? *(u16*)(MEM + chars + i * 2) : *(u8*)(MEM + chars + i)) < 0x80) {
+      const u32 run = (u32)(wide ? porf_simd_ascii_u16(src, (i32)i, (i32)len) : porf_simd_ascii_u8(src, (i32)i, (i32)len)) - i;
+      porf_simd_case_u16(dst, (i32)n, src, (i32)i, (i32)run, wide, lo);
+      n += run;
+      i += run;
+      continue;
+    }
     u32 w;
     const u32 cp = porf_case_cp(chars, wide, len, i, &w);
     u32 outs[3] = { cp, 0, 0 };
@@ -5171,8 +6002,7 @@ ${st}u32 porf_rope_flatten(u32 r) {
     const u32 n = *(u32*)(MEM + p);
     if (!wide) memcpy(MEM + out + 4 + pos, MEM + p + 4, n);
     else if (t == ${TYPES.bytestring}) {
-      u16* dst = (u16*)(MEM + out + 4) + pos;
-      for (u32 i = 0; i < n; i++) dst[i] = MEM[p + 4 + i];
+      porf_simd_widen(out, (i32)pos, p, 0, (i32)n);
     } else memcpy((u16*)(MEM + out + 4) + pos, MEM + p + 4, (size_t)n * 2);
     pos += n;
   }
@@ -5244,13 +6074,13 @@ ${ropes ? `  if (la + lb >= PORF_ROPE_MIN && la != 0 && lb != 0) {
   *(u32*)(MEM + s) = la + lb;
   u16* out = (u16*)(MEM + s + 4);
   if (a.type == ${TYPES.bytestring}) {
-    for (u32 i = 0; i < la; i++) out[i] = MEM[pa + 4 + i];
+    porf_simd_widen(s, 0, pa, 0, (i32)la);
   } else {
     memcpy(out, MEM + pa + 4, (size_t)la * 2);
   }
   out += la;
   if (b.type == ${TYPES.bytestring}) {
-    for (u32 i = 0; i < lb; i++) out[i] = MEM[pb + 4 + i];
+    porf_simd_widen(s, (i32)la, pb, 0, (i32)lb);
   } else {
     memcpy(out, MEM + pb + 4, (size_t)lb * 2);
   }
@@ -5264,13 +6094,7 @@ ${ropes ? `  if (porf_rope_is(pa) || porf_rope_is(pb)) return porf_str_eq(porf_s
 ` : ''}  const u32 la = *(u32*)(MEM + pa);
   if (la != *(u32*)(MEM + pb)) return 0;
   const i32 ta = porf_jv_type(a), tb = porf_jv_type(b);
-  if (ta == tb) return memcmp(MEM + pa + 4, MEM + pb + 4, (size_t)la * (ta == ${TYPES.string} ? 2 : 1)) == 0;
-  if (ta == ${TYPES.bytestring}) {
-    for (u32 i = 0; i < la; i++) if ((u16)MEM[pa + 4 + i] != *(u16*)(MEM + pb + 4 + i * 2)) return 0;
-  } else {
-    for (u32 i = 0; i < la; i++) if (*(u16*)(MEM + pa + 4 + i * 2) != (u16)MEM[pb + 4 + i]) return 0;
-  }
-  return 1;
+  return porf_str_mismatch(pa, ta == ${TYPES.string}, 0, pb, tb == ${TYPES.string}, 0, (i32)la) == (i32)la;
 }
 
 ${dtoa === 'libc' ? '' : DTOA[dtoa].c}
@@ -6254,7 +7078,15 @@ PORF_NOINLINE ${st}jsval ${name}_objects(jsval a, jsval b) {
   if (porf_is_object(b)) b = ${hook}(b);
   return ${name}(a, b);
 }
-` : ''}${sti}jsval ${name}(jsval a, jsval b) {
+` : ''}// the + of two numbers inlined everywhere; the rest (strings, objects, BigInts) out of line,
+// or the body is too big for clang to inline in a hot loop
+PORF_NOINLINE ${st}jsval ${name}_slow(jsval a, jsval b);
+${sti}jsval ${name}(jsval a, jsval b) {
+  if (porf_jv_is_num(a) && porf_jv_is_num(b))
+    return porf_box_num(a.val + b.val);
+  return ${name}_slow(a, b);
+}
+PORF_NOINLINE ${st}jsval ${name}_slow(jsval a, jsval b) {
   if (porf_jv_is_num(a) && porf_jv_is_num(b))
     return porf_box_num(a.val + b.val);
 ${hook ? `  if (porf_is_object(a) || porf_is_object(b)) return ${name}_objects(a, b);
@@ -6289,7 +7121,17 @@ ${sti}jsval porf_div(jsval a, jsval b) {
 // JS abstract relational comparison: -1/0/1, 2 = unordered (NaN involved).
 // numeric coercion, or lexicographic when both sides are strings.
 // twin helper: dies when string.ts/coercion builtins port (step 3).
+PORF_NOINLINE ${st}i32 porf_cmp_slow(jsval a, jsval b);
+// two numbers compared inline everywhere; the rest (objects, BigInts, strings) out of line
 ${sti}i32 porf_cmp(jsval a, jsval b) {
+  if (porf_jv_is_num(a) && porf_jv_is_num(b)) {
+    const f64 x = a.val, y = b.val;
+    if (x != x || y != y) return 2;
+    return x < y ? -1 : x > y ? 1 : 0;
+  }
+  return porf_cmp_slow(a, b);
+}
+PORF_NOINLINE ${st}i32 porf_cmp_slow(jsval a, jsval b) {
 ${toPrimNumber ? `  // IsLessThan: an object operand is a primitive first (hint "number"), the left one first
   if (porf_is_object(a)) a = ${toPrimNumber}(a);
   if (porf_is_object(b)) b = ${toPrimNumber}(b);
@@ -6304,21 +7146,8 @@ ${bigintUsed ? `  if (ta == ${TYPES.bigint}) return porf_bigint_cmp_any(a, b);
   if ((ta == ${TYPES.bytestring} || ta == ${TYPES.string}) && (tb == ${TYPES.bytestring} || tb == ${TYPES.string})) {
 ${ropes ? `    a = porf_str_flat(a);
     b = porf_str_flat(b);
-` : ''}    const u32 pa = (u32)a.val, pb = (u32)b.val;
-    const u32 la = *(u32*)(MEM + pa), lb = *(u32*)(MEM + pb);
-    const u32 n = la < lb ? la : lb;
-    if (ta == ${TYPES.bytestring} && tb == ${TYPES.bytestring}) {
-      const int c = memcmp(MEM + pa + 4, MEM + pb + 4, n);
-      if (c != 0) return c < 0 ? -1 : 1;
-    } else {
-      // by UTF-16 code unit: a one-byte string's bytes are its code units
-      for (u32 i = 0; i < n; i++) {
-        const u32 x = ta == ${TYPES.bytestring} ? MEM[pa + 4 + i] : *(u16*)(MEM + pa + 4 + i * 2);
-        const u32 y = tb == ${TYPES.bytestring} ? MEM[pb + 4 + i] : *(u16*)(MEM + pb + 4 + i * 2);
-        if (x != y) return x < y ? -1 : 1;
-      }
-    }
-    return la == lb ? 0 : la < lb ? -1 : 1;
+` : ''}    // by UTF-16 code unit: a one-byte string's bytes are its code units
+    return porf_str_order((u32)a.val, ta == ${TYPES.string}, (u32)b.val, tb == ${TYPES.string});
   }
   const f64 x = porf_to_num(a), y = porf_to_num(b);
   if (x != x || y != y) return 2;
@@ -6392,7 +7221,8 @@ static void porf_init(int argc, char** argv) {
 `;
 };
 
-const CORO_RUNTIME = () => `// ---- coroutines (fiber stacks) ----
+// settleAsyncResult(value, promise): C resolving promise with value (a thenable's then called)
+const CORO_RUNTIME = settleAsyncResult => `// ---- coroutines (fiber stacks) ----
 #if defined(__wasip3__) && PORF_STACKFUL
 // WASI P3: wasm cannot switch C stacks itself, so each coroutine is a component-model
 // cooperative thread (the host switches) with its own shadow stack. With none stackful,
@@ -6538,21 +7368,26 @@ typedef struct porf_coro_call {
 // the call a stackless function's starter takes its frame for (set just before porf_invoke)
 static porf_coro_call* porf_sl_starting = 0;
 
-// a stackless await's operand as a promise: its own, or one fulfilled with it (every
-// await suspends, and resumes from a microtask, as the spec has it)
+// a stackless await's operand: a promise as it is, a primitive as it is (porf_promise_attach_coro
+// queues its resume as the reaction of a promise fulfilled with it would be, from a microtask,
+// with no promise made), an object a promise resolved with it (a thenable's then is called)
 static jsval porf_sl_promise(jsval v) {
-  if (porf_jv_type(v) == ${TYPES.promise}) return v;
+  const i32 t = porf_jv_type(v);
+  if (t == ${TYPES.promise} || t <= ${TYPES.symbol} || t == ${TYPES.string} || t == ${TYPES.bytestring} ||
+      (t == ${TYPES.object} && (u32)v.val == 0u)) return v;
   const u32 p = porf_alloc(PORF_PROMISE_SIZE, ${TYPES.promise});
-  *(jsbits*)(MEM + p + PORF_PROMISE_RESULT) = porf_pack(v);
+  *(jsbits*)(MEM + p + PORF_PROMISE_RESULT) = JV_UNDEFINED_BITS;
   *(u32*)(MEM + p + PORF_PROMISE_FULFILL_HEAD) = 0;
   *(u32*)(MEM + p + PORF_PROMISE_FULFILL_TAIL) = 0;
   *(u32*)(MEM + p + PORF_PROMISE_REJECT_HEAD) = 0;
   *(u32*)(MEM + p + PORF_PROMISE_REJECT_TAIL) = 0;
   *(jsbits*)(MEM + p + PORF_PROMISE_PAYLOAD) = JV_UNDEFINED_BITS;
-  *(u8*)(MEM + p + PORF_PROMISE_STATE) = 1;
+  *(u8*)(MEM + p + PORF_PROMISE_STATE) = 0;
   *(u8*)(MEM + p + PORF_PROMISE_FLAGS) = 0;
   *(u8*)(MEM + p + PORF_PROMISE_HANDLED) = 0;
-  return porf_box((f64)p, ${TYPES.promise});
+  const jsval promise = porf_box((f64)p, ${TYPES.promise});
+  ${settleAsyncResult('v', 'promise')}
+  return promise;
 }
 
 static porf_coro* porf_coro_cur = 0;
@@ -6629,7 +7464,11 @@ static void porf_promise_append_raw_reaction(u32 promise, u32 reaction, i32 reje
 }
 
 static void porf_promise_attach_coro(jsval awaited, porf_coro_call* call, jsval out_promise) {
-  if (awaited.type != ${TYPES.promise}) porf_unreachable("coroutine awaited non-pending non-promise");
+  // not a promise: resumed with it from a microtask, as from a promise already fulfilled with it
+  if (awaited.type != ${TYPES.promise}) {
+    porf_promise_trigger_reactions(porf_promise_new_coro_reaction(call, out_promise, 0), awaited);
+    return;
+  }
   const u32 p = (u32)awaited.val;
   *(u8*)(MEM + p + PORF_PROMISE_HANDLED) = 1;
   // already settled (a stackless await always suspends): its reaction is queued now

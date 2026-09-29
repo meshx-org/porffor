@@ -331,6 +331,15 @@ ${body}
     else if (Porffor.fastOr(t == Porffor.TYPES.uint32array, t == Porffor.TYPES.int32array, t == Porffor.TYPES.float32array)) size = 4;
     else if (Porffor.fastOr(t == Porffor.TYPES.float64array, t == Porffor.TYPES.bigint64array, t == Porffor.TYPES.biguint64array)) size = 8;
   return Porffor.IR.loadI32(this, 0) * size;`);
+  // %TypedArray%.prototype[Symbol.toStringTag]: the kind's name, undefined for anything else
+  // (no TypeError). Not a _prototype_ name: its key is a symbol (builtinDescriptors.js)
+  out += `
+export const __Porffor_typedArray_toStringTag = function (this: any): any {
+  const t: i32 = Porffor.type(this);
+${TYPED_ARRAY_KINDS.map(k => `  if (t == Porffor.TYPES.${k.toLowerCase()}) return '${k}';`).join('\n')}
+  return undefined;
+};
+`;
   const notShared = new Set([ 'concat', 'valueOf' ]);
   for (const [ , method, params ] of out.matchAll(/export const __Uint8Array_prototype_([A-Za-z]+(?:\$get)?) = function \(this: Uint8Array,? ?([^)]*)\)/g)) {
     if (notShared.has(method) || params.includes('...') || method.endsWith('$get')) continue;

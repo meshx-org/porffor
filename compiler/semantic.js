@@ -574,6 +574,8 @@ const annotate = (node, parent = null, key = null) => {
     case 'Identifier':
       if (node._binding) break;
       if (semantic.objectHackers.includes(node.name)) break;
+      // labels are their own namespace: never a variable, never renamed with one
+      if (key === 'label' && (parent?.type === 'LabeledStatement' || parent?.type === 'BreakStatement' || parent?.type === 'ContinueStatement')) break;
 
       const name = node.name;
       const currentFunc = scopes[scopes.lastFuncs.at(-1)];

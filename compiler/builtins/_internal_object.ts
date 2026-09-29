@@ -655,6 +655,19 @@ export const __Porffor_array_propertyKeyIndex = (key: any): i32 => {
   return out;
 };
 
+// The TypeError of reading a property of null or undefined, naming the key as V8 does when
+// it is already a primitive: the key of `null[key]` is never converted (its toString not
+// called), since the base is checked first
+export const __Porffor_object_readError = (obj: any, key: any): any => {
+  const what: bytestring = Porffor.type(obj) == Porffor.TYPES.undefined ? 'undefined' : 'null';
+  const t: i32 = Porffor.type(key);
+  if (t == Porffor.TYPES.symbol) return new TypeError(`Cannot read properties of ${what} (reading '${key.toString()}')`);
+  if (Porffor.fastOr(t == Porffor.TYPES.string, t == Porffor.TYPES.bytestring, t == Porffor.TYPES.number)) {
+    return new TypeError(`Cannot read properties of ${what} (reading '${key}')`);
+  }
+  return new TypeError(`Cannot read properties of ${what}`);
+};
+
 export const __Porffor_object_get = (_obj: any, key: any): any => {
   let obj: any = _obj;
   const trueType: i32 = Porffor.type(obj);
@@ -662,9 +675,9 @@ export const __Porffor_object_get = (_obj: any, key: any): any => {
     if (trueType == Porffor.TYPES.proxy) return __Porffor_proxy_get(_obj, ecma262.ToPropertyKey(key), _obj);
   }
   if (trueType == Porffor.TYPES.object) {
-    if (Porffor.IR.ptr(obj) == 0) throw new TypeError('Cannot get property of null');
+    if (Porffor.IR.ptr(obj) == 0) throw __Porffor_object_readError(obj, key);
   } else {
-    if (trueType == Porffor.TYPES.undefined) throw new TypeError('Cannot get property of null');
+    if (trueType == Porffor.TYPES.undefined) throw __Porffor_object_readError(obj, key);
     obj = __Porffor_object_underlying(obj);
   }
 
@@ -798,13 +811,38 @@ export const __Porffor_object_get_icMiss = (_obj: any, keyPtr: i32, hash: i32, s
           // first writer wins so polymorphic sites miss instead of storing each time
           if (Porffor.IR.loadI32(slot, 0) == 2147483647) Porffor.IR.storeI32(slot, 0, ptr - entriesPtr);
           if ((Porffor.IR.loadU16(ptr, 16) & 0b0001) == 0) return __Porffor_object_readValue(ptr);
-          break;
+          return __Porffor_object_get_withHash(_obj, Porffor.as(keyPtr, Porffor.TYPES.bytestring), hash);
         }
       }
+
+      // not its own: a method on its class's prototype (p.add), the next place a read looks
+      const protoEntry: i32 = __Porffor_object_protoEntry(_obj, hash);
+      if (protoEntry != 0) return __Porffor_object_readValue(protoEntry);
     }
   }
 
   return __Porffor_object_get_withHash(_obj, Porffor.as(keyPtr, Porffor.TYPES.bytestring), hash);
+};
+
+// The entry of a key an object does not have itself on its immediate prototype, when that is
+// a plain object of a few entries (a class's prototype and its methods) and the entry a data
+// property: what a read of the key finds there. 0 for anything else (an accessor, a larger or
+// exotic prototype, a key further up the chain): the full read decides.
+export const __Porffor_object_protoEntry = (obj: any, hash: i32): i32 => {
+  if (Porffor.IR.loadU8(obj, 5) != Porffor.TYPES.object) return 0;
+  const proto: i32 = Porffor.IR.loadI32(obj, 8);
+  if (proto == 0) return 0;
+  const size: i32 = Porffor.IR.loadU16(proto, 0);
+  if (size > 16) return 0;
+  const entriesPtr: i32 = Porffor.IR.loadI32(proto, 12);
+  const endPtr: i32 = entriesPtr + size * 20;
+  for (let ptr: i32 = entriesPtr; ptr < endPtr; ptr += 20) {
+    if (Porffor.IR.loadI32(ptr, 0) == hash) {
+      if ((Porffor.IR.loadU16(ptr, 16) & 0b0001) == 0) return ptr;
+      return 0;
+    }
+  }
+  return 0;
 };
 
 // obj.key = value, cached per site as __Porffor_object_get_ic caches reads: the slot holds
@@ -815,7 +853,8 @@ export const __Porffor_object_set_ic = (_obj: any, keyPtr: i32, value: any, hash
   if (Porffor.type(_obj) == Porffor.TYPES.object) {
     if (Porffor.IR.ptr(_obj) != 0) {
       const off: i32 = Porffor.IR.loadI32(slot, 0);
-      if (off < Porffor.IR.loadU16(_obj, 0) * 20) {
+      const size: i32 = Porffor.IR.loadU16(_obj, 0);
+      if (off < size * 20) {
         const entryPtr: i32 = Porffor.IR.loadI32(_obj, 12) + off;
         if (Porffor.IR.loadI32(entryPtr, 0) == hash) {
           // writable (0b1000), not an accessor (0b0001)
@@ -826,11 +865,74 @@ export const __Porffor_object_set_ic = (_obj: any, keyPtr: i32, value: any, hash
             return value;
           }
         }
+      } else if (off == size * 20) {
+        if (__Porffor_object_tryAddProperty(_obj, keyPtr, value, hash, size)) return value;
       }
     }
   }
 
   return __Porffor_object_set_icMiss(_obj, keyPtr, value, hash, slot, strict);
+};
+
+// The i-th of a class constructor's leading `this.k = …` (codegen marks them; a class with no
+// extends and no fields): `this` is the new object, which holds exactly the keys the
+// statements before this one added, so the key goes in as entry i. It does when no accessor
+// exists anywhere (no setter on the chain to take the write, as the full set checks), the
+// object is a plain object with i entries and room for one more, and it is neither
+// inextensible nor watched; false otherwise, and the full set decides. The key is the site's
+// constant, static data: no barrier.
+export const __Porffor_object_addAt = (obj: any, i: i32, keyPtr: i32, hash: i32, value: any): boolean => {
+  if (accessorsExist) return false;
+  if (Porffor.type(obj) != Porffor.TYPES.object) return false;
+  if (Porffor.IR.ptr(obj) == 0) return false;
+  if (Porffor.IR.loadU16(obj, 0) != i) return false;
+  if (i >= Porffor.IR.loadU16(obj, 2)) return false;
+  if (Porffor.IR.loadU8(obj, 4) & 0b0101) return false;
+
+  const entryPtr: i32 = Porffor.IR.loadI32(obj, 12) + i * 20;
+  Porffor.IR.storeI32(entryPtr, 0, hash);
+  Porffor.IR.storeI32(entryPtr, 4, keyPtr);
+  Porffor.IR.storeUnF64(entryPtr, 8, value);
+  // writable, enumerable, configurable, not an accessor: a new data property
+  Porffor.IR.storeU8(entryPtr, 16, 0b1110);
+  Porffor.IR.storeU8(entryPtr, 17, Porffor.type(value));
+  Porffor.IR.storeU8(entryPtr, 18, Porffor.TYPES.bytestring);
+  Porffor.IR.storeU16(obj, 0, i + 1);
+  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+  return true;
+};
+
+// Tries to add a key as a new data property, the object's next entry, as the full set would,
+// for a site that last added it there (a constructor's this.x = x, on each new object). It
+// does when the key is not an own property (the few entries are looked at), no accessor
+// exists anywhere (so no setter on the chain can take the write: the full set only walks
+// the chain when one does) and the object is extensible; false otherwise, and the full set
+// decides.
+export const __Porffor_object_tryAddProperty = (obj: any, keyPtr: i32, value: any, hash: i32, size: i32): boolean => {
+  if (accessorsExist) return false;
+  if (Porffor.IR.loadU8(obj, 4) & 0b0001) return false;
+  const entriesPtr: i32 = Porffor.IR.loadI32(obj, 12);
+  const endPtr: i32 = entriesPtr + size * 20;
+  for (let ptr: i32 = entriesPtr; ptr < endPtr; ptr += 20) {
+    if (Porffor.IR.loadI32(ptr, 0) == hash) return false;
+  }
+
+  let entryPtr: i32 = endPtr;
+  if (size < Porffor.IR.loadU16(obj, 2)) {
+    // room for it (a new object is made the size its constructor fills): the entry written
+    // here, as appendEntry writes one. The key is a site's constant, static data: no barrier
+    if (Porffor.IR.loadU8(obj, 4) & 0b0100) missEpoch++;
+    Porffor.IR.storeU16(obj, 0, size + 1);
+    Porffor.IR.storeI32(entryPtr, 0, hash);
+    Porffor.IR.storeI32(entryPtr, 4, keyPtr);
+    Porffor.IR.storeU8(entryPtr, 18, Porffor.TYPES.bytestring);
+  } else entryPtr = __Porffor_object_appendEntry(obj, Porffor.as(keyPtr, Porffor.TYPES.bytestring), hash);
+  Porffor.IR.storeUnF64(entryPtr, 8, value);
+  // writable, enumerable, configurable, not an accessor: a new data property
+  Porffor.IR.storeU8(entryPtr, 16, 0b1110);
+  Porffor.IR.storeU8(entryPtr, 17, Porffor.type(value));
+  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+  return true;
 };
 
 export const __Porffor_object_set_icMiss = (_obj: any, keyPtr: i32, value: any, hash: i32, slot: i32, strict: boolean): any => {
@@ -869,10 +971,10 @@ export const __Porffor_object_get_withHash = (_obj: any, key: any, hash: i32): a
   let own: boolean = true;
   let defaultChain: boolean = false;
   if (trueType == Porffor.TYPES.object) {
-    if (Porffor.IR.ptr(obj) == 0) throw new TypeError('Cannot get property of null');
+    if (Porffor.IR.ptr(obj) == 0) throw __Porffor_object_readError(obj, key);
     defaultChain = Porffor.IR.loadU8(obj, 5) == Porffor.TYPES.undefined;
   } else {
-    if (trueType == Porffor.TYPES.undefined) throw new TypeError('Cannot get property of null');
+    if (trueType == Porffor.TYPES.undefined) throw __Porffor_object_readError(obj, key);
     obj = __Porffor_object_underlyingFind(_obj);
     if (Porffor.IR.ptr(obj) != 0) {
       defaultChain = Porffor.IR.loadU8(obj, 5) == Porffor.TYPES.undefined;

@@ -1,80 +1,42 @@
 import type {} from './porffor.d.ts';
 
-export const btoa = (input: bytestring): bytestring => {
-  // todo: throw on invalid chars
+// atob and btoa over the C runtime's base64 (porf_b64_*). Where HTML throws an
+// InvalidCharacterError DOMException (Porffor has none), a TypeError names it.
 
-  const keyStr: bytestring = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
-  const keyStrPtr: i32 = Porffor.IR.ptr(keyStr);
+export const btoa = (input: any): bytestring => {
+  if (Porffor.type(input) != Porffor.TYPES.bytestring && Porffor.type(input) != Porffor.TYPES.string) input = ecma262.ToString(input);
 
-  let len: i32 = input.length;
-  let output: bytestring = Porffor.malloc();
-
-  let i: i32 = Porffor.IR.ptr(input),
-      j: i32 = Porffor.IR.ptr(output);
-
-  // todo/perf: add some per 6 char variant using bitwise magic?
-
-  const endPtr: i32 = i + len;
-  while (i < endPtr) {
-    const chr1: i32 = Porffor.IR.loadU8(i++, 4);
-    const chr2: i32 = i < endPtr ? Porffor.IR.loadU8(i++, 4) : -1;
-    const chr3: i32 = i < endPtr ? Porffor.IR.loadU8(i++, 4) : -1;
-
-    const enc1: i32 = chr1 >> 2;
-    const enc2: i32 = ((chr1 & 3) << 4) | (chr2 == -1 ? 0 : (chr2 >> 4));
-    let enc3: i32 = ((chr2 & 15) << 2) | (chr3 == -1 ? 0 : (chr3 >> 6));
-    let enc4: i32 = chr3 & 63;
-
-    if (chr2 == -1) {
-      enc3 = 64;
-      enc4 = 64;
-    } else if (chr3 == -1) {
-      enc4 = 64;
+  const len: i32 = input.length;
+  let bytes: i32 = Porffor.IR.ptr(input);
+  if (Porffor.type(input) == Porffor.TYPES.string) {
+    // a two-byte string: every unit must be a byte
+    for (let i: i32 = 0; i < len; i++) {
+      if (Porffor.IR.loadU16(bytes + i * 2, 4) > 0xff) throw new TypeError('InvalidCharacterError: btoa input has a character above U+00FF');
     }
-
-    Porffor.IR.storeU8(j++, 4, Porffor.IR.loadU8(keyStrPtr + enc1, 4));
-    Porffor.IR.storeU8(j++, 4, Porffor.IR.loadU8(keyStrPtr + enc2, 4));
-    Porffor.IR.storeU8(j++, 4, Porffor.IR.loadU8(keyStrPtr + enc3, 4));
-    Porffor.IR.storeU8(j++, 4, Porffor.IR.loadU8(keyStrPtr + enc4, 4));
+    const narrow: i32 = Porffor.malloc(len + 8);
+    __Porffor_simd_narrow(narrow, 0, bytes, 0, len);
+    bytes = narrow;
   }
 
-  output.length = j - Porffor.IR.ptr(output);
+  const output: bytestring = Porffor.malloc(len * 2 + 16);
+  const outPtr: i32 = Porffor.IR.ptr(output);
+  Porffor.IR.storeI32(outPtr, 0, __Porffor_base64_encode(bytes, len, outPtr, 0, 1));
   return output;
 };
 
-export const atob = (input: bytestring): bytestring => {
-  // todo: throw on non-base64 chars
+// forgiving-base64 decode is FromBase64 with the loose last chunk: whitespace skipped,
+// padding optional, a lone final char or anything outside the alphabet a failure
+export const atob = (input: any): bytestring => {
+  if (Porffor.type(input) != Porffor.TYPES.bytestring && Porffor.type(input) != Porffor.TYPES.string) input = ecma262.ToString(input);
 
-  const lut: bytestring = '@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@>@@@?456789:;<=@@@@@@@\x00\x01\x02\x03\x04\x05\x06\x07\b\t\n\x0B\f\r\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19@@@@@@\x1A\x1B\x1C\x1D\x1E\x1F !"#$%&\'()*+,-./0123';
-  const lutPtr: i32 = Porffor.IR.ptr(lut);
+  const len: i32 = input.length;
+  const max: i32 = len * 3 / 4 + 3;
+  const output: bytestring = Porffor.malloc(max + 8);
+  const outPtr: i32 = Porffor.IR.ptr(output);
+  const two: i32 = Porffor.type(input) == Porffor.TYPES.string ? 1 : 0;
+  const written: i32 = __Porffor_base64_decode(Porffor.IR.ptr(input), two, len, 0, 0, outPtr, max);
+  if (written < 0) throw new TypeError('InvalidCharacterError: atob input is not valid base64');
 
-  let output: bytestring = Porffor.malloc();
-
-  let i: i32 = Porffor.IR.ptr(input),
-      j: i32 = Porffor.IR.ptr(output);
-
-  const endPtr: i32 = i + input.length;
-  while (i < endPtr) {
-    const enc1: i32 = Porffor.IR.loadU8(lutPtr + Porffor.IR.loadU8(i++, 4), 4);
-    const enc2: i32 = i < endPtr ? Porffor.IR.loadU8(lutPtr + Porffor.IR.loadU8(i++, 4), 4) : -1;
-    const enc3: i32 = i < endPtr ? Porffor.IR.loadU8(lutPtr + Porffor.IR.loadU8(i++, 4), 4) : -1;
-    const enc4: i32 = i < endPtr ? Porffor.IR.loadU8(lutPtr + Porffor.IR.loadU8(i++, 4), 4) : -1;
-
-    const chr1: i32 = (enc1 << 2) | (enc2 == -1 ? 0 : (enc2 >> 4));
-    const chr2: i32 = ((enc2 & 15) << 4) | (enc3 == -1 ? 0 : (enc3 >> 2));
-    const chr3: i32 = ((enc3 & 3) << 6) | (enc4 == -1 ? 0 : enc4);
-
-    Porffor.IR.storeU8(j++, 4, chr1);
-
-    if (enc3 != 64) {
-      Porffor.IR.storeU8(j++, 4, chr2);
-    }
-
-    if (enc4 != 64) {
-      Porffor.IR.storeU8(j++, 4, chr3);
-    }
-  }
-
-  output.length = j - Porffor.IR.ptr(output);
+  Porffor.IR.storeI32(outPtr, 0, written);
   return output;
 };

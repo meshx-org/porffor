@@ -5,21 +5,9 @@ export const __Porffor_strcmp = (a: any, b: any): boolean => {
   // fast path: check if pointers are equal
   if (Porffor.IR.ptr(a) == Porffor.IR.ptr(b)) return true;
 
-  const al: i32 = Porffor.IR.loadI32(a, 0);
-  const bl: i32 = Porffor.IR.loadI32(b, 0);
-
-  // fast path: check if lengths are inequal
-  if (al != bl) return false;
-
-  const aBytes: boolean = Porffor.type(a) == Porffor.TYPES.bytestring;
-  const bBytes: boolean = Porffor.type(b) == Porffor.TYPES.bytestring;
-  for (let i: i32 = 0; i < al; i++) {
-    const ac: i32 = aBytes ? Porffor.IR.loadU8(Porffor.IR.ptr(a) + i, 4) : Porffor.IR.loadU16(Porffor.IR.ptr(a) + i * 2, 4);
-    const bc: i32 = bBytes ? Porffor.IR.loadU8(Porffor.IR.ptr(b) + i, 4) : Porffor.IR.loadU16(Porffor.IR.ptr(b) + i * 2, 4);
-    if (ac != bc) return false;
-  }
-
-  return true;
+  const len: i32 = Porffor.IR.loadI32(a, 0);
+  if (len != Porffor.IR.loadI32(b, 0)) return false;
+  return __Porffor_string_mismatch(Porffor.IR.ptr(a), __Porffor_string_wide(a), 0, Porffor.IR.ptr(b), __Porffor_string_wide(b), 0, len) == len;
 };
 
 // --ropes: the string itself, as characters to read (a rope flattened: every builtin's
@@ -204,423 +192,144 @@ export const __ByteString_prototype_codePointAt = function (this: bytestring, in
   return Porffor.IR.loadU8(Porffor.IR.ptr(this) + index, 4);
 };
 
-export const __String_prototype_startsWith = function (this: string, searchString: any, position: number = 0) {
-  // as indexOf: the search as a string, widened from a bytestring to compare 16-bit units
-  searchString = ecma262.ToString(searchString);
-  if (Porffor.type(searchString) == Porffor.TYPES.bytestring) {
-    searchString = Porffor.bytestringToString(searchString);
-  }
-  // todo/perf: investigate whether for counter vs while ++s are faster
-
-  let thisPtr: i32 = Porffor.IR.ptr(this);
-  const searchPtr: i32 = Porffor.IR.ptr(searchString);
-
-  // todo/perf: make position oob handling optional (via pref or fast variant?)
-  const len: i32 = this.length;
-  if (position > 0) {
-    if (position > len) position = len;
-  } else position = 0;
-
-  if (searchString.length > len - position) return false;
-
-  thisPtr += position * 2;
-
-  const searchLen: i32 = searchString.length * 2;
-  for (let i: i32 = 0; i < searchLen; i += 2) {
-    let chr: i32 = Porffor.IR.loadU16(thisPtr + i, 4);
-    let expected: i32 = Porffor.IR.loadU16(searchPtr + i, 4);
-
-    if (chr != expected) return false;
-  }
-
-  return true;
+export const __String_prototype_startsWith = function (this: string, searchString: any, position: any = 0) {
+  return __Porffor_string_startsWith(this, searchString, position);
 };
 
-export const __ByteString_prototype_startsWith = function (this: bytestring, searchString: any, position: number = 0) {
-  // as indexOf: a search that is not a bytestring is compared as a string
-  searchString = ecma262.ToString(searchString);
-  if (Porffor.type(searchString) != Porffor.TYPES.bytestring) {
-    return Porffor.callThis(__String_prototype_startsWith, Porffor.bytestringToString(this), searchString, position);
-  }
-
-  // todo/perf: investigate whether for counter vs while ++s are faster
-
-  let thisPtr: i32 = Porffor.IR.ptr(this);
-  const searchPtr: i32 = Porffor.IR.ptr(searchString);
-
-  // todo/perf: make position oob handling optional (via pref or fast variant?)
-  const len: i32 = this.length;
-  if (position > 0) {
-    if (position > len) position = len;
-  } else position = 0;
-
-  if (searchString.length > len - position) return false;
-
-  thisPtr += position;
-
-  const searchLen: i32 = searchString.length;
-  for (let i: i32 = 0; i < searchLen; i++) {
-    let chr: i32 = Porffor.IR.loadU8(thisPtr + i, 4);
-    let expected: i32 = Porffor.IR.loadU8(searchPtr + i, 4);
-
-    if (chr != expected) return false;
-  }
-
-  return true;
+export const __ByteString_prototype_startsWith = function (this: bytestring, searchString: any, position: any = 0) {
+  return __Porffor_string_startsWith(this, searchString, position);
 };
 
 
 export const __String_prototype_endsWith = function (this: string, searchString: any, endPosition: any = undefined) {
-  // as indexOf: the search as a string, widened from a bytestring to compare 16-bit units
-  searchString = ecma262.ToString(searchString);
-  if (Porffor.type(searchString) == Porffor.TYPES.bytestring) {
-    searchString = Porffor.bytestringToString(searchString);
-  }
-
-  let i: i32 = Porffor.IR.ptr(this),
-      j: i32 = Porffor.IR.ptr(searchString);
-
-  const searchLen: i32 = searchString.length;
-
-  // todo/perf: make position oob handling optional (via pref or fast variant?)
-  const len: i32 = this.length;
-
-  if (Porffor.type(endPosition) == Porffor.TYPES.undefined) endPosition = len;
-
-  if (endPosition > 0) {
-    if (endPosition > len) endPosition = len;
-  } else endPosition = 0;
-
-  endPosition -= searchLen;
-
-  if (endPosition < 0) return false;
-
-  i += endPosition * 2;
-
-  const endPtr: i32 = j + searchLen * 2;
-  while (j < endPtr) {
-    let chr: i32 = Porffor.IR.loadU16(i, 4);
-    let expected: i32 = Porffor.IR.loadU16(j, 4);
-
-    i += 2;
-    j += 2;
-
-    if (chr != expected) return false;
-  }
-
-  return true;
+  return __Porffor_string_endsWith(this, searchString, endPosition);
 };
 
 export const __ByteString_prototype_endsWith = function (this: bytestring, searchString: any, endPosition: any = undefined) {
-  // as indexOf: a search that is not a bytestring is compared as a string
-  searchString = ecma262.ToString(searchString);
-  if (Porffor.type(searchString) != Porffor.TYPES.bytestring) {
-    return Porffor.callThis(__String_prototype_endsWith, Porffor.bytestringToString(this), searchString, endPosition);
-  }
-
-  let i: i32 = Porffor.IR.ptr(this),
-      j: i32 = Porffor.IR.ptr(searchString);
-
-  const searchLen: i32 = searchString.length;
-
-  // todo/perf: make position oob handling optional (via pref or fast variant?)
-  const len: i32 = this.length;
-
-  if (Porffor.type(endPosition) == Porffor.TYPES.undefined) endPosition = len;
-
-  if (endPosition > 0) {
-    if (endPosition > len) endPosition = len;
-  } else endPosition = 0;
-
-  endPosition -= searchLen;
-
-  if (endPosition < 0) return false;
-
-  i += endPosition;
-
-  const endPtr: i32 = j + searchLen;
-  while (j < endPtr) {
-    let chr: i32 = Porffor.IR.loadU8(i++, 4);
-    let expected: i32 = Porffor.IR.loadU8(j++, 4);
-
-    if (chr != expected) return false;
-  }
-
-  return true;
+  return __Porffor_string_endsWith(this, searchString, endPosition);
 };
 
 
-export const __String_prototype_indexOf = function (this: string, searchString: any, position: any = 0) {
+// a string's unit width for the __Porffor_string_* C helpers: 1 for two-byte units, 0 for one-byte
+export const __Porffor_string_wide = (s: any): i32 => Porffor.type(s) == Porffor.TYPES.string ? 1 : 0;
+
+// indexOf, lastIndexOf, includes, startsWith and endsWith for both string kinds, the search in
+// either kind: SIMD searches and compares over the units as they are, nothing widened
+
+export const __Porffor_string_indexOf = (str: any, searchString: any, position: any): i32 => {
   searchString = ecma262.ToString(searchString);
-  if (Porffor.type(searchString) == Porffor.TYPES.bytestring) {
-    searchString = Porffor.bytestringToString(searchString);
+  const pos: number = ecma262.ToIntegerOrInfinity(position);
+  const len: i32 = str.length;
+  let start: i32 = 0;
+  if (pos > 0) start = pos > len ? len : pos;
+  return __Porffor_string_find(Porffor.IR.ptr(str), __Porffor_string_wide(str), len,
+    Porffor.IR.ptr(searchString), __Porffor_string_wide(searchString), searchString.length, start);
+};
+
+export const __Porffor_string_lastIndexOf = (str: any, searchString: any, position: any): i32 => {
+  searchString = ecma262.ToString(searchString);
+  const numPos: number = ecma262.ToNumber(position);
+  const len: i32 = str.length;
+  // NaN (and undefined) searches from the end
+  let start: i32 = len;
+  if (numPos == numPos) {
+    const pos: number = ecma262.ToIntegerOrInfinity(numPos);
+    if (pos < len) start = pos > 0 ? pos : 0;
   }
-  position = ecma262.ToIntegerOrInfinity(position);
+  return __Porffor_string_rfind(Porffor.IR.ptr(str), __Porffor_string_wide(str), len,
+    Porffor.IR.ptr(searchString), __Porffor_string_wide(searchString), searchString.length, start);
+};
 
-  let thisPtr: i32 = Porffor.IR.ptr(this);
-  const searchPtr: i32 = Porffor.IR.ptr(searchString);
+export const __Porffor_string_startsWith = (str: any, searchString: any, position: any): boolean => {
+  searchString = ecma262.ToString(searchString);
+  const pos: number = ecma262.ToIntegerOrInfinity(position);
+  const len: i32 = str.length;
+  let start: i32 = 0;
+  if (pos > 0) start = pos > len ? len : pos;
+  const n: i32 = searchString.length;
+  if (n > len - start) return false;
+  return __Porffor_string_mismatch(Porffor.IR.ptr(str), __Porffor_string_wide(str), start,
+    Porffor.IR.ptr(searchString), __Porffor_string_wide(searchString), 0, n) == n;
+};
 
-  const searchLenX2: i32 = searchString.length * 2;
+export const __Porffor_string_endsWith = (str: any, searchString: any, endPosition: any): boolean => {
+  searchString = ecma262.ToString(searchString);
+  const len: i32 = str.length;
+  let end: i32 = len;
+  if (Porffor.type(endPosition) != Porffor.TYPES.undefined) {
+    const pos: number = ecma262.ToIntegerOrInfinity(endPosition);
+    end = pos > 0 ? (pos > len ? len : pos) : 0;
+  }
+  const n: i32 = searchString.length;
+  const start: i32 = end - n;
+  if (start < 0) return false;
+  return __Porffor_string_mismatch(Porffor.IR.ptr(str), __Porffor_string_wide(str), start,
+    Porffor.IR.ptr(searchString), __Porffor_string_wide(searchString), 0, n) == n;
+};
 
-  // todo/perf: make position oob handling optional (via pref or fast variant?)
-  const len: i32 = this.length;
-  if (position > 0) {
-    if (position > len) position = len;
-  } else position = 0;
-
-  // longer search than rest: negative end would saturate (i32) and scan all memory
-  if (searchString.length > len) return -1;
-
-  const thisPtrEnd: i32 = thisPtr + (len * 2) - searchLenX2;
-
-  thisPtr += position * 2;
-
-  while (thisPtr <= thisPtrEnd) {
-    let match: boolean = true;
-    for (let i: i32 = 0; i < searchLenX2; i += 2) {
-      let chr: i32 = Porffor.IR.loadU16(thisPtr + i, 4);
-      let expected: i32 = Porffor.IR.loadU16(searchPtr + i, 4);
-
-      if (chr != expected) {
-        match = false;
-        break;
-      }
+// the first index from at where the search string (searchLen units at data pointer search)
+// occurs in a string of len units at data pointer base, or -1: the search's first unit found by
+// a SIMD scan (__Porffor_simd_find*), the rest compared only there
+export const __Porffor_string_findU8 = (base: i32, len: i32, search: i32, searchLen: i32, at: i32): i32 => {
+  if (searchLen == 0) return at;
+  const first: i32 = Porffor.IR.loadU8(search, 4);
+  const last: i32 = len - searchLen;
+  while (at <= last) {
+    at = __Porffor_simd_findU8(base, at, last + 1, first);
+    if (at < 0) return -1;
+    let i: i32 = 1;
+    while (i < searchLen) {
+      if (Porffor.IR.loadU8(base + at + i, 4) != Porffor.IR.loadU8(search + i, 4)) break;
+      i++;
     }
-
-    if (match) return (thisPtr - Porffor.IR.ptr(this)) / 2;
-
-    thisPtr += 2;
+    if (i == searchLen) return at;
+    at++;
   }
-
   return -1;
+};
+
+export const __Porffor_string_findU16 = (base: i32, len: i32, search: i32, searchLen: i32, at: i32): i32 => {
+  if (searchLen == 0) return at;
+  const first: i32 = Porffor.IR.loadU16(search, 4);
+  const last: i32 = len - searchLen;
+  while (at <= last) {
+    at = __Porffor_simd_findU16(base, at, last + 1, first);
+    if (at < 0) return -1;
+    let i: i32 = 1;
+    while (i < searchLen) {
+      if (Porffor.IR.loadU16(base + (at + i) * 2, 4) != Porffor.IR.loadU16(search + i * 2, 4)) break;
+      i++;
+    }
+    if (i == searchLen) return at;
+    at++;
+  }
+  return -1;
+};
+
+export const __String_prototype_indexOf = function (this: string, searchString: any, position: any = 0) {
+  return __Porffor_string_indexOf(this, searchString, position);
 };
 
 export const __ByteString_prototype_indexOf = function (this: bytestring, searchString: any, position: any = 0) {
-  searchString = ecma262.ToString(searchString);
-  if (Porffor.type(searchString) != Porffor.TYPES.bytestring) {
-    return Porffor.callThis(__String_prototype_indexOf, Porffor.bytestringToString(this), searchString, position);
-  }
-  position = ecma262.ToIntegerOrInfinity(position);
-
-  let thisPtr: i32 = Porffor.IR.ptr(this);
-  const searchPtr: i32 = Porffor.IR.ptr(searchString);
-
-  const searchLen: i32 = searchString.length;
-
-  // todo/perf: make position oob handling optional (via pref or fast variant?)
-  const len: i32 = this.length;
-  if (position > 0) {
-    if (position > len) position = len;
-  } else position = 0;
-
-  // longer search than rest: negative end would saturate (i32) and scan all memory
-  if (searchLen > len) return -1;
-
-  const thisPtrEnd: i32 = thisPtr + len - searchLen;
-
-  thisPtr += position;
-
-  while (thisPtr <= thisPtrEnd) {
-    let match: boolean = true;
-    for (let i: i32 = 0; i < searchLen; i++) {
-      let chr: i32 = Porffor.IR.loadU8(thisPtr + i, 4);
-      let expected: i32 = Porffor.IR.loadU8(searchPtr + i, 4);
-
-      if (chr != expected) {
-        match = false;
-        break;
-      }
-    }
-
-    if (match) return thisPtr - Porffor.IR.ptr(this);
-
-    thisPtr++;
-  }
-
-  return -1;
+  return __Porffor_string_indexOf(this, searchString, position);
 };
 
 
 export const __String_prototype_lastIndexOf = function (this: string, searchString: any, position: any = undefined) {
-  searchString = ecma262.ToString(searchString);
-  if (Porffor.type(searchString) == Porffor.TYPES.bytestring) {
-    searchString = Porffor.bytestringToString(searchString);
-  }
-
-  let thisPtr: i32 = Porffor.IR.ptr(this);
-  const searchPtr: i32 = Porffor.IR.ptr(searchString);
-
-  const searchLen: i32 = searchString.length;
-  const searchLenX2: i32 = searchLen * 2;
-
-  // todo/perf: make position oob handling optional (via pref or fast variant?)
-  const len: i32 = this.length;
-  if (searchLen > len) return -1;
-
-  if (Porffor.type(position) == Porffor.TYPES.undefined) position = len - searchLen;
-
-  if (position > 0) {
-    const max: i32 = len - searchLen;
-    if (position > max) position = max;
-  } else position = 0;
-
-  const thisPtrStart: i32 = thisPtr;
-
-  thisPtr += position * 2;
-
-  while (thisPtr >= thisPtrStart) {
-    let match: boolean = true;
-    for (let i: i32 = 0; i < searchLenX2; i += 2) {
-      let chr: i32 = Porffor.IR.loadU8(thisPtr + i, 4);
-      let expected: i32 = Porffor.IR.loadU8(searchPtr + i, 4);
-
-      if (chr != expected) {
-        match = false;
-        break;
-      }
-    }
-
-    if (match) return (thisPtr - Porffor.IR.ptr(this)) / 2;
-
-    thisPtr -= 2;
-  }
-
-  return -1;
+  return __Porffor_string_lastIndexOf(this, searchString, position);
 };
 
 export const __ByteString_prototype_lastIndexOf = function (this: bytestring, searchString: any, position: any = undefined) {
-  searchString = ecma262.ToString(searchString);
-  if (Porffor.type(searchString) != Porffor.TYPES.bytestring) {
-    return Porffor.callThis(__String_prototype_lastIndexOf, Porffor.bytestringToString(this), searchString, position);
-  }
-
-  let thisPtr: i32 = Porffor.IR.ptr(this);
-  const searchPtr: i32 = Porffor.IR.ptr(searchString);
-
-  const searchLen: i32 = searchString.length;
-
-  // todo/perf: make position oob handling optional (via pref or fast variant?)
-  const len: i32 = this.length;
-  if (searchLen > len) return -1;
-
-  if (Porffor.type(position) == Porffor.TYPES.undefined) position = len - searchLen;
-
-  if (position > 0) {
-    const max: i32 = len - searchLen;
-    if (position > max) position = max;
-  } else position = 0;
-
-  const thisPtrStart: i32 = thisPtr;
-
-  thisPtr += position;
-
-  while (thisPtr >= thisPtrStart) {
-    let match: boolean = true;
-    for (let i: i32 = 0; i < searchLen; i++) {
-      let chr: i32 = Porffor.IR.loadU8(thisPtr + i, 4);
-      let expected: i32 = Porffor.IR.loadU8(searchPtr + i, 4);
-
-      if (chr != expected) {
-        match = false;
-        break;
-      }
-    }
-
-    if (match) return thisPtr - Porffor.IR.ptr(this);
-
-    thisPtr--;
-  }
-
-  return -1;
+  return __Porffor_string_lastIndexOf(this, searchString, position);
 };
 
 
-export const __String_prototype_includes = function (this: string, searchString: any, position: number = 0) {
-  searchString = ecma262.ToString(searchString);
-  if (Porffor.type(searchString) == Porffor.TYPES.bytestring) {
-    searchString = Porffor.bytestringToString(searchString);
-  }
-
-  let thisPtr: i32 = Porffor.IR.ptr(this);
-  const searchPtr: i32 = Porffor.IR.ptr(searchString);
-
-  const searchLenX2: i32 = searchString.length * 2;
-
-  // todo/perf: make position oob handling optional (via pref or fast variant?)
-  const len: i32 = this.length;
-  if (position > 0) {
-    if (position > len) position = len;
-  } else position = 0;
-
-  // longer search than rest: negative end would saturate (i32) and scan all memory
-  if (searchString.length > len) return false;
-
-  const thisPtrEnd: i32 = thisPtr + (len * 2) - searchLenX2;
-
-  thisPtr += position * 2;
-
-  while (thisPtr <= thisPtrEnd) {
-    let match: boolean = true;
-    for (let i: i32 = 0; i < searchLenX2; i += 2) {
-      let chr: i32 = Porffor.IR.loadU16(thisPtr + i, 4);
-      let expected: i32 = Porffor.IR.loadU16(searchPtr + i, 4);
-
-      if (chr != expected) {
-        match = false;
-        break;
-      }
-    }
-
-    if (match) return true;
-
-    thisPtr += 2;
-  }
-
-  return false;
+export const __String_prototype_includes = function (this: string, searchString: any, position: any = 0) {
+  return __Porffor_string_indexOf(this, searchString, position) != -1;
 };
 
-export const __ByteString_prototype_includes = function (this: bytestring, searchString: any, position: number = 0) {
-  searchString = ecma262.ToString(searchString);
-  if (Porffor.type(searchString) != Porffor.TYPES.bytestring) {
-    return Porffor.callThis(__String_prototype_includes, Porffor.bytestringToString(this), searchString, position);
-  }
-
-  let thisPtr: i32 = Porffor.IR.ptr(this);
-  const searchPtr: i32 = Porffor.IR.ptr(searchString);
-
-  const searchLen: i32 = searchString.length;
-
-  // todo/perf: make position oob handling optional (via pref or fast variant?)
-  const len: i32 = this.length;
-  if (position > 0) {
-    if (position > len) position = len;
-  } else position = 0;
-
-  // longer search than rest: negative end would saturate (i32) and scan all memory
-  if (searchLen > len) return false;
-
-  const thisPtrEnd: i32 = thisPtr + len - searchLen;
-
-  thisPtr += position;
-
-  while (thisPtr <= thisPtrEnd) {
-    let match: boolean = true;
-    for (let i: i32 = 0; i < searchLen; i++) {
-      let chr: i32 = Porffor.IR.loadU8(thisPtr + i, 4);
-      let expected: i32 = Porffor.IR.loadU8(searchPtr + i, 4);
-
-      if (chr != expected) {
-        match = false;
-        break;
-      }
-    }
-
-    if (match) return true;
-
-    thisPtr++;
-  }
-
-  return false;
+export const __ByteString_prototype_includes = function (this: bytestring, searchString: any, position: any = 0) {
+  return __Porffor_string_indexOf(this, searchString, position) != -1;
 };
 
 
@@ -1323,6 +1032,15 @@ export const __Porffor_string_replace = (str: any, searchValue: any, replaceValu
     let matched: boolean = false;
     let appendIndex: i32 = 0;
     let searchIndex: i32 = 0;
+    // a single replacement is one RegExpExec: sticky starts at lastIndex
+    if (!global && (Porffor.IR.loadU16(searchValue, 4) & 0b00100000) != 0) {
+      searchIndex = Porffor.IR.loadI32(searchValue, 8);
+      if (searchIndex < 0) searchIndex = 0;
+      if (searchIndex > thisLen) {
+        Porffor.IR.storeI32(searchValue, 8, 0);
+        return str;
+      }
+    }
 
     // plain replacement (no '$') only needs match positions
     let plain: boolean = false;
@@ -1444,6 +1162,93 @@ export const __ByteString_prototype_replace = function (this: bytestring, search
   return __Porffor_string_replace(this, searchValue, replaceValue);
 };
 
+// n units of a string (from unit si) into a result being built (from unit di), widened into a
+// two-byte result
+export const __Porffor_string_copyUnits = (dst: i32, dstWide: i32, di: i32, src: any, si: i32, n: i32): void => {
+  if (Porffor.type(src) == Porffor.TYPES.string) {
+    Porffor.IR.copy(dst + 4 + di * 2, Porffor.IR.ptr(src) + 4 + si * 2, n * 2);
+  } else if (dstWide) {
+    __Porffor_simd_widen(dst, di, Porffor.IR.ptr(src), si, n);
+  } else {
+    Porffor.IR.copy(dst + 4 + di, Porffor.IR.ptr(src) + 4 + si, n);
+  }
+};
+
+// replaceAll with one replacement for every match: the matches counted, then found again while
+// the result is copied out
+export const __Porffor_string_replaceAllPlain = (str: any, hay: i32, hayWide: i32, ndl: i32, ndlWide: i32, searchLen: i32, advance: i32, repl: any) => {
+  const len: i32 = str.length;
+  let count: i32 = 0;
+  let at: i32 = __Porffor_string_find(hay, hayWide, len, ndl, ndlWide, searchLen, 0);
+  while (at != -1) {
+    count++;
+    at = __Porffor_string_find(hay, hayWide, len, ndl, ndlWide, searchLen, at + advance);
+  }
+  if (count == 0) return str;
+
+  const replLen: i32 = repl.length;
+  const outLen: i32 = len + count * (replLen - searchLen);
+  if (hayWide || Porffor.type(repl) == Porffor.TYPES.string) {
+    const out: string = Porffor.malloc(8 + outLen * 2);
+    __Porffor_string_replaceAllPlainFill(Porffor.IR.ptr(out), 1, str, hay, hayWide, ndl, ndlWide, searchLen, advance, repl);
+    Porffor.IR.storeI32(Porffor.IR.ptr(out), 0, outLen);
+    return out;
+  }
+  const out: bytestring = Porffor.malloc(8 + outLen);
+  __Porffor_string_replaceAllPlainFill(Porffor.IR.ptr(out), 0, str, hay, hayWide, ndl, ndlWide, searchLen, advance, repl);
+  Porffor.IR.storeI32(Porffor.IR.ptr(out), 0, outLen);
+  return out;
+};
+
+export const __Porffor_string_replaceAllPlainFill = (dst: i32, dstWide: i32, str: any, hay: i32, hayWide: i32, ndl: i32, ndlWide: i32, searchLen: i32, advance: i32, repl: any): void => {
+  const len: i32 = str.length;
+  const replLen: i32 = repl.length;
+  let di: i32 = 0;
+  let from: i32 = 0;
+  let at: i32 = __Porffor_string_find(hay, hayWide, len, ndl, ndlWide, searchLen, 0);
+  while (at != -1) {
+    __Porffor_string_copyUnits(dst, dstWide, di, str, from, at - from);
+    di += at - from;
+    __Porffor_string_copyUnits(dst, dstWide, di, repl, 0, replLen);
+    di += replLen;
+    from = at + searchLen;
+    at = __Porffor_string_find(hay, hayWide, len, ndl, ndlWide, searchLen, at + advance);
+  }
+  __Porffor_string_copyUnits(dst, dstWide, di, str, from, len - from);
+};
+
+// units [from, to) of a string as a new string of its kind
+export const __Porffor_string_piece = (str: any, from: i32, to: i32) => {
+  const n: i32 = to - from;
+  if (Porffor.type(str) == Porffor.TYPES.string) {
+    const out: string = Porffor.malloc(8 + n * 2);
+    Porffor.IR.copy(Porffor.IR.ptr(out) + 4, Porffor.IR.ptr(str) + 4 + from * 2, n * 2);
+    Porffor.IR.storeI32(Porffor.IR.ptr(out), 0, n);
+    return out;
+  }
+  const out: bytestring = Porffor.malloc(8 + n);
+  Porffor.IR.copy(Porffor.IR.ptr(out) + 4, Porffor.IR.ptr(str) + 4 + from, n);
+  Porffor.IR.storeI32(Porffor.IR.ptr(out), 0, n);
+  return out;
+};
+
+// replaceAll's result: the string between matches and each replacement, in order
+export const __Porffor_string_replaceAllFill = (dst: i32, dstWide: i32, str: any, positions: any[], replacements: any[], count: i32, searchLen: i32): void => {
+  let di: i32 = 0;
+  let from: i32 = 0;
+  for (let i: i32 = 0; i < count; i++) {
+    const p: i32 = positions[i];
+    __Porffor_string_copyUnits(dst, dstWide, di, str, from, p - from);
+    di += p - from;
+    const r: any = replacements[i];
+    const rLen: i32 = r.length;
+    __Porffor_string_copyUnits(dst, dstWide, di, r, 0, rLen);
+    di += rLen;
+    from = p + searchLen;
+  }
+  __Porffor_string_copyUnits(dst, dstWide, di, str, from, str.length - from);
+};
+
 export const __Porffor_string_replaceAll = (str: any, searchValue: any, replaceValue: any) => {
   const thisLen: i32 = str.length;
 
@@ -1457,36 +1262,53 @@ export const __Porffor_string_replaceAll = (str: any, searchValue: any, replaceV
 
   searchValue = ecma262.ToString(searchValue);
   const searchLen: i32 = searchValue.length;
+  const hay: i32 = Porffor.IR.ptr(str), hayWide: i32 = __Porffor_string_wide(str);
+  const ndl: i32 = Porffor.IR.ptr(searchValue), ndlWide: i32 = __Porffor_string_wide(searchValue);
+  const advance: i32 = searchLen > 0 ? searchLen : 1;
+
+  // a replacement string, converted once; without '$' it is the same at every match
+  if (Porffor.type(replaceValue) != Porffor.TYPES.function) {
+    replaceValue = ecma262.ToString(replaceValue);
+    if (__Porffor_string_indexOfLike(replaceValue, '$', 0) == -1) {
+      return __Porffor_string_replaceAllPlain(str, hay, hayWide, ndl, ndlWide, searchLen, advance, replaceValue);
+    }
+  }
+
+  const positions: any[] = Porffor.array.new(8);
+  let count: i32 = 0;
+  let at: i32 = __Porffor_string_find(hay, hayWide, thisLen, ndl, ndlWide, searchLen, 0);
+  while (at != -1) {
+    count = Porffor.array.fastPush(positions, at);
+    at = __Porffor_string_find(hay, hayWide, thisLen, ndl, ndlWide, searchLen, at + advance);
+  }
+  if (count == 0) return str;
+
+  // the replacements, in match order, and the result's length and width
   const match: any[] = Porffor.array.new(1);
   match[0] = searchValue;
   match.input = str;
-
-  let out: any = __Porffor_string_emptyLike(str);
-  let appendIndex: i32 = 0;
-  let searchIndex: i32 = 0;
-  let matched: boolean = false;
-
-  while (searchIndex <= thisLen) {
-    const matchIndex: i32 = searchLen == 0 ? searchIndex : __Porffor_string_indexOfLike(str, searchValue, searchIndex);
-    if (matchIndex == -1) break;
-
-    matched = true;
-    match.index = matchIndex;
-    out = __Porffor_strcat(out, __Porffor_string_substringLike(str, appendIndex, matchIndex));
-    out = __Porffor_strcat(out, __Porffor_string_applyReplacer(str, match, matchIndex, replaceValue));
-
-    appendIndex = matchIndex + searchLen;
-    if (searchLen == 0) {
-      if (matchIndex >= thisLen) break;
-      searchIndex = matchIndex + 1;
-      continue;
-    }
-
-    searchIndex = appendIndex;
+  const replacements: any[] = Porffor.array.new(count);
+  let outLen: i32 = thisLen - count * searchLen;
+  let wide: i32 = hayWide;
+  for (let i: i32 = 0; i < count; i++) {
+    const p: i32 = positions[i];
+    match.index = p;
+    const r: any = __Porffor_string_applyReplacer(str, match, p, replaceValue);
+    Porffor.array.fastPush(replacements, r);
+    outLen += r.length;
+    if (Porffor.type(r) == Porffor.TYPES.string) wide = 1;
   }
 
-  if (!matched) return str;
-  return __Porffor_strcat(out, __Porffor_string_substringLike(str, appendIndex, thisLen));
+  if (wide) {
+    const out: string = Porffor.malloc(8 + outLen * 2);
+    __Porffor_string_replaceAllFill(Porffor.IR.ptr(out), 1, str, positions, replacements, count, searchLen);
+    Porffor.IR.storeI32(Porffor.IR.ptr(out), 0, outLen);
+    return out;
+  }
+  const out: bytestring = Porffor.malloc(8 + outLen);
+  __Porffor_string_replaceAllFill(Porffor.IR.ptr(out), 0, str, positions, replacements, count, searchLen);
+  Porffor.IR.storeI32(Porffor.IR.ptr(out), 0, outLen);
+  return out;
 };
 
 export const __String_prototype_replaceAll = function (this: string, searchValue: any, replaceValue: any) {
@@ -1506,11 +1328,14 @@ export const __Porffor_string_splitRegex = (str: any, separator: any, limit: num
   const thisLen: i32 = str.length;
   const nCaps: i32 = Porffor.IR.loadU16(separator, 6);
   const uv: boolean = (Porffor.IR.loadU16(separator, 4) & 0b10010000) != 0;
+  // split matches with a fresh splitter: the separator's own lastIndex stays as it was
+  const lastIndex: i32 = Porffor.IR.loadI32(separator, 8);
 
   if (thisLen == 0) {
     const e0: i32 = __Porffor_regex_interpretFrom(separator, str, 2, 0);
     out.length = 0;
     if (e0 == -1) Porffor.array.fastPush(out, str);
+    Porffor.IR.storeI32(separator, 8, lastIndex);
     return out;
   }
 
@@ -1531,19 +1356,52 @@ export const __Porffor_string_splitRegex = (str: any, separator: any, limit: num
     }
 
     outLen = Porffor.array.fastPush(out, __Porffor_regex_inputSubstring(str, strType, p, mi));
-    if (outLen >= limit) { out.length = outLen; return out; }
+    if (outLen >= limit) { out.length = outLen; Porffor.IR.storeI32(separator, 8, lastIndex); return out; }
     for (let k: i32 = 0; k < nCaps; k++) {
       const cs: i32 = __Porffor_regex_capsRead(k * 2);
       const ce: i32 = __Porffor_regex_capsRead(k * 2 + 1);
       if (cs != -1 && ce != -1) outLen = Porffor.array.fastPush(out, __Porffor_regex_inputSubstring(str, strType, cs, ce));
         else outLen = Porffor.array.fastPush(out, undefined);
-      if (outLen >= limit) { out.length = outLen; return out; }
+      if (outLen >= limit) { out.length = outLen; Porffor.IR.storeI32(separator, 8, lastIndex); return out; }
     }
     p = e;
     q = e;
   }
 
   outLen = Porffor.array.fastPush(out, __Porffor_regex_inputSubstring(str, strType, p, thisLen));
+  out.length = outLen;
+  Porffor.IR.storeI32(separator, 8, lastIndex);
+  return out;
+};
+
+// split by a string separator: its matches found by SIMD search, the pieces between them
+export const __Porffor_string_splitString = (str: any, separator: any, limit: number, out: any[]): any[] => {
+  let outLen: i32 = 0;
+  const len: i32 = str.length, sepLen: i32 = separator.length;
+  if (sepLen == 0) {
+    // every code unit on its own
+    for (let i: i32 = 0; i < len && outLen < limit; i++) {
+      outLen = Porffor.array.fastPush(out, __Porffor_string_substringLike(str, i, i + 1));
+    }
+    out.length = outLen;
+    return out;
+  }
+
+  const hay: i32 = Porffor.IR.ptr(str), hayWide: i32 = __Porffor_string_wide(str);
+  const sep: i32 = Porffor.IR.ptr(separator), sepWide: i32 = __Porffor_string_wide(separator);
+  let start: i32 = 0;
+  while (true) {
+    const at: i32 = __Porffor_string_find(hay, hayWide, len, sep, sepWide, sepLen, start);
+    if (at == -1) break;
+    outLen = Porffor.array.fastPush(out, __Porffor_string_piece(str, start, at));
+    if (outLen >= limit) {
+      out.length = outLen;
+      return out;
+    }
+    start = at + sepLen;
+  }
+
+  outLen = Porffor.array.fastPush(out, __Porffor_string_piece(str, start, len));
   out.length = outLen;
   return out;
 };
@@ -1585,72 +1443,7 @@ export const __String_prototype_split = function (this: string, separator: any, 
     return out;
   }
 
-  const thisLen: i32 = this.length, sepLen: i32 = separator.length;
-  if (sepLen == 1) {
-    // fast path: single char separator
-    const sepChar: i32 = separator.charCodeAt(0);
-    let start: i32 = 0;
-    for (let i: i32 = 0; i < thisLen; i++) {
-      const x: i32 = Porffor.IR.loadU16(Porffor.IR.ptr(this) + i * 2, 4);
-
-      if (x == sepChar) {
-        if (outLen >= limit) {
-          out.length = outLen;
-          return out;
-        }
-
-        outLen = Porffor.array.fastPush(out, Porffor.callThis(__String_prototype_substring, this, start, i));
-        start = i + 1;
-      }
-    }
-
-    if (outLen < limit) {
-      outLen = Porffor.array.fastPush(out, Porffor.callThis(__String_prototype_substring, this, start, thisLen));
-    }
-  } else if (sepLen == 0) {
-    let produced: i32 = 0;
-    for (let i = 0; i < thisLen && produced < limit; i++) {
-      outLen = Porffor.array.fastPush(out, Porffor.callThis(__String_prototype_substring, this, i, i + 1));
-      produced++;
-    }
-  } else if (sepLen > thisLen) {
-    outLen = Porffor.array.fastPush(out, this);
-  } else {
-    let start: i32 = 0;
-    const maxStart: i32 = thisLen - sepLen;
-    let i: i32 = 0;
-    while (i <= maxStart) {
-      let match: boolean = true;
-      for (let j: i32 = 0; j < sepLen; j++) {
-        const x: i32 = Porffor.IR.loadU16(Porffor.IR.ptr(this) + (i + j) * 2, 4);
-        if (x != separator.charCodeAt(j)) {
-          match = false;
-          break;
-        }
-      }
-
-      if (match) {
-        if (outLen >= limit) {
-          out.length = outLen;
-          return out;
-        }
-
-        outLen = Porffor.array.fastPush(out, Porffor.callThis(__String_prototype_substring, this, start, i));
-        i += sepLen;
-        start = i;
-        continue;
-      }
-
-      i++;
-    }
-
-    if (outLen < limit) {
-      outLen = Porffor.array.fastPush(out, Porffor.callThis(__String_prototype_substring, this, start, thisLen));
-    }
-  }
-
-  out.length = outLen;
-  return out;
+  return __Porffor_string_splitString(this, separator, limit, out);
 };
 
 export const __ByteString_prototype_split = function (this: bytestring, separator: any, limit: any) {
@@ -1690,72 +1483,7 @@ export const __ByteString_prototype_split = function (this: bytestring, separato
     return out;
   }
 
-  const thisLen: i32 = this.length, sepLen: i32 = separator.length;
-  if (sepLen == 1) {
-    // fast path: single char separator
-    const sepChar: i32 = separator.charCodeAt(0);
-    let start: i32 = 0;
-    for (let i: i32 = 0; i < thisLen; i++) {
-      const x: i32 = Porffor.IR.loadU8(Porffor.IR.ptr(this) + i, 4);
-
-      if (x == sepChar) {
-        if (outLen >= limit) {
-          out.length = outLen;
-          return out;
-        }
-
-        outLen = Porffor.array.fastPush(out, Porffor.callThis(__ByteString_prototype_substring, this, start, i));
-        start = i + 1;
-      }
-    }
-
-    if (outLen < limit) {
-      outLen = Porffor.array.fastPush(out, Porffor.callThis(__ByteString_prototype_substring, this, start, thisLen));
-    }
-  } else if (sepLen == 0) {
-    let produced: i32 = 0;
-    for (let i = 0; i < thisLen && produced < limit; i++) {
-      outLen = Porffor.array.fastPush(out, Porffor.callThis(__ByteString_prototype_substring, this, i, i + 1));
-      produced++;
-    }
-  } else if (sepLen > thisLen) {
-    outLen = Porffor.array.fastPush(out, this);
-  } else {
-    let start: i32 = 0;
-    const maxStart: i32 = thisLen - sepLen;
-    let i: i32 = 0;
-    while (i <= maxStart) {
-      let match: boolean = true;
-      for (let j: i32 = 0; j < sepLen; j++) {
-        const x: i32 = Porffor.IR.loadU8(Porffor.IR.ptr(this) + i + j, 4);
-        if (x != separator.charCodeAt(j)) {
-          match = false;
-          break;
-        }
-      }
-
-      if (match) {
-        if (outLen >= limit) {
-          out.length = outLen;
-          return out;
-        }
-
-        outLen = Porffor.array.fastPush(out, Porffor.callThis(__ByteString_prototype_substring, this, start, i));
-        i += sepLen;
-        start = i;
-        continue;
-      }
-
-      i++;
-    }
-
-    if (outLen < limit) {
-      outLen = Porffor.array.fastPush(out, Porffor.callThis(__ByteString_prototype_substring, this, start, thisLen));
-    }
-  }
-
-  out.length = outLen;
-  return out;
+  return __Porffor_string_splitString(this, separator, limit, out);
 };
 
 

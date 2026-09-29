@@ -540,6 +540,16 @@ export const __Array_prototype_fill = function (this: any[], value: any, _start:
   }
   if (end > len) end = len;
 
+  // a byte array's fill: the first store converts the value, the rest is one memset of its byte
+  if (Porffor.fastOr(Porffor.type(this) == Porffor.TYPES.uint8array, Porffor.type(this) == Porffor.TYPES.uint8clampedarray, Porffor.type(this) == Porffor.TYPES.int8array)) {
+    if (start < end) {
+      this[start] = value;
+      const data: i32 = Porffor.IR.loadI32(this, 4) + 4;
+      Porffor.IR.fill(data + start + 1, Porffor.IR.loadU8(data + start, 0), end - start - 1);
+    }
+    return this;
+  }
+
   for (let i: i32 = start; i < end; i++) {
     this[i] = value;
   }
@@ -558,6 +568,14 @@ export const __Array_prototype_indexOf = function (this: any[], searchElement: a
   } else {
     position = len + position;
     if (position < 0) position = 0;
+  }
+
+  // a byte array's search is a SIMD scan for the byte; a value that is no byte is never there
+  if (Porffor.fastOr(Porffor.type(this) == Porffor.TYPES.uint8array, Porffor.type(this) == Porffor.TYPES.uint8clampedarray)) {
+    if (Porffor.type(searchElement) != Porffor.TYPES.number) return -1;
+    if (!Number.isInteger(searchElement) || searchElement < 0 || searchElement > 255) return -1;
+    const found: i32 = __Porffor_simd_findU8(Porffor.IR.loadI32(this, 4), position, len, searchElement);
+    return found;
   }
 
   const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
@@ -581,6 +599,14 @@ export const __Array_prototype_lastIndexOf = function (this: any[], searchElemen
     position = len + position;
   }
 
+  // a byte array's search is a SIMD scan backwards for the byte
+  if (Porffor.fastOr(Porffor.type(this) == Porffor.TYPES.uint8array, Porffor.type(this) == Porffor.TYPES.uint8clampedarray)) {
+    if (position < 0) return -1;
+    if (Porffor.type(searchElement) != Porffor.TYPES.number) return -1;
+    if (!Number.isInteger(searchElement) || searchElement < 0 || searchElement > 255) return -1;
+    return __Porffor_simd_rfindU8(Porffor.IR.loadI32(this, 4), 0, position + 1, searchElement);
+  }
+
   const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
   for (let i: i32 = position; i >= 0; i--) {
     if (!__Porffor_array_hasIndex(this, i)) continue;
@@ -601,6 +627,14 @@ export const __Array_prototype_includes = function (this: any[], searchElement: 
   } else {
     position = len + position;
     if (position < 0) position = 0;
+  }
+
+  // a byte array's search is a SIMD scan for the byte; a value that is no byte is never there
+  if (Porffor.fastOr(Porffor.type(this) == Porffor.TYPES.uint8array, Porffor.type(this) == Porffor.TYPES.uint8clampedarray)) {
+    if (Porffor.type(searchElement) != Porffor.TYPES.number) return false;
+    if (!Number.isInteger(searchElement) || searchElement < 0 || searchElement > 255) return false;
+    const found: i32 = __Porffor_simd_findU8(Porffor.IR.loadI32(this, 4), position, len, searchElement);
+    return found != -1;
   }
 
   for (let i: i32 = position; i < len; i++) {
@@ -1015,81 +1049,121 @@ export const __Porffor_strlt = (a: string|bytestring, b: string|bytestring) => {
   return aLen < bLen;
 };
 
+// SortCompare(x, y) > 0, x sorting after y. mode 0 calls the comparefn; mode 1 compares the
+// elements' string keys kx and ky (an Array's default); mode 2 orders numbers, -0 before +0
+// and NaN last (a typed array's default)
+export const __Porffor_array_sortAfter = (x: any, y: any, kx: any, ky: any, mode: i32, comparefn: any): boolean => {
+  if (mode == 1) {
+    return __Porffor_string_order(Porffor.IR.ptr(kx), __Porffor_string_wide(kx), Porffor.IR.ptr(ky), __Porffor_string_wide(ky)) > 0;
+  }
+  if (mode == 2) {
+    if (x != x) return y == y;
+    if (y != y) return false;
+    if (x > y) return true;
+    if (x < y) return false;
+    // +0 after -0
+    if (Porffor.fastAnd(Porffor.type(x) == Porffor.TYPES.number, x == 0)) return 1 / x > 0 && 1 / y < 0;
+    return false;
+  }
+  const v: number = comparefn(x, y);
+  return v > 0;
+};
+
+// a stable merge sort of n elements with their keys (moved alongside; the elements again when
+// there are none): runs of 8 by insertion, then merged pairwise through a second buffer
+export const __Porffor_array_mergeSort = (vals: any[], keys: any[], n: i32, mode: i32, comparefn: any): void => {
+  for (let lo: i32 = 0; lo < n; lo += 8) {
+    const hi: i32 = lo + 8 < n ? lo + 8 : n;
+    for (let i: i32 = lo + 1; i < hi; i++) {
+      const x: any = vals[i];
+      const kx: any = keys[i];
+      let j: i32 = i;
+      while (j > lo && __Porffor_array_sortAfter(vals[j - 1], x, keys[j - 1], kx, mode, comparefn)) {
+        vals[j] = vals[j - 1];
+        keys[j] = keys[j - 1];
+        j--;
+      }
+      vals[j] = x;
+      keys[j] = kx;
+    }
+  }
+  if (n <= 8) return;
+
+  let a: any[] = vals, ka: any[] = keys;
+  let b: any[] = Porffor.array.new(n), kb: any[] = Porffor.array.new(n);
+  b.length = n;
+  kb.length = n;
+  for (let width: i32 = 8; width < n; width *= 2) {
+    for (let lo: i32 = 0; lo < n; lo += width * 2) {
+      const mid: i32 = lo + width < n ? lo + width : n;
+      const hi: i32 = lo + width * 2 < n ? lo + width * 2 : n;
+      let i: i32 = lo, j: i32 = mid, k: i32 = lo;
+      while (i < mid && j < hi) {
+        if (__Porffor_array_sortAfter(a[i], a[j], ka[i], ka[j], mode, comparefn)) {
+          b[k] = a[j];
+          kb[k++] = ka[j++];
+        } else {
+          b[k] = a[i];
+          kb[k++] = ka[i++];
+        }
+      }
+      while (i < mid) {
+        b[k] = a[i];
+        kb[k++] = ka[i++];
+      }
+      while (j < hi) {
+        b[k] = a[j];
+        kb[k++] = ka[j++];
+      }
+    }
+    const t: any[] = a, kt: any[] = ka;
+    a = b;
+    ka = kb;
+    b = t;
+    kb = kt;
+  }
+  if (a !== vals) {
+    for (let i: i32 = 0; i < n; i++) vals[i] = a[i];
+  }
+};
+
 // @porf-typed-array
 export const __Array_prototype_sort = function (this: any[], callbackFn: any) {
-  if (callbackFn === undefined) {
-    // default callbackFn, convert to strings and sort by char code
-    callbackFn = (x: any, y: any) => {
-      // 23.1.3.30.2 CompareArrayElements (x, y, comparefn)
-      // https://tc39.es/ecma262/#sec-comparearrayelements
-      // 5. Let xString be ? ToString(x).
-      const xString: any = ecma262.ToString(x);
-
-      // 6. Let yString be ? ToString(y).
-      const yString: any = ecma262.ToString(y);
-
-      // 7. Let xSmaller be ! IsLessThan(xString, yString, true).
-      // 8. If xSmaller is true, return -1𝔽.
-      if (__Porffor_strlt(xString, yString)) return -1;
-
-      // 9. Let ySmaller be ! IsLessThan(yString, xString, true).
-      // 10. If ySmaller is true, return 1𝔽.
-      if (__Porffor_strlt(yString, xString)) return 1;
-
-      // 11. Return +0𝔽.
-      return 0;
-    };
+  // 23.1.3.30 SortIndexedProperties: the present elements, undefined left out and put last,
+  // sorted (stable), written back; holes end up at the end
+  let mode: i32 = 0;
+  if (Porffor.type(callbackFn) == Porffor.TYPES.undefined) {
+    mode = Porffor.type(this) == Porffor.TYPES.array ? 1 : 2;
+  } else if (Porffor.type(callbackFn) != Porffor.TYPES.function) {
+    throw new TypeError('Callback must be a function');
   }
 
-  if (Porffor.type(callbackFn) != Porffor.TYPES.function) throw new TypeError('Callback must be a function');
-
-  // insertion sort, i guess
-  let len: i32 = this.length;
-  if (Porffor.type(this) == Porffor.TYPES.array) {
-    let presentLen: i32 = 0;
-    for (let i: i32 = 0; i < len; i++) {
-      if (!__Porffor_array_has(this, i)) continue;
-      this[presentLen++] = this[i];
-    }
-    for (let i: i32 = presentLen; i < len; i++) __Porffor_array_delete(this, i);
-    len = presentLen;
-  }
+  const len: i32 = this.length;
+  const plain: boolean = Porffor.type(this) == Porffor.TYPES.array;
+  const vals: any[] = Porffor.array.new(len);
+  const keys: any[] = Porffor.array.new(len);
+  let n: i32 = 0;
+  let undefs: i32 = 0;
   for (let i: i32 = 0; i < len; i++) {
+    if (plain && !__Porffor_array_has(this, i)) continue;
     const x: any = this[i];
-    let j: i32 = i;
-    while (j > 0) {
-      const y: any = this[j - 1];
-
-      // 23.1.3.30.2 CompareArrayElements (x, y, comparefn)
-      // https://tc39.es/ecma262/#sec-comparearrayelements
-      let v: number;
-
-      // 1. If x and y are both undefined, return +0𝔽.
-      if (Porffor.type(x) == Porffor.TYPES.undefined && Porffor.type(y) == Porffor.TYPES.undefined) v = 0;
-        // 2. If x is undefined, return 1𝔽.
-        else if (Porffor.type(x) == Porffor.TYPES.undefined) v = 1;
-        // 3. If y is undefined, return -1𝔽.
-        else if (Porffor.type(y) == Porffor.TYPES.undefined) v = -1;
-        else {
-          // 4. If comparefn is not undefined, then
-          // a. Let v be ? ToNumber(? Call(comparefn, undefined, « x, y »)).
-          // perf: ToNumber unneeded as we just check >= 0
-          v = callbackFn(x, y);
-
-          // b. If v is NaN, return +0𝔽.
-          // perf: unneeded as we just check >= 0
-          // if (Number.isNaN(v)) v = 0;
-
-          // c. Return v.
-        }
-
-      if (v >= 0) break;
-      this[j--] = y;
+    if (Porffor.type(x) == Porffor.TYPES.undefined) {
+      undefs++;
+      continue;
     }
-
-    this[j] = x;
+    Porffor.array.fastPush(vals, x);
+    // an Array's default order compares ToString of each element, taken once
+    n = Porffor.array.fastPush(keys, mode == 1 ? ecma262.ToString(x) : x);
   }
 
+  __Porffor_array_mergeSort(vals, keys, n, mode, callbackFn);
+
+  let i: i32 = 0;
+  for (; i < n; i++) this[i] = vals[i];
+  for (; i < n + undefs; i++) this[i] = undefined;
+  if (plain) {
+    for (; i < len; i++) __Porffor_array_delete(this, i);
+  }
   return this;
 };
 

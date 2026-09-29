@@ -92,11 +92,7 @@ export const __Porffor_json_putString = (off: i32, str: any): i32 => {
     let i: i32 = 0;
     while (i < len) {
       const runStart: i32 = i;
-      while (i < len) {
-        const c: i32 = Porffor.IR.loadU8(p + i, 4);
-        if (Porffor.fastOr(c < 0x20, c == 0x22, c == 0x5c)) break;
-        i++;
-      }
+      i = __Porffor_simd_jsonU8(p, i, len);
       if (i > runStart) {
         __Porffor_json_ensure(off, i - runStart);
         Porffor.IR.copy(__Porffor_json_buf + 4 + off, p + 4 + runStart, i - runStart);
@@ -109,6 +105,15 @@ export const __Porffor_json_putString = (off: i32, str: any): i32 => {
 
   // UTF-16
   for (let i: i32 = 0; i < len; i++) {
+    // a run of units 0x20..0xff that need no escape, narrowed to bytes in one go
+    const run: i32 = __Porffor_simd_jsonU16(p, i, len);
+    if (run > i) {
+      __Porffor_json_ensure(off, run - i);
+      __Porffor_simd_narrow(__Porffor_json_buf, off, p, i, run - i);
+      off += run - i;
+      i = run - 1;
+      continue;
+    }
     const c: i32 = Porffor.IR.loadU16(p + i * 2, 4);
     if (Porffor.fastOr(c < 0x20, c == 0x22, c == 0x5c)) {
       off = __Porffor_json_putEscaped(off, c);
@@ -546,7 +551,7 @@ export const __Porffor_json_plainString = (base: i32, wide: boolean, start: i32,
   const out: bytestring = Porffor.malloc(6 + n);
   if (wide) {
     const op: i32 = Porffor.IR.ptr(out);
-    for (let i: i32 = 0; i < n; i++) Porffor.IR.storeU8(op + i, 4, Porffor.IR.loadU16(base + (start + i) * 2, 4));
+    __Porffor_simd_narrow(op, 0, base, start, n);
   } else Porffor.IR.copy(Porffor.IR.ptr(out) + 4, base + 4 + start, n);
   out.length = n;
   if (Porffor.fastAnd(isKey, n > 0, n <= 24)) __Porffor_json_keys[slot] = out;
@@ -560,6 +565,10 @@ export const __Porffor_json_parseString = (base: i32, wide: boolean, posPtr: i32
   let escaped: boolean = false;
   let maxUnit: i32 = 0;
   while (true) {
+    // to the next unit that ends a plain run (a quote, a backslash, a control character; two-byte,
+    // also one above 0xff): a SIMD scan (__Porffor_simd_json*). maxUnit only ever decides whether
+    // the string needs two bytes a unit, so the units skipped here (0x20..0xff) need no tracking
+    pos = wide ? __Porffor_simd_jsonU16(base, pos, len) : __Porffor_simd_jsonU8(base, pos, len);
     if (pos >= len) throw new SyntaxError('Unterminated string');
     const ch: i32 = __Porffor_json_at(base, wide, pos);
     if (ch == 34) break;

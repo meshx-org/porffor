@@ -282,6 +282,12 @@ export const __Porffor_promise_runOne = (reaction: i32): void => {
   const value: any = __Porffor_promise_reactionValue(reaction);
   const payload: i32 = __Porffor_promise_reactionPayload(reaction);
 
+  // an async generator's await (13 fulfilled, 14 rejected): the generator runs on with it
+  if (Porffor.fastOr(kind == 13, kind == 14)) {
+    __Porffor_AsyncGenerator_run(handler, value, kind - 13, outPromise);
+    return;
+  }
+
   if (kind >= 3) {
     __Porffor_promise_aggSettle(kind, outPromise, payload, value);
     return;

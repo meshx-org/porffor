@@ -1,4 +1,4 @@
-const onByDefault = [ 'indirectCalls', 'optUnused', 'optTypes', 'ctHash', 'closures', 'lazyObjects', 'ic' ];
+const onByDefault = [ 'indirectCalls', 'optUnused', 'optTypes', 'ctHash', 'closures', 'lazyObjects', 'ic', 'narrow' ];
 
 const nameToKey = x => (x === 'secure' ? 'safe' : x).replace(/[a-z]\-[a-z]/g, y => `${y[0]}${y[2].toUpperCase()}`);
 

@@ -42,13 +42,29 @@ export const __Porffor_AsyncGenerator_run = (gen: __Porffor_AsyncGenerator, valu
     return;
   }
   if (!done && Porffor.coroutine.awaiting(gen)) {
-    Porffor.callThis(__Promise_prototype_then, Porffor.coroutine.value(gen),
-      (v: any): void => {
-        __Porffor_AsyncGenerator_run(gen, v, 0 as i32, promise);
-      },
-      (e: any): void => {
-        __Porffor_AsyncGenerator_run(gen, e, 1 as i32, promise);
-      });
+    // resumed by a reaction of its own (kind 13 fulfilled, 14 rejected: __Porffor_promise_runOne
+    // runs gen on with the value), no closures or promise for then: an operand that is no
+    // promise as the reaction of one already fulfilled with it, from a microtask all the same
+    let awaited: any = Porffor.coroutine.value(gen);
+    if (Porffor.type(awaited) != Porffor.TYPES.promise) {
+      // a primitive cannot be a thenable: its reaction straight away
+      if (Porffor.fastAnd(typeof awaited != 'object', typeof awaited != 'function')) {
+        __Porffor_promise_enqueueReaction(__Porffor_promise_newReaction(gen, promise, 13), awaited);
+        return;
+      }
+      // an object may be one: a promise resolved with it (its then called from a job)
+      const resolved: Promise = __Porffor_promise_create();
+      __Porffor_promise_resolve(awaited, resolved);
+      awaited = resolved;
+    }
+    const state: i32 = __Porffor_promise_state(awaited);
+    __Porffor_promise_setHandled(awaited);
+    if (state == 0) {
+      __Porffor_promise_appendFulfillReaction(awaited, __Porffor_promise_newReaction(gen, promise, 13));
+      __Porffor_promise_appendRejectReaction(awaited, __Porffor_promise_newReaction(gen, promise, 14));
+    } else {
+      __Porffor_promise_enqueueReaction(__Porffor_promise_newReaction(gen, promise, state == 1 ? 13 : 14), __Porffor_promise_result(awaited));
+    }
     return;
   }
   __Porffor_promise_resolve(done, promise);

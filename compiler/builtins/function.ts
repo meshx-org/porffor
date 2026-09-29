@@ -23,6 +23,18 @@ export const __Function_prototype_toString = function (this: Function) {
 export const __Function_prototype_toLocaleString = function (this: Function) { return Porffor.callThis(__Function_prototype_toString, this); };
 
 export const __Function_prototype_apply = function (this: Function, thisArg: any, argsArray: any) {
+  // an array (arguments included) with no holes is passed as it is: the call reads its
+  // entries as the arguments, and the callee's own arguments object is a new array either
+  // way (f.apply(this, arguments) copied every call's arguments). A hole reads through the
+  // prototype chain, which the copy does, as for any other array-like.
+  if (Porffor.type(argsArray) == Porffor.TYPES.array) {
+    let dense: i32 = 0;
+    Porffor.c`dense = porf_arr_dense((u32)argsArray.val);`;
+    if (dense) return Porffor.call(this, argsArray, thisArg, null);
+  }
+  // CreateListFromArrayLike: anything but null, undefined or an object is refused
+  if (argsArray != null && typeof argsArray != 'object' && typeof argsArray != 'function')
+    throw new TypeError('Function.prototype.apply: the arguments list must be an object');
   return Porffor.call(this, Array.from(argsArray ?? []) as any[], thisArg, null);
 };
 

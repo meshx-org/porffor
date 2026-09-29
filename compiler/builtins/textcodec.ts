@@ -32,14 +32,27 @@ export const __Porffor_utf8_length = (s: any): i32 => {
   const len: i32 = s.length;
   const ptr: i32 = Porffor.IR.ptr(s);
   let n: i32 = 0;
+  // ASCII runs counted by a SIMD scan (__Porffor_simd_ascii*), one byte each
   if (Porffor.type(s) == Porffor.TYPES.bytestring) {
-    for (let i: i32 = 0; i < len; i++) n += Porffor.IR.loadU8(ptr + i, 4) < 0x80 ? 1 : 2;
+    let at: i32 = 0;
+    while (at < len) {
+      const run: i32 = __Porffor_simd_asciiU8(ptr, at, len);
+      n += run - at;
+      at = run;
+      if (at < len) {
+        n += 2;
+        at++;
+      }
+    }
     return n;
   }
   for (let i: i32 = 0; i < len; i++) {
     const c: i32 = Porffor.IR.loadU16(ptr + i * 2, 4);
-    if (c < 0x80) n += 1;
-      else if (c < 0x800) n += 2;
+    if (c < 0x80) {
+      const run: i32 = __Porffor_simd_asciiU16(ptr, i, len);
+      n += run - i;
+      i = run - 1;
+    } else if (c < 0x800) n += 2;
       else if (c >= 0xd800 && c <= 0xdbff && i + 1 < len) {
         const d: i32 = Porffor.IR.loadU16(ptr + i * 2 + 2, 4);
         if (d >= 0xdc00 && d <= 0xdfff) {
@@ -62,8 +75,13 @@ export const __Porffor_utf8_write = (s: any, dst: i32, cap: i32): number => {
     for (; i < len; i++) {
       const c: i32 = Porffor.IR.loadU8(ptr + i, 4);
       if (c < 0x80) {
-        if (w + 1 > cap) break;
-        Porffor.IR.storeU8(dst + w++, 4, c);
+        // the whole ASCII run in one copy, as much of it as fits
+        let run: i32 = __Porffor_simd_asciiU8(ptr, i, len) - i;
+        if (run > cap - w) run = cap - w;
+        if (run == 0) break;
+        Porffor.IR.copy(dst + 4 + w, ptr + 4 + i, run);
+        w += run;
+        i += run - 1;
       } else {
         if (w + 2 > cap) break;
         Porffor.IR.storeU8(dst + w++, 4, 0xc0 | (c >> 6));
@@ -74,6 +92,16 @@ export const __Porffor_utf8_write = (s: any, dst: i32, cap: i32): number => {
   }
   while (i < len) {
     let c: i32 = Porffor.IR.loadU16(ptr + i * 2, 4);
+    if (c < 0x80) {
+      // the whole ASCII run narrowed to bytes in one go, as much of it as fits
+      let run: i32 = __Porffor_simd_asciiU16(ptr, i, len) - i;
+      if (run > cap - w) run = cap - w;
+      if (run == 0) break;
+      __Porffor_simd_narrow(dst, w, ptr, i, run);
+      w += run;
+      i += run;
+      continue;
+    }
     let units: i32 = 1;
     if (c >= 0xd800 && c <= 0xdfff) {
       c = 0xfffd;
@@ -241,6 +269,16 @@ export const __TextDecoder_prototype_decode = function (this: TextDecoder, input
     } else {
       const b: i32 = Porffor.IR.loadU8(base + i, 4);
       if (needed == 0) {
+        if (b <= 0x7f) {
+          // the whole ASCII run widened in one go (ASCII is never a BOM: it only settles that)
+          const run: i32 = __Porffor_simd_asciiU8(base, i, len);
+          __Porffor_simd_widen(tmpPtr, n, base, i, run - i);
+          n += run - i;
+          i = run;
+          bomSeen = true;
+          if (maxUnit < 0x7f) maxUnit = 0x7f;
+          continue;
+        }
         i++;
         if (b <= 0x7f) out = b;
           else if (b >= 0xc2 && b <= 0xdf) {
@@ -327,7 +365,7 @@ export const __TextDecoder_prototype_decode = function (this: TextDecoder, input
   }
   const narrow: bytestring = Porffor.malloc(6 + n);
   const narrowPtr: i32 = Porffor.IR.ptr(narrow);
-  for (let j: i32 = 0; j < n; j++) Porffor.IR.storeU8(narrowPtr + j, 4, Porffor.IR.loadU16(tmpPtr + j * 2, 4));
+  __Porffor_simd_narrow(narrowPtr, 0, tmpPtr, 0, n);
   narrow.length = n;
   return narrow;
 };

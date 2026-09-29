@@ -56,6 +56,10 @@ const help = () => {
       'ropes': 'Build long string concatenations as ropes, flattened when read (s += x in a loop is linear)',
       'switch-hash': 'Switch over string cases by hash: a case that does not match is an integer compare',
       'dtoa': 'How numbers become their shortest digits: dragonbox (default), ryu, grisu3 or libc',
+      'escape': 'Escape analysis: an object literal that never leaves its function becomes locals, never allocated (--escape-log lists them)',
+      'inline': 'Inline calls returning a fresh object literal where escape analysis then removes it (turns --escape on; --inline-log lists them)',
+      'devirtualize=N': 'Call a method directly (guarded by a check of the function read) when at most N functions are defined under its name (--devirtualize-log counts the call sites)',
+      'no-narrow': 'Turn off narrowing (a check like typeof x === \'number\' typing x where it holds)',
       'profile-compiler': 'Log general compiler performance (on by default when compiling to a file)',
       'jN': 'Parallel C compile jobs for module builds (default: CPU count)',
     })) {

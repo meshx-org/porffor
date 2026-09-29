@@ -197,7 +197,10 @@ export default (code, module = Prefs.module, opts = {}) => {
       if (logProgress) progressDone(`compiled ${changed.length}/${objects.length} units (using ${cc.split(' ')[0]})`, t5);
       return objects;
     };
-    const ccUnits = [ ...compiler, '-c', ...compileOnlyArgs ].join(' ');
+    // C only: a call before its declaration is an error, as it is to tcc (and C99): clang and
+    // gcc would otherwise take it as returning int and build a wrong program
+    const cOnlyArgs = isTinyCC ? [] : [ '-Werror=implicit-function-declaration' ];
+    const ccUnits = [ ...compiler, '-c', ...compileOnlyArgs, ...cOnlyArgs ].join(' ');
 
     const compileNativeFetch = () => {
       const uwsDir = uwebsockets.ensureUWebSockets();
@@ -245,7 +248,7 @@ export default (code, module = Prefs.module, opts = {}) => {
       const args = [
         ...compiler,
         ...(Prefs.musl ? [ '-static' ] : []),
-        ...(objects ?? [ '-xc', '-', ...compileOnlyArgs ]),
+        ...(objects ?? [ '-xc', '-', ...compileOnlyArgs, ...cOnlyArgs ]),
         '-o', outFile ?? (process.platform === 'win32' ? 'out.exe' : 'out'), // set path for output
         '-lm', // link math.h
         ...(objects ? [ ...compilerArgs, `-O${optLevel}` ] : []),

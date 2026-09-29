@@ -368,9 +368,9 @@ export const BuiltinVars = ({ builtinFuncs }) => {
           // whole (X.prototype: then it brings the function in)
           const f = p.func ?? p.get;
           const gated = f && !p.always && Prefs.lazyObjects ? () => whenFact([ [ 'hasFunc', f ], [ 'full', getName ] ], emit) : emit;
-          if (p.demand) whenFact([ [ 'member', p.demand ] ], gated);
-            else if (p.unless) whenFact([ [ 'program', p.unless ] ], () => {}, gated);
-            else gated();
+          const unlessGated = p.unless ? () => whenFact([ [ 'program', p.unless ] ], () => {}, gated) : gated;
+          if (p.demand) whenFact([ [ 'member', p.demand ] ], unlessGated);
+            else unlessGated();
         });
 
         out.push(BlockStmt(adds));
@@ -737,7 +737,7 @@ return porf_box_num(pow(baseNum, exponentNum));`, false)
     body: [ RawC(`u32 len = *(u32*)(MEM + src);
 u32 dst = porf_alloc(6u + len * 2u, ${TYPES.string});
 *(u32*)(MEM + dst) = len;
-for (u32 i = 0; i < len; i++) *(u16*)(MEM + dst + 4u + i * 2u) = *(u8*)(MEM + src + 4u + i);
+porf_simd_widen(dst, 0, src, 0, (i32)len);
 return porf_box((f64)dst, ${TYPES.string});`, false) ]
   };
 
@@ -882,6 +882,67 @@ return sign * (i64)((((u64)*(u32*)(MEM + ptr + 4)) << 32) + (u64)*(u32*)(MEM + p
     returnType: TYPES.undefined,
     body: [ RawC('porf_random_fill((u8*)(MEM + (u32)ptr), (u32)len);', false) ]
   };
+
+  // SIMD scans and copies (render.js porf_simd_*; scalar where the target has no SIMD). A base is a
+  // data pointer (units at base + 4), indices count units from it
+  const i32Param = name => ({ name, type: T.i32 });
+  const simdScan = (fn, params) => ({
+    params: params.map(i32Param),
+    retType: T.i32,
+    returnType: TYPES.number,
+    body: [ RawC(`return ${fn}(${params.map(x => x === 'base' || x === 'c' || x === 'set' ? `(u32)${x}` : x).join(', ')});`, false) ]
+  });
+  // the first index in [from, to) holding c, or -1
+  _.__Porffor_simd_findU8 = simdScan('porf_simd_find_u8', [ 'base', 'from', 'to', 'c' ]);
+  _.__Porffor_simd_findU16 = simdScan('porf_simd_find_u16', [ 'base', 'from', 'to', 'c' ]);
+  // the last index in [from, to) holding c, or -1
+  _.__Porffor_simd_rfindU8 = simdScan('porf_simd_rfind_u8', [ 'base', 'from', 'to', 'c' ]);
+  // the first index in [from, to) whose unit is in the 256-bit set at set, or -1
+  _.__Porffor_simd_findSetU8 = simdScan('porf_simd_find_set_u8', [ 'base', 'from', 'to', 'set' ]);
+  _.__Porffor_simd_findSetU16 = simdScan('porf_simd_find_set_u16', [ 'base', 'from', 'to', 'set' ]);
+  // the first index in [from, to) whose unit is not in the set, or to
+  _.__Porffor_simd_spanSetU8 = simdScan('porf_simd_span_set_u8', [ 'base', 'from', 'to', 'set' ]);
+  _.__Porffor_simd_spanSetU16 = simdScan('porf_simd_span_set_u16', [ 'base', 'from', 'to', 'set' ]);
+  // the first index in [from, to) that is not ASCII, or to
+  _.__Porffor_simd_asciiU8 = simdScan('porf_simd_ascii_u8', [ 'base', 'from', 'to' ]);
+  _.__Porffor_simd_asciiU16 = simdScan('porf_simd_ascii_u16', [ 'base', 'from', 'to' ]);
+  // the first index in [from, to) that JSON escapes (and, two-byte, above 0xff), or to
+  _.__Porffor_simd_jsonU8 = simdScan('porf_simd_json_u8', [ 'base', 'from', 'to' ]);
+  _.__Porffor_simd_jsonU16 = simdScan('porf_simd_json_u16', [ 'base', 'from', 'to' ]);
+  const simdCopy = fn => ({
+    params: [ 'dst', 'di', 'src', 'si', 'n' ].map(i32Param),
+    retType: T.none,
+    returnType: TYPES.undefined,
+    body: [ RawC(`${fn}((u32)dst, di, (u32)src, si, n);`, false) ]
+  });
+  // n bytes to two-byte units, and two-byte units (below 0x100) to bytes
+  _.__Porffor_simd_widen = simdCopy('porf_simd_widen');
+  _.__Porffor_simd_narrow = simdCopy('porf_simd_narrow');
+
+  // base64 and hex (render.js porf_b64_* / porf_hex_*): data pointers, lengths in units
+  const cHelper = (fn, params, ret = true) => ({
+    params: params.map(i32Param),
+    retType: ret ? T.i32 : T.none,
+    returnType: ret ? TYPES.number : TYPES.undefined,
+    body: [ RawC(`${ret ? 'return ' : ''}${fn}(${params.join(', ')});`, false) ]
+  });
+  // the chars written
+  _.__Porffor_base64_encode = cHelper('porf_b64_encode', [ 'src', 'n', 'dst', 'url', 'pad' ]);
+  // the bytes written, or -1 - written on a SyntaxError; __Porffor_base64_read gives the units read
+  _.__Porffor_base64_decode = cHelper('porf_b64_decode', [ 'src', 'two', 'len', 'url', 'lch', 'dst', 'max' ]);
+  _.__Porffor_base64_read = { params: [], retType: T.i32, returnType: TYPES.number, body: [ RawC('return porf_b64_read;', false) ] };
+  _.__Porffor_hex_encode = cHelper('porf_hex_encode', [ 'src', 'n', 'dst' ], false);
+  // the bytes written before the first pair that is not two hex digits
+  _.__Porffor_hex_decode = cHelper('porf_hex_decode', [ 'src', 'two', 'n', 'dst' ]);
+
+  // string search and order (render.js porf_str_*): data pointers, w* 1 for two-byte units
+  // the first index from at (last index up to at, for rfind) where the needle occurs, or -1
+  _.__Porffor_string_find = cHelper('porf_str_find', [ 'hay', 'wh', 'len', 'ndl', 'wn', 'n', 'at' ]);
+  _.__Porffor_string_rfind = cHelper('porf_str_rfind', [ 'hay', 'wh', 'len', 'ndl', 'wn', 'n', 'at' ]);
+  // the first of n units where a from ai and b from bi differ, or n
+  _.__Porffor_string_mismatch = cHelper('porf_str_mismatch', [ 'a', 'wa', 'ai', 'b', 'wb', 'bi', 'n' ]);
+  // -1, 0 or 1 by UTF-16 code units
+  _.__Porffor_string_order = cHelper('porf_str_order', [ 'a', 'wa', 'b', 'wb' ]);
 
   _.__Porffor_gc = {
     params: [],

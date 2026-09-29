@@ -20,6 +20,16 @@
 - [ ] Profile react_ssr for a possible regression from closure environment snapshots in direct
       closure calls
 - [ ] Generate every argument of a type-dispatched method call once, not per branch
+- [ ] A `throw` lexically inside a `try` of the same function: jump to the catch with the value,
+      no longjmp. A throw costs ~20 ns native, ~0.19 µs in V8's wasm and ~2.8 µs in wasmtime
+      (its unwinding, whatever the collector or backtrace setting); entering a `try` costs
+      nothing extra anywhere
+- [ ] Throws across calls without engine exceptions: a pending-exception result each call site
+      checks (as QuickJS does), so wasmtime pays no unwinding and `throw` works without wasm EH.
+      Overlaps the setjmp-free `try` stackless coroutines need
+- [ ] Standalone wasm collects nothing under `PORF_GC_DEFER` (no safe point until `main`
+      returns; a component collects at each export). Safe points (loop back-edges, allocating
+      calls) with the live pointer-holding locals spilled to a shadow frame the collector scans
 
 ## test262
 

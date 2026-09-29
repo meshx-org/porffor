@@ -1736,13 +1736,19 @@ const parseNew = () => {
 
   const calleeStart = tokStart;
   if (tokKind === T_IMPORT && peekToken()[0] === T_LPAREN) raise(tokStart, 'Cannot use new with import()');
-  const callee = parseSubscripts(parseExprAtom(null, false, true), calleeStart, true, false);
+  let callee = parseSubscripts(parseExprAtom(null, false, true), calleeStart, true, false);
+  // new Map<K, V>(): the callee is parsed without calls, so its type arguments come back
+  // wrapped around it; they belong to the new, as they do to a call (f<T>())
+  let typeParameters;
+  if (callee.type === 'TSInstantiationExpression') ({ expression: callee, typeParameters } = callee);
   let args = [];
   if (tokKind === T_LPAREN) {
     next();
     args = parseExprList(T_RPAREN, true, false);
   }
-  return { type: 'NewExpression', start, end: prevEnd, callee, arguments: args };
+  return typeParameters
+    ? { type: 'NewExpression', start, end: prevEnd, callee, arguments: args, typeParameters }
+    : { type: 'NewExpression', start, end: prevEnd, callee, arguments: args };
 };
 
 // typeMode: parse types in the \${} slots (TS template literal types)

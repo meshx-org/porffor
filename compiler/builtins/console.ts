@@ -435,7 +435,7 @@ export const __console_info = (...args: any[]): void => {
 
 // to stderr, as in Node and SpiderMonkey (stdout flushed first, so the order holds)
 export const __console_warn = (...args: any[]): void => {
-  Porffor.c`fflush(stdout); porf_print_out = stderr;`;
+  Porffor.c`fflush(PORF_CONSOLE_OUT); porf_print_out = PORF_CONSOLE_ERR;`;
   const argLen: i32 = args.length - 1;
   for (let i: i32 = 0; i <= argLen; i++) {
     __Porffor_consoleIndent();
@@ -445,12 +445,12 @@ export const __console_warn = (...args: any[]): void => {
   }
 
   Porffor.printStatic('\n');
-  Porffor.c`fflush(stderr); porf_print_out = NULL;`;
+  Porffor.c`fflush(PORF_CONSOLE_ERR); porf_print_out = NULL;`;
 };
 
 // to stderr, as in Node and SpiderMonkey (stdout flushed first, so the order holds)
 export const __console_error = (...args: any[]): void => {
-  Porffor.c`fflush(stdout); porf_print_out = stderr;`;
+  Porffor.c`fflush(PORF_CONSOLE_OUT); porf_print_out = PORF_CONSOLE_ERR;`;
   const argLen: i32 = args.length - 1;
   for (let i: i32 = 0; i <= argLen; i++) {
     __Porffor_consoleIndent();
@@ -460,7 +460,7 @@ export const __console_error = (...args: any[]): void => {
   }
 
   Porffor.printStatic('\n');
-  Porffor.c`fflush(stderr); porf_print_out = NULL;`;
+  Porffor.c`fflush(PORF_CONSOLE_ERR); porf_print_out = NULL;`;
 };
 
 export const __console_assert = (assertion: any, ...args: any[]): void => {

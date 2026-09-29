@@ -3772,13 +3772,36 @@ export const __Porffor_regex_compileBlob = (pattern: any, flags: i32): i32 => {
       } else if (bits > 0 || __Porffor_regex_fsWide) prefKind = 3;
     }
 
+  // a pattern that is one class, bare or under a greedy + (/[aeiou]/, /\d+/), is matched without
+  // the bytecode: its first-unit set is its set, found and spanned by SIMD scans (blob byte 7:
+  // 1 one unit, 2 a run). A class with members above 0xff needs the bytecode on two-byte input
+  let fast: i32 = 0;
+  let top: i32 = root;
+  while (true) {
+    const k: i32 = __Porffor_regex_nKind(top);
+    if (k != 8 && k != 9) break;
+    const c: i32 = __Porffor_regex_nChild(top);
+    if (c == -1) break;
+    if (__Porffor_regex_nSib(c) != -1) break;
+    top = c;
+  }
+  if (!__Porffor_regex_fsUnknown) {
+    if (__Porffor_regex_nKind(top) == 2) {
+      if (__Porffor_regex_nD2(top) > 0) fast = 1;
+    } else if (__Porffor_regex_nKind(top) == 10) {
+      const atom: i32 = __Porffor_regex_nChild(top);
+      if (__Porffor_regex_nAux(top) == 1 && __Porffor_regex_nD1(top) == 1 && __Porffor_regex_nD2(top) == -1)
+        if (__Porffor_regex_nKind(atom) == 2) if (__Porffor_regex_nD2(atom) > 0) fast = 2;
+    }
+  }
+
   const blob: i32 = Porffor.malloc(40 + __Porffor_regex_bcTop);
   Porffor.IR.storeU16(blob, 0, minLen > 0xFFFF ? 0xFFFF : minLen);
   Porffor.IR.storeU8(blob, 2, prefKind);
   Porffor.IR.storeU8(blob, 3, __Porffor_regex_fsWide ? 1 : 0);
   Porffor.IR.storeU16(blob, 4, prefUnit);
   Porffor.IR.storeU8(blob, 6, __Porffor_regex_eCounters);
-  Porffor.IR.storeU8(blob, 7, 0);
+  Porffor.IR.storeU8(blob, 7, fast);
   Porffor.IR.copy(blob + 8, Porffor.IR.ptr(__Porffor_regex_fsBitmap), 32);
   Porffor.IR.copy(blob + 40, Porffor.IR.ptr(__Porffor_regex_bufBc), __Porffor_regex_bcTop);
 
@@ -3947,6 +3970,15 @@ export const __Porffor_regex_interpretFrom = (regexp: RegExp, input: any, mode: 
     if (sticky) {
       matchEnd = __Porffor_regex_attempt(bc, inputPtr, inputLen, isU16, cpMode, flags, nCaps, nSlots, pos);
       if (matchEnd != -1) __Porffor_regex_mStart = pos;
+    } else if (Porffor.IR.loadU8(blob, 7) != 0 && (!isU16 || !wideStart)) {
+      // one class (blob byte 7): the first unit in its set, and a + run to the first unit not in it
+      pos = isU16 ? __Porffor_simd_findSetU16(inputPtr, pos, inputLen, blob + 8) : __Porffor_simd_findSetU8(inputPtr, pos, inputLen, blob + 8);
+      if (pos >= 0) {
+        __Porffor_regex_mStart = pos;
+        matchEnd = pos + 1;
+        if (Porffor.IR.loadU8(blob, 7) == 2)
+          matchEnd = isU16 ? __Porffor_simd_spanSetU16(inputPtr, pos + 1, inputLen, blob + 8) : __Porffor_simd_spanSetU8(inputPtr, pos + 1, inputLen, blob + 8);
+      }
     } else if (prefKind == 1 && !mFlag) {
       // anchored patterns can only match at 0
       if (pos == 0) {
@@ -3959,33 +3991,13 @@ export const __Porffor_regex_interpretFrom = (regexp: RegExp, input: any, mode: 
       while (pos <= bound) {
         // skip positions that can't start a match
         if (scanKind == 2) {
-          if (isU16) {
-            while (pos <= bound && Porffor.IR.loadU16(inputPtr + pos * 2, 4) != prefUnit) pos += 1;
-          } else {
-            const bcast: i32 = 0x01010101 * prefUnit;
-            while (pos + 4 <= bound + 1) {
-              const v: i32 = Porffor.IR.loadU32(inputPtr + pos, 4) ^ bcast;
-              if (((v - 0x01010101) & ((v & 0x80808080) ^ 0x80808080)) != 0) break;
-              pos += 4;
-            }
-            while (pos <= bound && Porffor.IR.loadU8(inputPtr + pos, 4) != prefUnit) pos += 1;
-          }
-          if (pos > bound) break;
+          // the pattern's first unit: a SIMD scan (__Porffor_simd_find*)
+          pos = isU16 ? __Porffor_simd_findU16(inputPtr, pos, bound + 1, prefUnit) : __Porffor_simd_findU8(inputPtr, pos, bound + 1, prefUnit);
+          if (pos < 0) break;
         } else if (scanKind == 3) {
-          if (isU16) {
-            while (pos <= bound) {
-              const u: i32 = Porffor.IR.loadU16(inputPtr + pos * 2, 4);
-              if (u <= 255 && (Porffor.IR.loadU8(blob + 8 + (u >> 3), 0) & (1 << (u & 7))) != 0) break;
-              pos += 1;
-            }
-          } else {
-            while (pos <= bound) {
-              const u: i32 = Porffor.IR.loadU8(inputPtr + pos, 4);
-              if ((Porffor.IR.loadU8(blob + 8 + (u >> 3), 0) & (1 << (u & 7))) != 0) break;
-              pos += 1;
-            }
-          }
-          if (pos > bound) break;
+          // a unit in the pattern's first-unit set (the bitmap at blob + 8): a SIMD scan
+          pos = isU16 ? __Porffor_simd_findSetU16(inputPtr, pos, bound + 1, blob + 8) : __Porffor_simd_findSetU8(inputPtr, pos, bound + 1, blob + 8);
+          if (pos < 0) break;
         } else if (scanKind == 1) {
           // m + ^: only try right after line terminators
           if (pos != 0) {

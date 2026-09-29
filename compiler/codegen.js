@@ -12,6 +12,8 @@ import { BuiltinFuncs, BuiltinVars, fullPrototypes } from './builtins.js';
 import { memberIndex, TYPED_ARRAY_KINDS } from './builtinDescriptors.js';
 import { TYPES, TYPE_FLAGS, TYPE_NAMES } from './types.js';
 import semantic, { knownValue, unknownValue } from './semantic.js';
+import escapeAnalysis from './escape.js';
+import inlineCalls from './inline.js';
 import parse from './parse.js';
 import temporalPolyfillSource from './temporal.js';
 import './prefs.js';
@@ -533,8 +535,10 @@ const generate = (scope, decl, name = undefined, valueUnused = false) => {
         setLocalWithType(scope, name, global, materializeFunctionValue(scope, func), false, TYPES.function);
       }
       const capture = scope.closureOwnLocals?.[decl.id?.name];
+      // never reassigned, the binding is this function: read by name, a global of the same
+      // name would win over it
       if (capture && closureBindingNeedsSlot(capture))
-        mirrorToClosureEnv(scope, decl.id.name, closureLocalReadNode(decl.id.name, false));
+        mirrorToClosureEnv(scope, decl.id.name, { ...closureLocalReadNode(decl.id.name, false), _funcValue: decl._writes ? null : func });
       return out;
     }
 
@@ -872,6 +876,11 @@ const lookup = (scope, name, allowImplicitArguments = true, markFunctionReferenc
   // the func referencing itself under another name, the static record keeps identity
   if (scope.name === name) return materializeFunctionValue(scope, funcByIndex(scope.index));
 
+  // the global object inherits Object.prototype: a bare toString (hasOwnProperty, valueOf...)
+  // nothing else defines is its method
+  if (!name.startsWith('__') && `__Object_prototype_${name}` in builtinFuncs)
+    return materializeFunctionValue(scope, includeBuiltin(scope, `__Object_prototype_${name}`), markFunctionReferenced);
+
   return null;
 };
 
@@ -889,6 +898,9 @@ const generateIdent = (scope, decl) => {
     if (!scope.closureAware) throw new Error(`missing closure env in ${scope.name}`);
     return currentClosureEnv(scope);
   }
+
+  // a function declaration's own value (closureLocalReadNode for a declaration)
+  if (decl._funcValue) return materializeFunctionValue(scope, decl._funcValue, decl._markFunctionReferenced !== false);
 
   let closureOwner = null;
   if (decl._closureFunc && !(decl.name in scope.locals)) closureOwner = decl._closureFunc;
@@ -909,15 +921,26 @@ const generateIdent = (scope, decl) => {
     ?? unresolvedName(scope, unhackName(decl.name));
 };
 
-// a name nothing defines: a ReferenceError where it is read. PORF_LIST_UNDEFINED=1 lists
-// them all at the end of the compile (what globals a program expects that are not there)
+// a name nothing defines: the global object's property of that name, which the program may
+// have made at run time (UMD's `global.THREE = factory()`), else a ReferenceError where it is
+// read. PORF_LIST_UNDEFINED=1 lists them all at the end of the compile (what globals a program
+// expects that are not there)
 const unresolvedNames = new Set();
 const unresolvedName = (scope, name) => {
   if (process.env.PORF_LIST_UNDEFINED && !globalThis.precompile && !unresolvedNames.has(name)) {
     unresolvedNames.add(name);
     process.once('exit', () => { if (unresolvedNames.size) console.error(`undefined names: ${[ ...unresolvedNames ].sort().join(' ')}`); unresolvedNames.clear(); });
   }
-  return internalThrow(scope, 'ReferenceError', `${name} is not defined`);
+  // a name the program assigns bare (sloppy `x = 1` makes it a global) is its binding, which
+  // this read comes before: not yet made
+  if (globalThis.precompile || name === 'globalThis' || implicitGlobalNames.has(name)) return internalThrow(scope, 'ReferenceError', `${name} is not defined`);
+
+  const has = generate(scope, { type: 'BinaryExpression', operator: 'in', left: { type: 'Literal', value: name }, right: identNode('globalThis') });
+  emitIf(scope, falsy(scope, has, TYPES.boolean), () => exprStmt(scope, internalThrow(scope, 'ReferenceError', `${name} is not defined`)));
+  // read here, in evaluation order (x + (x = 1) reads x before the assignment makes it)
+  const value = tmp(scope, T.jsval);
+  assign(scope, value, coerceValue(generate(scope, memberNode(identNode('globalThis'), identNode(name))), T.jsval));
+  return value;
 };
 
 const generateYield = (scope, decl) => {
@@ -1365,6 +1388,17 @@ const generateBinaryExp = (scope, decl) => {
     });
   }
 
+  // two strings (known, or narrowed to string types): == is ===, a content compare with no
+  // conversion, pure, so an unused one goes
+  if (decl.operator === '==' || decl.operator === '!=') {
+    const strs = node => {
+      const t = knownTypeOrSet(scope, node);
+      const ts = Array.isArray(t) ? t : t == null ? null : [ t ];
+      return ts != null && ts.every(x => x === TYPES.string || x === TYPES.bytestring);
+    };
+    if (strs(decl.left) && strs(decl.right)) return generateBinaryExp(scope, { ...decl, operator: decl.operator + '=' });
+  }
+
   // opt: x == null|undefined -> nullish(x)
   if (decl.operator === '==' || decl.operator === '!=') {
     const other = knownNullish(decl.right) ? decl.left : knownNullish(decl.left) ? decl.right : null;
@@ -1373,6 +1407,34 @@ const generateBinaryExp = (scope, decl) => {
       if (decl.operator === '!=') r = Un('!', T.i32, r);
       return Box(r, Const(T.i32, TYPES.boolean));
     }
+  }
+
+  // opt: typeof x === 'number' -> a test of x's type tag, not a string built and compared
+  const typeofTest = typeofComparison(decl);
+  if (typeofTest != null && !ifIdentifierErrors(scope, typeofTest.arg)) {
+    const exact = knownType(scope, getNodeType(scope, typeofTest.arg));
+    const set = exact != null ? [ exact ] : typeSet(scope, typeofTest.arg);
+    const value = generate(scope, typeofTest.arg);
+    const types = TYPEOF_TYPES[typeofTest.name];
+    // when every type it may be answers the same, any one of them stands for all
+    const answers = set?.map(t => typeofTest.name === 'object' ? !TYPEOF_LISTED.includes(t) : types?.includes(t) === true);
+    const known = answers?.every(x => x === answers[0]) ? set[0] : null;
+    let test;
+    if (known != null) {
+      exprStmt(scope, value);
+      const is = typeofTest.name === 'object' ? !TYPEOF_LISTED.includes(known) : types?.includes(known) === true;
+      test = Const(T.i32, is ? 1 : 0);
+    } else if (typeofTest.name === 'object') {
+      test = Un('!', T.i32, typeIsOneOf(JvType(reuse(scope, coerceValue(value, T.jsval))), TYPEOF_LISTED));
+    } else if (types != null) {
+      test = typeIsOneOf(JvType(reuse(scope, coerceValue(value, T.jsval))), types);
+    } else {
+      // a name typeof never answers
+      exprStmt(scope, value);
+      test = Const(T.i32, 0);
+    }
+    if (typeofTest.negated) test = Un('!', T.i32, test);
+    return Box(test, Const(T.i32, TYPES.boolean));
   }
 
   return performOp(scope, decl.operator, generate(scope, decl.left), generate(scope, decl.right), getNodeType(scope, decl.left), getNodeType(scope, decl.right));
@@ -1560,15 +1622,23 @@ const logicalChecks = { '||': falsy, '&&': truthy, '??': nullish };
 const generateLogicExp = (scope, decl) => {
   const check = logicalChecks[decl.operator];
   const res = tmp(scope, T.jsval, coerceValue(generate(scope, decl.left), T.jsval));
-  emitIf(scope, check(scope, res, getNodeType(scope, decl.left)),
-    () => assign(scope, res, coerceValue(generate(scope, decl.right), T.jsval)));
+  // the right runs only where the left was truthy (&&) or falsy (||): what that proves holds
+  const facts = decl.operator === '??' ? [] : guardFacts(scope, decl.left, decl.operator === '&&');
+  emitIf(scope, check(scope, res, getNodeType(scope, decl.left)), () => {
+    if (facts.length === 0) return assign(scope, res, coerceValue(generate(scope, decl.right), T.jsval));
+    inferBranchStart(scope);
+    narrow(scope, facts);
+    assign(scope, res, coerceValue(generate(scope, decl.right), T.jsval));
+    inferBranchEnd(scope);
+  });
   return res;
 };
 
 const getInferred = (scope, name, global = false) => {
   const isConst = getVarMetadata(scope, name, global)?.kind === 'const';
   if (global) {
-    if (name in globalInfer && (isConst || inferLoopPrev.length === 0)) return globalInfer[name];
+    // in a loop, only a global nothing ever reassigns keeps the type its declaration gave it
+    if (name in globalInfer && (isConst || inferLoopPrev.length === 0 || !programWrittenNames.has(name))) return globalInfer[name];
   } else if (scope.inferTree) {
     for (let i = scope.inferTree.length - 1; i >= 0; i--) {
       const x = scope.inferTree[i];
@@ -1979,6 +2049,25 @@ const createThisArg = (scope, decl) => {
     }
 
     const obj = reuse(scope, builtinCall(scope, '__Porffor_object_new', [ Const(T.i32, knownSlotCount) ]));
+    // a top-level class's prototype, kept when it was defined; read from the class until
+    // then (a new before the class is defined fails as it would)
+    const target = decl.callee?.type === 'Identifier' ? decl.callee._resolvedVariable?.node : null;
+    const protoGlobal = (target?._classDeclaration ?? target)?._protoGlobal;
+    if (protoGlobal) {
+      allocVar(scope, protoGlobal, true);
+      const proto = reuse(scope, Global(protoGlobal, T.jsval));
+      emitIf(scope, Bin('==', T.i32, JvType(proto), Const(T.i32, TYPES.undefined)),
+        () => exprStmt(scope, builtinCall(scope, '__Porffor_object_setPrototype', [ obj, generate(scope, getObjProp(decl.callee, 'prototype')) ])),
+        // the prototype (an object) written straight into the new object's header, as
+        // setPrototype writes it; a new object is no one's prototype, so nothing is watched
+        () => {
+          const ptr = reuse(scope, JvPtr(obj));
+          stmt(scope, Store('i32', ptr, 8, Convert(T.i32, JvPtr(proto))));
+          stmt(scope, Store('u8', ptr, 5, JvType(proto)));
+          stmt(scope, GcBarrier(ptr, Const(T.i32, TYPES.object)));
+        });
+      return obj;
+    }
     exprStmt(scope, builtinCall(scope, '__Porffor_object_setPrototype', [ obj, generate(scope, getObjProp(decl.callee, 'prototype')) ]));
     return obj;
   }
@@ -2268,7 +2357,7 @@ const generateCall = (scope, decl) => {
 
       aliasPrimObjsBC(protoBC);
 
-      return typeSwitch(scope, JvType(targetTmp), targetKnownType, protoBC);
+      return typeSwitch(scope, JvType(targetTmp), targetKnownType ?? typeSet(scope, target), protoBC);
     }
   }
 
@@ -2420,7 +2509,123 @@ const generateCall = (scope, decl) => {
   if (decl._new) emitIf(scope, JvFalsy(builtinCall(scope, '__ecma262_IsConstructor', [ calleeVal ])),
     () => internalThrow(scope, 'TypeError', 'value is not a constructor'));
 
+  if (methodIndex && !decl._new && !hasSpread && !decl.optional && callee.type === 'MemberExpression' &&
+      !callee.computed && callee.object.type !== 'Super' && callee.property.type === 'Identifier') {
+    const devirtualized = devirtualizedCall(scope, decl, callee.property.name, calleeVal, thisVal, argVals);
+    if (devirtualized) return devirtualized;
+  }
+
   return CallDynamic(calleeVal, coerceValue(thisVal, T.jsval), argVals, decl._new ? calleeVal : null, spreadArr);
+};
+
+// ---- devirtualized method calls (--devirtualize=N) ----
+// obj.m(…) reads a function and calls it through the dynamic call (porf_invoke), which clang
+// can neither see through nor inline. When the program defines at most N functions as a
+// method named m (class methods, F.prototype.m = function, object literal methods), the call
+// checks the function it read against each, one compare of its record's function index, and
+// calls the one it is directly; anything else (another object, a replaced method) takes the
+// dynamic call as before. Only a guess, never assumed: a wrong one costs its compare. Only
+// candidates that capture nothing and are neither async nor generators are guessed (their
+// direct call needs no closure environment); a name with any other candidate is not guessed.
+let methodIndex = null, devirtualizeTally = null, devirtualizeSites = [];
+
+/** Every function the program defines as a method, by name: class and object literal methods, prototype assignments. */
+const indexMethods = program => {
+  const index = new Map();
+  const add = (key, fn) => {
+    if (key?.type !== 'Identifier') return;
+    const list = index.get(key.name) ?? [];
+    list.push(fn);
+    index.set(key.name, list);
+  };
+  const walk = node => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { for (const x of node) walk(x); return; }
+    if (node.type === 'MethodDefinition' && !node.computed && node.kind === 'method') add(node.key, node.value);
+    // any other kind of definition under the name (a getter, a setter, an arrow, a value) is
+    // still a candidate the call could reach: counted, never guessed
+    else if (node.type === 'MethodDefinition' && !node.computed && (node.kind === 'get' || node.kind === 'set')) add(node.key, null);
+    if (node.type === 'Property' && !node.computed && node.kind === 'init' && (node.value.type === 'FunctionExpression' || node.value.type === 'ArrowFunctionExpression'))
+      add(node.key, node.value.type === 'FunctionExpression' ? node.value : null);
+    if (node.type === 'Property' && !node.computed && (node.kind === 'get' || node.kind === 'set')) add(node.key, null);
+    if (node.type === 'AssignmentExpression' && node.left.type === 'MemberExpression' && !node.left.computed &&
+        (node.right.type === 'FunctionExpression' || node.right.type === 'ArrowFunctionExpression'))
+      add(node.left.property, node.right.type === 'FunctionExpression' ? node.right : null);
+    for (const key in node) {
+      if (key[0] === '_' || key === 'start' || key === 'end') continue;
+      const value = node[key];
+      if (value && typeof value === 'object') walk(value);
+    }
+  };
+  walk(program);
+  return index;
+};
+
+/**
+ * obj.m(…) as guarded direct calls, when m has at most N candidates. The call is emitted as the
+ * dynamic call now, in a block of its own; once every candidate is compiled (a method's class
+ * may come later in the program than a call of it: declarations are hoisted), a finalizer
+ * swaps in the guards and direct calls. A candidate never compiled, or not directly callable,
+ * leaves the dynamic call as it is. Null when m is not guessed at all.
+ */
+const devirtualizedCall = (scope, decl, name, calleeVal, thisVal, argVals) => {
+  const candidates = methodIndex.get(name) ?? [];
+  const count = candidates.length;
+  const plural = `${count} candidate${count > 1 ? 's' : ''}`;
+  if (count === 0) { tallyDevirtualize('0 candidates', name); return null; }
+  if (count > +Prefs.devirtualize) { tallyDevirtualize(`${count > 4 ? '5+' : count} candidates: more than N`, name); return null; }
+  if (candidates.some(fn => fn == null)) { tallyDevirtualize(`${plural}: one a getter, setter or arrow`, name); return null; }
+
+  const res = tmp(scope, T.jsval);
+  const thisV = reuse(scope, coerceValue(thisVal, T.jsval));
+  const body = collect(scope, () => assign(scope, res, CallDynamic(calleeVal, thisV, argVals, null, null)));
+  stmt(scope, BlockStmt(body));
+
+  // temps live here are read by the direct calls made later: kept out of their scratch
+  const pinned = scope.tmpBusy.slice();
+  const site = { done: false, plural, name };
+  devirtualizeSites.push(site);
+  onFinalize(() => {
+    if (site.done) return;
+    const funcs = candidates.map(fn => fn._compiledFunc);
+    if (funcs.some(f => !f)) return;
+    site.done = true;
+    if (funcs.some(f => f.async || f.generator || hasClosureCaptures(f) || f.params.some(p => p.name === '#env'))) {
+      tallyDevirtualize(`${plural}: one not directly callable (captures, async or generator)`, name);
+      return;
+    }
+    for (const { name: tmpName, type } of pinned) {
+      const pool = scope.tmpPool[type];
+      const i = pool ? pool.indexOf(tmpName) : -1;
+      if (i !== -1) pool.splice(i, 1);
+    }
+
+    const dynamic = () => assign(scope, res, CallDynamic(calleeVal, thisV, argVals, null, null));
+    const direct = func => {
+      func.generate?.();
+      func.onlyNew = false;
+      coroTypeUsed(func);
+      assign(scope, res, coerceValue(Call(func.index, buildDirectArgs(scope, decl, func, argVals, null, thisV), func.retType ?? T.jsval), T.jsval));
+    };
+    const guarded = collect(scope, () => emitIf(scope, Bin('==', T.i32, JvType(calleeVal), Const(T.i32, TYPES.function)), () => {
+      const index = reuse(scope, Load('u32', JvPtr(calleeVal), 0));
+      const chain = i => i === funcs.length ? dynamic()
+        : emitIf(scope, Bin('==', T.i32, index, FuncIdx(funcs[i].index)), () => direct(funcs[i]), () => chain(i + 1));
+      chain(0);
+    }, dynamic));
+    body.length = 0;
+    body.push(...guarded);
+    tallyDevirtualize(`${plural}: devirtualized`, name);
+  });
+  return res;
+};
+
+const tallyDevirtualize = (reason, name) => {
+  if (!devirtualizeTally) return;
+  const entry = devirtualizeTally.get(reason) ?? { count: 0, names: new Set() };
+  entry.count++;
+  if (name && entry.names.size < 3) entry.names.add(name);
+  devirtualizeTally.set(reason, entry);
 };
 
 const generateThis = (scope, decl) => {
@@ -2534,6 +2739,18 @@ const typeSwitch = (scope, subject, staticType, bc, fallthrough = false) => {
   const entries = entriesOf(bc);
   const typeIdsOf = types => Array.isArray(types) ? types : [ types ];
 
+  // one of a set: only the cases for its types, and no fallback when each has one
+  if (Array.isArray(staticType)) {
+    if (staticType.length === 1) staticType = staticType[0];
+    else {
+      const set = staticType;
+      const covered = new Set(entries.flatMap(([ types ]) => types === 'default' ? [] : typeIdsOf(types)));
+      const needDefault = set.some(t => !covered.has(t));
+      const kept = entries.filter(([ types ]) => types === 'default' ? needDefault : typeIdsOf(types).some(t => set.includes(t)));
+      return typeSwitch(scope, subject, null, kept, fallthrough);
+    }
+  }
+
   if (staticType != null) {
     let def;
     for (const [ types, v ] of entries) {
@@ -2646,7 +2863,8 @@ const addVarMetadata = (scope, name, global = false, metadata = {}) => {
 };
 
 const HOIST_DECL = 1;
-// module let/const: seen by inner functions only, the module body keeps its tdz
+// top-level let/const/class: seen by inner functions only, the body keeps its tdz (a class's
+// methods are generated where it is defined, before a later top-level binding)
 const HOIST_LEXICAL = 2;
 const markVarHoists = (scope, body, moduleTop = false) => {
   scope.hoists ??= new Map();
@@ -2698,9 +2916,10 @@ const markVarHoists = (scope, body, moduleTop = false) => {
 
   const stmts = body.type === 'Program' || body.type === 'BlockStatement' ? body.body : null;
   if (stmts) for (const x of stmts) {
-    if (moduleTop && x.type === 'VariableDeclaration' && x.kind !== 'var') {
+    if ((moduleTop || scope.topLevel) && x.type === 'VariableDeclaration' && x.kind !== 'var') {
       for (const d of x.declarations) mark(d.id, HOIST_LEXICAL);
     }
+    if ((moduleTop || scope.topLevel) && x.type === 'ClassDeclaration' && x.id) mark(x.id, HOIST_LEXICAL);
     scan(x);
   }
 };
@@ -2711,11 +2930,33 @@ const materializeHoistedVar = (scope, name) => {
   return global ? Global(name, globals[name]?.type ?? T.jsval) : Local(name, scope.locals[name]?.type ?? T.jsval);
 };
 
+// a hoisted top-level let/const/class not yet initialised: undefined with payload 1, which no
+// value has (the marker the program starts it with)
+const tdzMarker = () => JvConst(TYPES.undefined, 1);
+
+// an inner function's read of a hoisted top-level let/const/class: its TDZ checked at run time
+const readHoistedLexical = (scope, top, name) => {
+  const global = materializeHoistedVar(top, name);
+  if (global[N_TYPE] !== T.jsval || globalThis.precompile) return global;
+  tdzGlobals.add(name);
+  const value = reuse(scope, global);
+  emitIf(scope, Bin('&', T.i32, Bin('==', T.i32, JvType(value), Const(T.i32, TYPES.undefined)), Bin('==', T.i32, JvPtr(value), Const(T.i32, 1))),
+    () => exprStmt(scope, internalThrow(scope, 'ReferenceError', `Cannot access '${unhackName(name)}' before initialization`)));
+  return value;
+};
+
 const lookupHoistedVar = (scope, name) => {
   if (scope.hoists?.get(name) === HOIST_DECL) return materializeHoistedVar(scope, name);
 
   for (let cursor = scope.parentFunc; cursor; cursor = cursor.parentFunc) {
-    if (cursor.topLevel && cursor.hoists?.has(name)) return materializeHoistedVar(cursor, name);
+    if (cursor.topLevel && cursor.hoists?.has(name)) {
+      // a top-level class already defined is read as itself, not through the global
+      if (cursor.hoists.get(name) === HOIST_LEXICAL) {
+        if (!(name in globals) && resolveNamedFunction(scope, name)) return;
+        return readHoistedLexical(scope, cursor, name);
+      }
+      return materializeHoistedVar(cursor, name);
+    }
   }
 };
 
@@ -3004,6 +3245,17 @@ const generateVarDstr = (scope, kind, pattern, init, defaultValue, global) => {
       setVarMetadata(scope, name, global, metadata);
     }
     if (typed) addVarMetadata(scope, name, global, { ...typed, typeAnnotation: pattern.typeAnnotation });
+    // xs[i] of an array of T: a T, or undefined past its end (what narrowing then tells apart)
+    else if (init?.type === 'MemberExpression' && init.computed && init.object.type === 'Identifier') {
+      const element = (scope.locals[init.object.name] ?? globals[init.object.name])?.metadata?.elementType;
+      if (element != null) addVarMetadata(scope, name, global, { possible: [ element, TYPES.undefined ] });
+    }
+    // what it holds, when that is one of a few types (a string): typeSet reads it for a
+    // local nothing reassigns
+    if (!typed && init != null && !global && metadata.possible == null) {
+      const set = typeSet(scope, init);
+      if (set != null && set.length > 1) addVarMetadata(scope, name, global, { possible: set });
+    }
 
     if (init) {
       setLocalWithType(scope, name, global, init, false, typed?.type);
@@ -3441,6 +3693,15 @@ const generateAssign = (scope, decl, valueUnused = false) => {
             cached ? builtinCall(scope, '__Porffor_object_get_ic', [ obj, icKey(key), Const(T.i32, hash), icSlot(scope) ])
               : hash != null ? builtinCall(scope, '__Porffor_object_get_withHash', [ obj, key, Const(T.i32, hash) ]) : builtinCall(scope, '__Porffor_object_get', [ obj, key ]),
             generate(scope, decl.right), null, getNodeType(scope, decl.right));
+      // a class constructor's i-th leading this.k = … (markConstructorAdds): written as entry i
+      // of the new object when that holds, else set as any other
+      if (cached && op === '=' && decl._constructorEntry != null) {
+        const v = reuse(scope, coerceValue(value, T.jsval));
+        const added = builtinCall(scope, '__Porffor_object_addAt', [ obj, Const(T.i32, decl._constructorEntry), icKey(key), Const(T.i32, hash), v ]);
+        emitIf(scope, Un('!', T.i32, truthy(scope, added, TYPES.boolean)),
+          () => exprStmt(scope, builtinCall(scope, '__Porffor_object_set_ic', [ obj, icKey(key), v, Const(T.i32, hash), icSlot(scope), Const(T.i32, scope.strict ? 1 : 0) ])));
+        return v;
+      }
       if (cached) return builtinCall(scope, '__Porffor_object_set_ic', [ obj, icKey(key), value, Const(T.i32, hash), icSlot(scope), Const(T.i32, scope.strict ? 1 : 0) ]);
       return hash != null
         ? builtinCall(scope, setBuiltin + '_withHash', [ obj, key, value, Const(T.i32, hash) ])
@@ -3477,7 +3738,8 @@ const generateAssign = (scope, decl, valueUnused = false) => {
       const addr = taAddr(1);
       const v = reuse(scope, op === '=' ? simpleValue
         : performOp(scope, op, Box(Convert(T.f64, Load('u8', addr, 4)), Const(T.i32, TYPES.number)), generate(scope, decl.right), TYPES.number, getNodeType(scope, decl.right)));
-      stmt(scope, Store('u8', addr, 4, Convert(T.u32, Bin('min', T.f64, Bin('max', T.f64, numValue(v), Const(T.f64, 0)), Const(T.f64, 255)), 0)));
+      // ToUint8Clamp: clamped to 0..255, then rounded half to even (1.5 is 2, 2.5 is 2; NaN is 0)
+      stmt(scope, Store('u8', addr, 4, Convert(T.u32, Call('porf_nearest', [ Bin('min', T.f64, Bin('max', T.f64, numValue(v), Const(T.f64, 0)), Const(T.f64, 255)) ], T.f64), 0)));
       return v[N_TYPE] === T.jsval ? v : valNumber(v);
     };
     const taSetBig = () => {
@@ -3658,7 +3920,9 @@ const generateUnary = (scope, decl) => {
     }
 
     case 'typeof': {
-      if (ifIdentifierErrors(scope, decl.argument)) return makeString(scope, 'undefined');
+      // a name nothing defines: the global object's property of it, made at run time or not
+      if (ifIdentifierErrors(scope, decl.argument)) return globalThis.precompile || decl.argument.name === 'globalThis' ? makeString(scope, 'undefined')
+        : generate(scope, { ...decl, argument: memberNode(identNode('globalThis'), identNode(decl.argument.name)) });
 
       const arg = reuse(scope, generate(scope, decl.argument));
       return typeSwitch(scope, arg, knownType(scope, getNodeType(scope, decl.argument)), [
@@ -3776,11 +4040,23 @@ const inferBranchElse = scope => {
 
 const inferLoopPrev = [];
 const inferLoopAssigned = [];
-const inferLoopStart = scope => {
-  // todo/opt: do not just wipe the infer tree for loops
-  inferLoopPrev.push(scope.inferTree ?? [ Object.create(null) ]);
+// a loop's body is generated once but runs again after its own writes: what was inferred before
+// it holds inside only for a name the loop (its test, update, head and body) never assigns or
+// declares. Those carry in, their types and narrowed sets; the rest start unknown
+const inferLoopStart = (scope, loop = null) => {
+  const prev = scope.inferTree ?? [ Object.create(null) ];
+  inferLoopPrev.push(prev);
   inferLoopAssigned.push(new Set());
-  scope.inferTree = [ Object.create(null) ];
+  const root = Object.create(null);
+  const { written, declared, opaque } = loop ? writtenNames(loop) : { opaque: true };
+  if (!opaque) {
+    const kept = name => !written.has(name) && !declared.has(name);
+    for (const frame of prev) {
+      for (const name in frame) if (kept(name)) root[name] = frame[name];
+      for (const name in frame[TYPE_SETS] ?? {}) if (kept(name)) (root[TYPE_SETS] ??= Object.create(null))[name] = frame[TYPE_SETS][name];
+    }
+  }
+  scope.inferTree = [ root ];
 };
 
 const inferLoopEnd = scope => {
@@ -3792,6 +4068,213 @@ const inferLoopEnd = scope => {
       if (name in tree) tree[name] = null;
     }
   }
+};
+
+// ---- type sets ----
+// One of several types, which one not known: above all a string, in either of its two
+// representations (string, bytestring). Only what cannot be wrong makes one: an operation
+// that always gives a string ('a' + x, a template, String(x), s.slice()), a check that ran
+// (typeof x === 'string'), or the never-reassigned local one of those was stored in. An
+// annotated `: string` counts only under --opt-types, which trusts every annotation. Given a
+// set, a typeSwitch keeps only the cases for its types, and drops its fallback when every
+// type in it has a case: a type the set rules out is never reached, so it is never checked.
+// Kept apart from getType/getNodeType, whose callers take a type as an exact runtime tag.
+const STRING_TYPES = [ TYPES.string, TYPES.bytestring ];
+const isStringSet = set => set != null && set.length > 0 && set.every(t => STRING_TYPES.includes(t));
+const TYPE_SETS = Symbol('type sets');
+
+// String.prototype methods that return a string whatever the arguments
+const STRING_RESULT_METHODS = new Set([ 'charAt', 'concat', 'normalize', 'padEnd', 'padStart', 'repeat',
+  'replace', 'replaceAll', 'slice', 'substr', 'substring', 'toLocaleLowerCase', 'toLocaleUpperCase',
+  'toLowerCase', 'toString', 'toUpperCase', 'toWellFormed', 'trim', 'trimEnd', 'trimStart', 'valueOf' ]);
+
+/** A set a narrowing wrote for `name` in the frames still open; else null. */
+const inferredSet = (scope, name) => {
+  for (let i = (scope.inferTree?.length ?? 0) - 1; i >= 0; i--) {
+    const set = scope.inferTree[i][TYPE_SETS]?.[name];
+    if (set != null) return set;
+  }
+  return null;
+};
+
+/** The types `node` may evaluate to, when that is known to be a few of them; else null. */
+const typeSet = (scope, node) => {
+  if (node == null) return null;
+  const known = knownType(scope, getNodeType(scope, node));
+  if (known != null) return [ known ];
+
+  switch (node.type) {
+    case 'Identifier': {
+      if (!narrowable(scope, node)) return null;
+      const metadata = getVarMetadata(scope, node.name);
+      return inferredSet(scope, node.name) ?? metadata?.possible ?? metadata?.types ?? null;
+    }
+    case 'TemplateLiteral':
+      return STRING_TYPES;
+    case 'BinaryExpression':
+      // with a string on either side, + concatenates
+      if (node.operator === '+' && (isStringSet(typeSet(scope, node.left)) || isStringSet(typeSet(scope, node.right)))) return STRING_TYPES;
+      return null;
+    case 'ConditionalExpression': {
+      const a = typeSet(scope, node.consequent), b = typeSet(scope, node.alternate);
+      return a && b ? [ ...new Set([ ...a, ...b ]) ] : null;
+    }
+    case 'CallExpression': {
+      const { callee } = node;
+      if (callee.type === 'Identifier' && callee.name === 'String' && !builtinShadowed(scope, 'String')) return STRING_TYPES;
+      if (callee.type === 'MemberExpression' && !callee.computed && !node.optional && !callee.optional) {
+        const method = callee.property.name;
+        if (STRING_RESULT_METHODS.has(method) && isStringSet(typeSet(scope, callee.object))) return STRING_TYPES;
+        if (method === 'join' && knownType(scope, getNodeType(scope, callee.object)) === TYPES.array) return STRING_TYPES;
+      }
+      return null;
+    }
+  }
+  return null;
+};
+
+/** The exact type of `node` if known, else its set: what a typeSwitch over it may take. */
+const knownTypeOrSet = (scope, node) => knownType(scope, getNodeType(scope, node)) ?? typeSet(scope, node);
+
+// ---- narrowing ----
+// A check the code makes proves something about a variable wherever it holds: in the branch
+// it guards (`typeof x === 'number' ? x * 2 : …`), and, when the check leaves the block on
+// failure (`if (x === undefined) return;`), in the rest of that block. The proof is the
+// check itself, run at runtime, so it needs no type annotation to be sound. It is written
+// into the branch's inference frame without counting as an assignment: it lasts as long as
+// the branch, and a write in the branch would override it. Only a local nothing reassigns
+// is narrowed (the semantic pass counted no writes), so no closure or later statement can
+// change it between the check and the use. --no-narrow turns it off.
+
+// what `typeof` answers, per type (the same table the typeof operator switches on)
+const TYPEOF_TYPES = {
+  number: [ TYPES.number ],
+  boolean: [ TYPES.boolean ],
+  string: [ TYPES.string, TYPES.bytestring ],
+  undefined: [ TYPES.undefined ],
+  function: [ TYPES.function ],
+  symbol: [ TYPES.symbol ],
+  bigint: [ TYPES.bigint ]
+};
+const TYPEOF_LISTED = Object.values(TYPEOF_TYPES).flat();
+
+/** `typeof arg OP 'name'` (either side), as { arg, name, negated }; else null. */
+const typeofComparison = decl => {
+  if (decl.type !== 'BinaryExpression' || !EQUALITY_OPS.has(decl.operator)) return null;
+  const isTypeof = x => x.type === 'UnaryExpression' && x.operator === 'typeof';
+  const isName = x => x.type === 'Literal' && typeof x.value === 'string';
+  const [ t, lit ] = isTypeof(decl.left) && isName(decl.right) ? [ decl.left, decl.right ]
+    : isTypeof(decl.right) && isName(decl.left) ? [ decl.right, decl.left ] : [ null, null ];
+  if (t == null) return null;
+  return { arg: t.argument, name: lit.value, negated: decl.operator[0] === '!' };
+};
+const EQUALITY_OPS = new Set([ '===', '!==', '==', '!=' ]);
+
+/** `x` as `undefined` (or `void 0`), which a guard compares against. */
+const isUndefinedNode = x => (x.type === 'Identifier' && x.name === 'undefined') ||
+  (x.type === 'UnaryExpression' && x.operator === 'void' && x.argument.type === 'Literal');
+
+/** A local a guard can narrow: read directly, and never written after its declaration. */
+const narrowable = (scope, node) => node?.type === 'Identifier' &&
+  node.name in scope.locals && scope.locals[node.name].type === T.jsval &&
+  !node._closureFunc && !scope.closureOwnLocals?.[node.name] &&
+  node._resolvedVariable != null && !node._resolvedVariable.node?._writes;
+
+/**
+ * What `test` evaluating to `sense` proves: a list of { name, keep } (the variable is one of
+ * these types) or { name, drop } (it is none of them).
+ */
+const guardFacts = (scope, test, sense) => {
+  if (!Prefs.narrow || test == null) return [];
+
+  switch (test.type) {
+    case 'UnaryExpression':
+      if (test.operator === '!') return guardFacts(scope, test.argument, !sense);
+      break;
+
+    case 'LogicalExpression':
+      // both held for && to be true, and both failed for || to be false
+      if ((test.operator === '&&' && sense) || (test.operator === '||' && !sense))
+        return [ ...guardFacts(scope, test.left, sense), ...guardFacts(scope, test.right, sense) ];
+      break;
+
+    // truthy: at least not undefined (null shares the object type, so it cannot be dropped)
+    case 'Identifier':
+      if (sense && narrowable(scope, test)) return [ { name: test.name, drop: [ TYPES.undefined ] } ];
+      break;
+
+    case 'CallExpression': {
+      const { callee } = test;
+      if (callee.type === 'MemberExpression' && !callee.computed && callee.object.name === 'Array' &&
+          callee.property.name === 'isArray' && !builtinShadowed(scope, 'Array') && narrowable(scope, test.arguments[0])) {
+        const name = test.arguments[0].name;
+        return [ sense ? { name, keep: [ TYPES.array ] } : { name, drop: [ TYPES.array ] } ];
+      }
+      break;
+    }
+
+    case 'BinaryExpression': {
+      if (!EQUALITY_OPS.has(test.operator)) break;
+      const holds = (test.operator[0] !== '!') === sense;
+
+      const t = typeofComparison(test);
+      if (t != null) {
+        const types = TYPEOF_TYPES[t.name];
+        if (types == null || !narrowable(scope, t.arg)) break;
+        return [ holds ? { name: t.arg.name, keep: types } : { name: t.arg.name, drop: types } ];
+      }
+
+      const subject = isUndefinedNode(test.right) ? test.left : isUndefinedNode(test.left) ? test.right : null;
+      if (subject == null || !narrowable(scope, subject)) break;
+      // x === undefined is exactly undefined; x == undefined may also be null
+      if (test.operator.length === 3) return [ holds ? { name: subject.name, keep: [ TYPES.undefined ] } : { name: subject.name, drop: [ TYPES.undefined ] } ];
+      if (!holds) return [ { name: subject.name, drop: [ TYPES.undefined ] } ];
+      break;
+    }
+  }
+
+  return [];
+};
+
+/** The types a local may hold, as far as they are known; else null. */
+const possibleTypes = (scope, name) => {
+  const set = inferredSet(scope, name);
+  if (set) return set;
+  const metadata = getVarMetadata(scope, name);
+  if (metadata?.types) return metadata.types;
+  if (metadata?.possible) return metadata.possible;
+  const known = getType(scope, name);
+  return known == null ? null : [ known ];
+};
+
+/** Writes what `facts` prove into the current inference frame, where it comes to one type. */
+const narrow = (scope, facts) => {
+  for (const fact of facts) {
+    const types = fact.keep ?? possibleTypes(scope, fact.name)?.filter(t => !fact.drop.includes(t));
+    if (!types?.length) continue;
+    scope.inferTree ??= [ Object.create(null) ];
+    const frame = scope.inferTree.at(-1);
+    for (const t of types) typeUsed(scope, t);
+    if (types.length === 1) frame[fact.name] = types[0];
+    // several: one of them (typeof x === 'string' leaves two representations)
+    else (frame[TYPE_SETS] ??= Object.create(null))[fact.name] = types;
+  }
+};
+
+/** A statement that never completes normally: it returns, throws, breaks or continues. */
+const alwaysExits = node => {
+  if (node == null) return false;
+  switch (node.type) {
+    case 'ReturnStatement': case 'ThrowStatement': case 'BreakStatement': case 'ContinueStatement':
+      return true;
+    case 'BlockStatement': {
+      const body = node.body.filter(x => !isEmptyNode(x));
+      return body.length > 0 && alwaysExits(body.at(-1));
+    }
+    case 'IfStatement':
+      return alwaysExits(node.consequent) && alwaysExits(node.alternate);
+  }
+  return false;
 };
 
 const generateLoopBinding = (scope, left, valNode) => {
@@ -3837,10 +4320,12 @@ const generateIf = (scope, decl) => {
   const cond = truthy(scope, generate(scope, decl.test), getNodeType(scope, decl.test));
 
   inferBranchStart(scope);
+  narrow(scope, guardFacts(scope, decl.test, true));
   const then = collect(scope, () => genStmt(scope, decl.consequent));
   let els = null;
   if (decl.alternate) {
     inferBranchElse(scope);
+    narrow(scope, guardFacts(scope, decl.test, false));
     els = collect(scope, () => genStmt(scope, decl.alternate));
     inferBranchEnd(scope);
   } else inferBranchEnd(scope);
@@ -3855,8 +4340,10 @@ const generateConditional = (scope, decl) => {
   const res = tmp(scope, resType);
 
   inferBranchStart(scope);
+  narrow(scope, guardFacts(scope, decl.test, true));
   const then = collect(scope, () => assign(scope, res, coerceValue(generate(scope, decl.consequent), resType)));
   inferBranchElse(scope);
+  narrow(scope, guardFacts(scope, decl.test, false));
   const els = collect(scope, () => assign(scope, res, coerceValue(generate(scope, decl.alternate), resType)));
   inferBranchEnd(scope);
 
@@ -3891,7 +4378,7 @@ const genLoop = (scope, decl, type) => {
   const d = { type, brk: L, cont: C ?? L, contViaBreak: C != null };
   consumePendingLabels(scope, d);
   depth.push(d);
-  inferLoopStart(scope);
+  inferLoopStart(scope, decl);
 
   const testBreak = () => {
     for (const s of condStmts) stmt(scope, s);
@@ -4044,7 +4531,7 @@ const generateForOfCore = (scope, decl) => {
     return Call('__Porffor_coroutine_value', [ root ]);
   };
   depth.push(d);
-  inferLoopStart(scope);
+  inferLoopStart(scope, decl);
 
   const num = x => Box(Convert(T.f64, x), Const(T.i32, TYPES.number));
   const taNext = (ctype, size, box) => () => {
@@ -4202,7 +4689,7 @@ const generateForIn = (scope, decl) => {
       const d = { type: 'forin', brk: L, cont: C, contViaBreak: true };
       consumePendingLabels(scope, d);
       depth.push(d);
-      inferLoopStart(scope);
+      inferLoopStart(scope, decl);
 
       const tmpName = tmp(scope, T.jsval)[N_A];
       const body = collect(scope, () => {
@@ -4224,17 +4711,20 @@ const generateForIn = (scope, decl) => {
       return valUndefined();
     },
 
-    // wrap as for..of Object.keys(obj ?? 0)
-    default: () => generate(scope, {
-      type: 'ForOfStatement',
-      left: decl.left,
-      body: decl.body,
-      right: {
-        type: 'CallExpression',
-        callee: { type: 'Identifier', name: '__Object_keys' },
-        arguments: [ { type: 'LogicalExpression', left: { type: 'Identifier', name: objName }, operator: '??', right: { type: 'Literal', value: 0 } } ]
-      }
-    })
+    // wrap as for..of Object.keys(obj ?? 0); a statement, so the case's value is undefined
+    default: () => {
+      generate(scope, {
+        type: 'ForOfStatement',
+        left: decl.left,
+        body: decl.body,
+        right: {
+          type: 'CallExpression',
+          callee: { type: 'Identifier', name: '__Object_keys' },
+          arguments: [ { type: 'LogicalExpression', left: { type: 'Identifier', name: objName }, operator: '??', right: { type: 'Literal', value: 0 } } ]
+        }
+      });
+      return valUndefined();
+    }
   });
 };
 
@@ -4985,6 +5475,9 @@ const startMemberDemands = () => {
   whenTypedArrayReachable(() => {
     for (const x of [ 'buffer', 'byteLength', 'byteOffset', 'length' ]) includeBuiltin(topLevelFunc, `__Porffor_TypedArray_prototype_${x}$get`);
   });
+  // a typed array's [Symbol.toStringTag] getter, in a program that names it and has a kind
+  whenFact([ [ 'member', 'toStringTag' ] ], () =>
+    whenFact(TYPED_ARRAY_KINDS.map(k => [ 'hasType', TYPES[k.toLowerCase()] ]), () => includeBuiltin(topLevelFunc, '__Porffor_typedArray_toStringTag')));
 };
 
 let icSites;
@@ -5100,6 +5593,8 @@ const generateMember = (scope, decl, objValue = null) => {
 
   const type = getNodeType(scope, object);
   const known = knownType(scope, type);
+  // one of a few types (a string, either representation): what the switches below may take
+  const knownSet = known == null ? typeSet(scope, object) : null;
   const propertyType = getNodeType(scope, property);
   const propertyKnown = knownType(scope, propertyType);
   const objectKnownValue = knownValue(scope, object);
@@ -5166,6 +5661,8 @@ const generateMember = (scope, decl, objValue = null) => {
     const arrayLengthVal = () => Box(Convert(T.f64, Load('u32', JvPtr(obj), 0)), Const(T.i32, TYPES.number));
     if (known === TYPES.array) return arrayLengthVal();
     if (Prefs.fastLength || (known != null && (known & TYPE_FLAGS.length) !== 0)) return lengthVal();
+    // each type in the set keeps its length at the pointer (strings, typed arrays)
+    if (knownSet?.every(t => t !== TYPES.array && (t & TYPE_FLAGS.length) !== 0)) return lengthVal();
     if (known != null) return genericMemberGet();
 
     const res = tmp(scope, T.jsval);
@@ -5245,11 +5742,11 @@ const generateMember = (scope, decl, objValue = null) => {
     [ 'default', () => builtinCall(scope, '__Porffor_object_indexGet', [ obj, prop ]) ]
   ];
   if (decl.computed) return typeSwitch(scope, prop, propertyKnown, {
-    [TYPES.number]: () => typeSwitch(scope, obj, known, known == null && !globalThis.precompile ? indexedMemberGetShared : indexedMemberGetBC),
-    default: () => typeSwitch(scope, obj, known, genericMemberGetBC)
+    [TYPES.number]: () => typeSwitch(scope, obj, known ?? knownSet, known == null && knownSet == null && !globalThis.precompile ? indexedMemberGetShared : indexedMemberGetBC),
+    default: () => typeSwitch(scope, obj, known ?? knownSet, genericMemberGetBC)
   });
 
-  return typeSwitch(scope, obj, known, genericMemberGetBC);
+  return typeSwitch(scope, obj, known ?? knownSet, genericMemberGetBC);
 };
 
 const generateAwait = (scope, decl) =>
@@ -5325,6 +5822,43 @@ const classSuperExpr = () => ({
   ]
 });
 
+/**
+ * Marks a class constructor's leading `this.k = expr` statements with the entry each adds
+ * (0, 1, …), for a class with no extends and no fields: `this` is then the new, empty object,
+ * and those statements fill it in that order (the member set writes each straight in). The
+ * run stops at the first statement that is anything else, repeats a key, or whose value names
+ * this, super or eval (which could reach the object between two of them).
+ */
+const markConstructorAdds = decl => {
+  if (decl.superClass) return;
+  const body = decl.body.body;
+  if (body.some(x => x.type === 'PropertyDefinition' || x.type === 'AccessorProperty')) return;
+  const constructor = body.find(x => x.kind === 'constructor')?.value;
+  if (constructor?.body?.type !== 'BlockStatement') return;
+
+  const reaches = node => {
+    if (!node || typeof node !== 'object') return false;
+    if (node.type === 'ThisExpression' || node.type === 'Super' || (node.type === 'Identifier' && node.name === 'eval')) return true;
+    for (const key in node) {
+      if (key[0] === '_' || key === 'start' || key === 'end') continue;
+      const value = node[key];
+      if (Array.isArray(value) ? value.some(reaches) : value && typeof value.type === 'string' && reaches(value)) return true;
+    }
+    return false;
+  };
+
+  const keys = new Set();
+  for (const x of constructor.body.body) {
+    const e = x.type === 'ExpressionStatement' ? x.expression : null;
+    if (e?.type !== 'AssignmentExpression' || e.operator !== '=' || e.left.type !== 'MemberExpression' ||
+        e.left.object.type !== 'ThisExpression' || e.left.computed || e.left.property.type !== 'Identifier') break;
+    const key = e.left.property.name;
+    if (key === '__proto__' || keys.has(key) || reaches(e.right)) break;
+    e._constructorEntry = keys.size;
+    keys.add(key);
+  }
+};
+
 const generateClass = (scope, decl) => {
   const expr = decl.type === 'ClassExpression';
   if (!expr && !classHasDefinitionSideEffects(decl) && (decl._refs ?? 0) === 0) {
@@ -5333,6 +5867,7 @@ const generateClass = (scope, decl) => {
 
   if (!decl.id) decl.id = { type: 'Identifier', name: anonymousName(decl) };
   const name = decl.id.name;
+  markConstructorAdds(decl);
 
   const body = decl.body.body;
   const root = { type: 'Identifier', name };
@@ -5390,8 +5925,19 @@ const generateClass = (scope, decl) => {
   // Before the elements, as the spec binds the class's inner name: a static initialiser
   // that reads the name through the closure env (static BASE = new C()) sees the class
   if (!expr && scope.closureOwnLocals?.[name]) mirrorToClosureEnv(scope, name, rootIdent);
+  // code generated before this top-level class (an earlier class's methods) reads it through
+  // a hoisted global (lookupHoistedVar): the class is its value from here
+  if (!expr && scope.topLevel && scope.hoists?.get(name) === HOIST_LEXICAL && name in globals)
+    assign(scope, Global(name, globals[name].type ?? T.jsval), coerceValue(classRoot, globals[name].type ?? T.jsval));
 
   const classProto = reuse(scope, generate(scope, getObjProp(rootIdent, 'prototype')));
+
+  // a class declared once, at the program's top level, under a binding nothing reassigns:
+  // its prototype (which cannot be replaced) kept where each new of it reads it (createThisArg)
+  if (!expr && decl._protoGlobal) {
+    allocVar(scope, decl._protoGlobal, true);
+    assign(scope, Global(decl._protoGlobal, T.jsval), coerceValue(classProto, T.jsval));
+  }
 
   // wire constructor + prototype chains to the superclass, null superclass included
   if (decl.superClass) {
@@ -5439,7 +5985,7 @@ const generateClass = (scope, decl) => {
       let id = value.id;
       let noFuncIndex = false;
       if (typeof key.value === 'string' && !id) { id = { type: 'Identifier', name: key.value }; noFuncIndex = true; }
-      value = { ...value, id, _noFuncIndex: noFuncIndex, strict: true, _noGlobalThis: true,
+      value = { ...value, id, _noFuncIndex: noFuncIndex, strict: true, _noGlobalThis: true, _source: closureSource,
         _closureSource: closureSource._closureSource ?? closureSource,
         // an accessor's name is "get x" / "set x"
         ...((kind === 'get' || kind === 'set') && typeof key.value === 'string' ? { _jsName: kind + ' ' + key.value } : {}) };
@@ -6048,6 +6594,12 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
       return func.body;
     }
   };
+  // the source node's compiled function, for a devirtualized call to find (--devirtualize); a
+  // class or object literal method is compiled from a copy of its node, which names the
+  // original (_source, _closureSource)
+  decl._compiledFunc = func;
+  const source = decl._source ?? decl._closureSource;
+  if (source) source._compiledFunc = func;
   decl._porfforFunc = func;
 
   if (!decl._method && !decl._noFuncIndex) setFuncIndex(name, func.index);
@@ -6166,6 +6718,17 @@ const generateModules = (scope, body) => {
 };
 
 const generateBlock = (scope, decl) => {
+  // a block's function declarations exist from its start (called or read before their line),
+  // after its directives ("use strict" stays first)
+  let j = 0;
+  while (decl.body[j]?.directive) j++;
+  for (let i = j; i < decl.body.length; i++) {
+    if (decl.body[i].type === 'FunctionDeclaration') {
+      if (i !== j) decl.body.splice(j, 0, decl.body.splice(i, 1)[0]);
+      j++;
+    }
+  }
+
   inferBranchStart(scope);
   let last = -1;
   if (scope.inEval) {
@@ -6182,6 +6745,10 @@ const generateBlock = (scope, decl) => {
     if (isEmptyNode(x)) continue;
     if (i === last) out = generate(scope, x);
     else genStmt(scope, x);
+
+    // `if (x === undefined) return;`: the rest of the block runs only where the test failed
+    if (x.type === 'IfStatement' && x.alternate == null && alwaysExits(x.consequent))
+      narrow(scope, guardFacts(scope, x.test, false));
   }
   inferBranchEnd(scope);
   return out ?? valUndefined();
@@ -6262,6 +6829,9 @@ const inferDirectCallParamTypes = root => {
       for (let i = 0; i < (decl.params?.length ?? 0); i++) {
         const param = decl.params[i];
         if (param?.type !== 'Identifier' || param._directInferredType != null) continue;
+        // a parameter the body assigns holds whatever it is given there (`tag = { tag, ... }`),
+        // not only what its callers pass: its local keeps the general type
+        if (param._writes) continue;
 
         let inferred = null;
         let valid = calls.length > 0;
@@ -6289,7 +6859,7 @@ const inferDirectCallParamTypes = root => {
   }
 };
 
-let globals, funcs, funcsByIndex, funcIndex, funcNameCollisions, currentFuncIndex, depth, data, dataUnits, dataRelocs, dataCache, modular, rawHead, builtinGlobalInits, includedBuiltinGlobalInits, usedTypes, globalInfer, builtinFuncs, builtinVars, builtinPrototypeFuncs, builtinStaticFuncs, builtinPrototypeGetters, builtinPrototypeObjectGetters, topLevelFunc;
+let globals, funcs, funcsByIndex, funcIndex, funcNameCollisions, currentFuncIndex, depth, data, dataUnits, dataRelocs, dataCache, modular, rawHead, builtinGlobalInits, includedBuiltinGlobalInits, usedTypes, globalInfer, builtinFuncs, builtinVars, builtinPrototypeFuncs, builtinStaticFuncs, builtinPrototypeGetters, builtinPrototypeObjectGetters, topLevelFunc, tdzGlobals, implicitGlobalNames, programWrittenNames;
 
 export default (program, opts = {}) => {
   const entryName = opts.entryName ?? '#main';
@@ -6306,6 +6876,9 @@ export default (program, opts = {}) => {
   modular = !!program._units;
   rawHead = [];
   builtinGlobalInits = [];
+  tdzGlobals = new Set();
+  implicitGlobalNames = new Set();
+  programWrittenNames = new Set();
   includedBuiltinGlobalInits = new Set();
   irFinalizers = [];
   memberDemands = new Set();
@@ -6341,21 +6914,60 @@ export default (program, opts = {}) => {
 
   if (!globalThis.precompile) startMemberDemands();
 
-  // a user top-level decl shadowing a builtin name disables the object hack for it:
-  // its member accesses are real property accesses
+  // a user binding shadowing a builtin name, at any depth, disables the object hack for it
+  // program-wide: its member accesses are real property accesses (pdfjs's own `Promise`)
   {
     const userDecls = new Set();
-    for (const x of program.body) {
-      if (x.type === 'FunctionDeclaration' || x.type === 'ClassDeclaration') {
-        if (x.id?.name) userDecls.add(x.id.name);
-      } else if (x.type === 'VariableDeclaration') {
-        for (const d of x.declarations) if (d.id?.type === 'Identifier') userDecls.add(d.id.name);
+    const walk = node => {
+      if (!node || typeof node !== 'object') return;
+      if (Array.isArray(node)) { for (const x of node) walk(x); return; }
+      switch (node.type) {
+        case 'FunctionDeclaration': case 'FunctionExpression': case 'ArrowFunctionExpression':
+          if (node.id) patternNames(node.id, userDecls);
+          for (const p of node.params) patternNames(p, userDecls);
+          break;
+        case 'ClassDeclaration': case 'ClassExpression':
+          if (node.id) patternNames(node.id, userDecls);
+          break;
+        case 'VariableDeclarator': patternNames(node.id, userDecls); break;
+        case 'CatchClause': patternNames(node.param, userDecls); break;
+        // a bare name written with no binding: a sloppy implicit global
+        case 'AssignmentExpression': case 'ForInStatement': case 'ForOfStatement': {
+          const target = node.left;
+          if (target?.type === 'Identifier' && !target._resolvedBinding) implicitGlobalNames.add(target.name);
+          break;
+        }
+        case 'UpdateExpression':
+          if (node.argument?.type === 'Identifier' && !node.argument._resolvedBinding) implicitGlobalNames.add(node.argument.name);
+          break;
       }
-    }
+      for (const k in node) {
+        const v = node[k];
+        if (v && typeof v === 'object' && k[0] !== '_') walk(v);
+      }
+    };
+    // a builtin's own `export const Int8Array` is no user binding: precompile keeps the hack
+    if (!globalThis.precompile) walk(program.body);
     objectHackers = userDecls.size > 0 ? allObjectHackers.filter(x => !userDecls.has(x)) : allObjectHackers;
     semantic.objectHackers = objectHackers;
   }
+  // every name assigned anywhere (not its declaration): an opaque program (with, eval) all of them
+  {
+    const { written, opaque } = writtenNames(program);
+    programWrittenNames = opaque ? { has: () => true } : written;
+  }
   markInBoundsIndexes(program);
+  // --devirtualize=N: every function defined as a method, by name (see devirtualizedCall)
+  methodIndex = Prefs.devirtualize ? indexMethods(program) : null;
+  devirtualizeTally = Prefs.devirtualizeLog ? new Map() : null;
+  devirtualizeSites = [];
+
+  // top-level classes nothing rebinds: where each keeps its prototype for new (generateClass)
+  for (const x of program.body) {
+    if (x.type !== 'ClassDeclaration' || !x.id || x._writes || x.id._writes) continue;
+    x._protoGlobal = `#proto#${x.id.name}`;
+    x.id._classDeclaration = x;
+  }
   if (program._usesTemporal) {
     const polyfillAst = parse(temporalPolyfillSource);
     const polyfill = polyfillAst.body;
@@ -6376,6 +6988,11 @@ export default (program, opts = {}) => {
   // semantic relies on object hack happening before
   program = objectHack(program);
   if (Prefs.closures) program = semantic(program);
+  // --inline: calls returning a fresh literal that then stays local are inlined (inline.js);
+  // --escape (which --inline turns on): literals that never leave their function become one
+  // local per field (escape.js)
+  if (Prefs.inline && Prefs.closures && !globalThis.precompile) program = inlineCalls(program);
+  if ((Prefs.escape || Prefs.inline) && Prefs.closures && !globalThis.precompile) program = escapeAnalysis(program);
   if (Prefs.p) {
     const last = getLastNode(program.body);
     const lastIndex = program.body.indexOf(last);
@@ -6471,10 +7088,18 @@ export default (program, opts = {}) => {
   irFinalizers.length = 0;
 
   if (builtinGlobalInits.length !== 0) topLevelFunc.body.unshift(...builtinGlobalInits);
+  // hoisted top-level let/const/class start uninitialised (read before: a ReferenceError)
+  for (const name of tdzGlobals)
+    if ((globals[name]?.type ?? T.jsval) === T.jsval) topLevelFunc.body.unshift(Assign(Global(name, T.jsval), tdzMarker()));
 
   // render input: funcs indexed by func.index, ungenerated ones null (tree-shaken to a trapping stub), globals as {name, type}
   const renderFuncs = [];
   for (const f of funcs) renderFuncs[f.index] = f.body ? f : null;
+
+  // --devirtualize-log: method call sites by how many candidates they have, and what became of them
+  for (const site of devirtualizeSites) if (!site.done) tallyDevirtualize(`${site.plural}: a candidate never compiled (dynamic)`, site.name);
+  if (devirtualizeTally) for (const [ reason, { count, names } ] of [ ...devirtualizeTally ].sort((a, b) => b[1].count - a[1].count))
+    console.log(`devirtualize: ${String(count).padStart(5)}  ${reason}   (.${[ ...names ].join('(), .')}())`);
 
   const renderGlobals = [];
   for (const name in globals) {

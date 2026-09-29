@@ -114,6 +114,10 @@ export const prototypeDescriptors = (funcNames, isConstructor) => {
 
     for (const [ symbol, method ] of SYMBOL_METHODS[base] ?? [])
       props.push({ symbol, kind: 'method', func: name + '_' + method, attrs: METHOD_ATTRS, always: true });
+    // a typed array's tag is a getter on %TypedArray%.prototype; a kind's own too, in a program
+    // whose kinds do not inherit from it
+    if (name === '__Porffor_TypedArray_prototype' || isTypedArrayKind)
+      props.push({ symbol: 'toStringTag', kind: 'accessor', get: '__Porffor_typedArray_toStringTag', attrs: ACCESSOR_ATTRS, demand: 'toStringTag', unless: isTypedArrayKind ? 'typedArrayCtorValue' : undefined });
     if (TO_STRING_TAGS.includes(base))
       props.push({ symbol: 'toStringTag', kind: 'data', value: base, attrs: { writable: false, enumerable: false, configurable: true }, demand: 'toStringTag' });
 
