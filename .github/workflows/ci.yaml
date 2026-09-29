@@ -14,9 +14,10 @@ concurrency:
 
 jobs:
   prepare:
+    # releases (GitHub and npm) only from the upstream repository, never from a fork
     if: >
       github.event.head_commit
-      && github.event.head_commit.author.email == 'honk@goose.icu'
+      && github.repository == 'CanadaHonk/porffor'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -267,7 +268,7 @@ jobs:
           const common = {
             version,
             license: 'MIT',
-            author: 'Oliver Medhurst <honk@goose.icu>',
+            author: 'Oliver Medhurst',
             repository: { type: 'git', url: 'git+https://github.com/CanadaHonk/porffor.git' },
             homepage: 'https://porffor.dev'
           };
