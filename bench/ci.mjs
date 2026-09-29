@@ -1,6 +1,6 @@
 // The benchmarks, for CI: every program in bench/ compiled to C and built natively, the builds
 // in parallel, then each run RUNS times one after another (median wall ms, and the scores it
-// prints, the V8 suite's). Writes a Markdown table (to $GITHUB_STEP_SUMMARY when set, else
+// prints, the V8 suite's). Writes a Markdown table (to $GITHUB_STEP_SUMMARY when set, and to
 // stdout) and the results as JSON (bench-results.json, or the path given).
 // node bench/ci.mjs [out.json]
 import { execFile, spawnSync } from 'node:child_process';
@@ -80,8 +80,9 @@ if (suite) {
   for (const [ k, v ] of Object.entries(suite[1].scores)) if (k !== 'SCORE') md += `| ${k} | ${v} |\n`;
 }
 
+// (the run's Summary page shows the step summary; the log gets it too)
 if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, md);
-else console.log(md);
+console.log(md);
 fs.writeFileSync(jsonOut, JSON.stringify({ commit: process.env.GITHUB_SHA ?? null, date: new Date().toISOString(), runs: RUNS, results }, null, 2));
 fs.rmSync(outDir, { recursive: true, force: true });
 

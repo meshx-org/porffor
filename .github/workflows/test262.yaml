@@ -1,0 +1,76 @@
+name: test262
+
+# the whole of test262 (the pinned commit), nightly: the result line, what was won and lost
+# since the last run, and where the failures are, in the run's summary; results.json and the
+# failures as an artifact (the next run compares against it)
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: test262
+  cancel-in-progress: false
+
+jobs:
+  test262:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: checkout test262
+        uses: actions/checkout@v4
+        with:
+          repository: tc39/test262
+          ref: 6eec1ac9ee144dafd8f344d73a21f36bfc9f6755
+          path: test262/test262
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      # the runner compiles each test to C and runs it with tcc (-run): the tinycc the results
+      # are tracked with (its mob branch), not the distribution's 0.9.27
+      - name: build tcc
+        run: |
+          git init -q /tmp/tinycc
+          cd /tmp/tinycc
+          git fetch -q --depth=1 https://github.com/TinyCC/tinycc 9db1105c32afd3dcf0c28b8186f08e63c761b2b5
+          git checkout -q FETCH_HEAD
+          ./configure --prefix="$HOME/.local"
+          make -j"$(nproc)"
+          make install
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: previous results
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow test262.yaml --status success --limit 1 --json databaseId -q '.[0].databaseId')
+          if test -n "$id"; then
+            gh run download "$id" --repo "$GITHUB_REPOSITORY" --name test262-results --dir /tmp/previous
+            cp /tmp/previous/results.json test262/results.json
+            cp /tmp/previous/results.json /tmp/previous-results.json
+          fi
+      - name: run test262
+        shell: bash
+        env:
+          PORF_T262_ERRLOG: /tmp/t262err
+        run: node test262/index.js --threads="$(nproc)" 2>&1 | tee /tmp/test262.log
+      - name: summary
+        if: always()
+        run: |
+          cat /tmp/t262err.* > /tmp/test262-failures.tsv 2>/dev/null || touch /tmp/test262-failures.tsv
+          prev=/tmp/previous-results.json
+          test -f "$prev" || prev=-
+          node test262/ci-summary.mjs /tmp/test262.log "$prev" test262/results.json /tmp/test262-failures.tsv
+          mkdir -p /tmp/test262-out
+          cp test262/results.json /tmp/test262-failures.tsv /tmp/test262.log /tmp/test262-out/ 2>/dev/null || true
+      - name: upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test262-results
+          path: /tmp/test262-out

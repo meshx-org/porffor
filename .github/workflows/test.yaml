@@ -38,6 +38,27 @@ jobs:
       # a selfhost compiler compiles regex literals ahead of time, so its C for a program
       # with them (and for the compiler itself: stage2) differs from the host's by design
       - name: verify selfhost compiler
-        run: ./selfhost verify --skip=v8_v7,regex,temporal,stage2
+        shell: bash
+        run: ./selfhost verify --skip=v8_v7,regex,temporal,stage2 2>&1 | tee /tmp/verify.log
       - name: test selfhost test262 harness
-        run: node test262/selfhost.js harness --threads=4 --expect-passes=112
+        shell: bash
+        run: node test262/selfhost.js harness --threads=4 --expect-passes=112 2>&1 | tee /tmp/harness.log
+      # the results as Markdown on the run's Summary page
+      - name: summary
+        if: always()
+        shell: bash
+        run: |
+          strip() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$1" 2>/dev/null | tr '\r' '\n'; }
+          {
+            echo '## Tests'
+            echo
+            echo '### selfhost verify'
+            echo
+            echo '| check | result |'
+            echo '|---|---|'
+            strip /tmp/verify.log | grep -E '^\[(ok|fail)\]' | sed -E 's/^\[ok\] (.*)$/| \1 | ✅ |/; s/^\[fail\] (.*)$/| \1 | ❌ |/'
+            echo
+            echo '### test262 harness through the selfhost compiler'
+            echo
+            strip /tmp/harness.log | grep -E '^(selfhost harness:|  🤠|vs node-hosted|expected )' | sed 's/^ *//; s/$/  /'
+          } >> "$GITHUB_STEP_SUMMARY"
