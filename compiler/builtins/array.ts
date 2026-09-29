@@ -385,10 +385,25 @@ export const __Array_prototype_shift = function (this: any[]) {
   if (len == 0) return undefined;
 
   const element: any = this[0];
-  const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
-  for (let i: i32 = 1; i < len; i++) {
-    if (__Porffor_array_hasIndex(this, i)) this[i - 1] = this[i];
-      else __Porffor_array_delete(this, i - 1);
+  // an array without holes: its entries moved down at once (a hole reads through the
+  // prototype chain, which the element by element move below does)
+  let dense: boolean = Porffor.type(this) == Porffor.TYPES.array;
+  if (dense) for (let i: i32 = 1; i < len; i++) if (!__Porffor_array_has(this, i)) {
+    dense = false;
+    break;
+  }
+
+  if (dense) {
+    const entries: i32 = __Porffor_array_ensure(this, len);
+    Porffor.IR.copy(entries, entries + 8, (len - 1) * 8);
+    Porffor.IR.gcBarrier(this, Porffor.TYPES.array);
+  } else {
+    const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
+    for (let i: i32 = 1; i < len; i++) {
+      if (__Porffor_array_hasIndex(this, i)) this[i - 1] = this[i];
+      else if (isArray) __Porffor_array_delete(this, i - 1);
+      else __Porffor_object_deleteStrict(this, Porffor.callThis(__Number_prototype_toString, i - 1));
+    }
   }
   __Porffor_array_setLength(this, len - 1);
 
@@ -1155,7 +1170,6 @@ export const __Array_prototype_sort = function (this: any[], callbackFn: any) {
     // an Array's default order compares ToString of each element, taken once
     n = Porffor.array.fastPush(keys, mode == 1 ? ecma262.ToString(x) : x);
   }
-
   __Porffor_array_mergeSort(vals, keys, n, mode, callbackFn);
 
   let i: i32 = 0;

@@ -2291,9 +2291,11 @@ const generateCall = (scope, decl) => {
   let name = decl.callee.name;
 
   // opt: virtualize IIFEs -> call the generated func by name
+  let iifeEnv = null;
   if (decl.callee.type === 'FunctionExpression' || decl.callee.type === 'ArrowFunctionExpression') {
     const [ func ] = generateFunc(scope, decl.callee, true);
     name = func.name;
+    if (getClosureSnapshotCaptureNames(func).length > 0) iifeEnv = closureEnvFor(scope, func);
   }
 
   if (name?.startsWith('__Porffor_IR_')) {
@@ -2508,7 +2510,7 @@ const generateCall = (scope, decl) => {
   }
 
   // resolve the callee to a known user func for a direct call
-  let func, directCallEnv = null, isBuiltin = false;
+  let func, directCallEnv = iifeEnv, isBuiltin = false;
   if (decl._funcIdx) func = funcByIndex(decl._funcIdx);
   else {
     const isBuiltinMember = decl.callee._builtinMember && name in builtinFuncs;
@@ -3753,7 +3755,7 @@ const generateAssign = (scope, decl, valueUnused = false) => {
     const obj = reuse(scope, generate(scope, decl.left.object));
     const res = tmp(scope, T.jsval);
     emitIf(scope, Bin('!=', T.i32, Bin('&', T.i32, JvType(obj), Const(T.i32, TYPE_FLAGS.length)), Const(T.i32, 0)),
-      () => assign(scope, res, storeLength(JvPtr(obj), Bin('==', T.i32, JvType(obj), Const(T.i32, TYPES.array)))),
+      () => assign(scope, res, coerceValue(storeLength(JvPtr(obj), Bin('==', T.i32, JvType(obj), Const(T.i32, TYPES.array))), T.jsval)),
       () => assign(scope, res, generate(scope, { ...decl, _internalAssign: true })));
     return valueUnused ? valUndefined() : res;
   }
@@ -6829,7 +6831,11 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
   if (typedInput && decl.returnType) {
     // unwrap Promise<T> for async functions
     const { type, types, irType } = extractTypeAnnotation(decl.returnType, func.async && !func.generator);
-    if (irType != null) func.retType = irType;
+    if (irType != null) {
+      func.retType = irType;
+      // a raw return type cannot carry the constructed object
+      if (irType !== T.jsval) func.constr = false;
+    }
     if (type != null) { typeUsed(func, type); func.returnType = type; }
     else if (types != null) { func.returnTypes = types; for (const x of types) typeUsed(func, x); }
   }
