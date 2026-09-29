@@ -1,6 +1,9 @@
 import type {} from './porffor.d.ts';
 
 export const Object = function (value: any): any {
+  // super() from a subclass: the subclass's this is the instance (made with its prototype)
+  if (Porffor.fastAnd(new.target !== undefined, new.target !== Object)) return undefined;
+
   if (value == null) {
     // if nullish, return new empty object
     return Porffor.object.new();
@@ -524,6 +527,7 @@ export const __Object_getOwnPropertySymbols = (obj: any): any[] => {
     let i: i32 = 0;
     for (; ptr < endPtr; ptr += 20) {
       if (Porffor.IR.loadU8(ptr, 18) != Porffor.TYPES.symbol) continue;
+      if (Porffor.IR.loadU8(ptr, 19) != 0) continue; // a private name
 
       let key: any = Porffor.as(Porffor.IR.loadI32(ptr, 4), Porffor.IR.loadU8(ptr, 18));
       out[i++] = key;

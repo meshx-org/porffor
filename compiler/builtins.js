@@ -2,7 +2,7 @@ import * as PrecompiledBuiltins from './builtins_precompiled.js';
 import { TYPES, TYPE_NAMES } from './types.js';
 import { Bin, Un, T, K, Const, JvConst, Box, JvType, JvNum, JvPtr, JvIsNum, Select, Convert, Reinterpret, CONVERT_SIGNED, N_KIND, N_TYPE, N_A, N_B, Local, Assign, Call, CallDynamic, If, TypeSwitch, Return, RawC, BlockStmt } from './ir.js';
 import './prefs.js';
-import { prototypeDescriptors, NAMESPACE_TO_STRING_TAGS } from './builtinDescriptors.js';
+import { prototypeDescriptors, NAMESPACE_TO_STRING_TAGS, TYPED_ARRAY_KINDS } from './builtinDescriptors.js';
 
 const f64FromBytes = bytes => {
   const floats = new Float64Array(1);
@@ -1108,6 +1108,28 @@ return sign * (i64)((((u64)*(u32*)(MEM + ptr + 4)) << 32) + (u64)*(u32*)(MEM + p
   // absent only while precompile first builds it
   if (_.SuppressedError) _.SuppressedError.jsLength = 3;
   _.__BigInt_prototype_toString.jsLength = 0;
+
+  // the spec's lengths where an implementation's parameters say otherwise (optional arguments
+  // are plain parameters there, a rest one counts nothing)
+  const SPEC_LENGTHS = {
+    Array: 1, Map: 0, Set: 0, WeakMap: 0, WeakSet: 0, Symbol: 0, Date: 7, DataView: 1,
+    __Array_from: 1, __Math_max: 2, __Math_min: 2, __Object_assign: 2, __String_fromCodePoint: 1,
+    __Atomics_notify: 3, __Atomics_wait: 4, __Iterator_prototype_reduce: 1, __Iterator_zip: 1, __Iterator_zipKeyed: 1,
+    __ArrayBuffer_prototype_transfer: 0, __ArrayBuffer_prototype_transferToFixedLength: 0,
+    __FinalizationRegistry_prototype_register: 2,
+    __Date_prototype_toLocaleString: 0, __Date_prototype_toLocaleDateString: 0, __Date_prototype_toLocaleTimeString: 0
+  };
+  const ARRAY_LIKE_LENGTHS = {
+    every: 1, some: 1, forEach: 1, map: 1, filter: 1, find: 1, findIndex: 1, findLast: 1, findLastIndex: 1,
+    reduce: 1, reduceRight: 1, indexOf: 1, lastIndexOf: 1, includes: 1, fill: 1, copyWithin: 2, set: 1
+  };
+  for (const [ method, n ] of Object.entries(ARRAY_LIKE_LENGTHS)) {
+    if (method !== 'set') SPEC_LENGTHS['__Array_prototype_' + method] = n;
+    SPEC_LENGTHS['__Porffor_TypedArray_prototype_' + method] = n;
+    for (const kind of TYPED_ARRAY_KINDS) SPEC_LENGTHS[`__${kind}_prototype_${method}`] = n;
+  }
+  Object.assign(SPEC_LENGTHS, { __Array_prototype_push: 1, __Array_prototype_unshift: 1, __Array_prototype_concat: 1 });
+  for (const [ name, n ] of Object.entries(SPEC_LENGTHS)) if (_[name]) _[name].jsLength = n;
 
   return _;
 };

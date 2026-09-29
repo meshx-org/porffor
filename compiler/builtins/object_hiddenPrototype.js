@@ -128,6 +128,19 @@ export const __Porffor_object_builtinParent = (f: any): any => {`;
   out += `
 
 export const __Porffor_object_builtinStatics = (f: any, store: object): void => {`;
+  // get [Symbol.species] (returns this) on the constructors that have one, in a program that
+  // names species (which also brings in the symbol)
+  out += `
+  if (Porffor.comptime.flag\`member.species\`) {`;
+  for (const ctor of [ 'Array', 'Map', 'Set', 'RegExp', 'Promise', 'ArrayBuffer', 'SharedArrayBuffer', '__Porffor_TypedArray' ]) {
+    if (!ctor.startsWith('__') && !ctors.has(ctor)) continue;
+    out += `
+    if (Porffor.comptime.flag\`hasFunc.${ctor}\`) {
+      if (f == ${ctor}) __Porffor_object_fastAddAccessor(store, Symbol.species, __Porffor_species$get, 0b0010);
+    }`;
+  }
+  out += `
+  }`;
   for (const [ ctor, methods ] of statics) {
     out += `
   if (Porffor.comptime.flag\`hasFunc.${ctor}\`) {

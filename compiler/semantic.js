@@ -228,6 +228,20 @@ const nearestStrictEvalScope = () => {
   return scope && (scope._strictEval || scope._strict) ? scope : null;
 };
 
+// Annex B.3.3: a sloppy function declared in a block is also a var of its function, unless
+// replacing it with `var name` would be an early error: a lexical binding of the name in a scope
+// between the block and the function (for (let f of ...) { { function f() {} } }). Then it is
+// the block's alone
+const annexBConflict = name => {
+  const funcInd = scopes.lastFuncs.at(-1);
+  if (scopes.length - 1 - funcInd <= 1) return false; // directly in the function body
+  for (let i = funcInd + 1; i < scopes.length; i++) {
+    const variable = scopes[i]._variables?.[name];
+    if (variable && variable.kind !== 'var' && variable.kind !== 'function-name') return true;
+  }
+  return false;
+};
+
 const evalLexicalConflict = name => {
   const evalScope = nearestEvalScope();
   if (!evalScope) return false;
@@ -296,7 +310,7 @@ const parseEval = node => {
   try {
     node._evalParsed = {
       type: 'BlockStatement',
-      body: semantic(semantic.objectHack(parse(code)), node._semanticScopes).body
+      body: semantic(semantic.objectHack(parse(code, null, node._indirectEval || node.optional ? null : evalContext())), node._semanticScopes).body
     };
   } catch (e) {
     if (e.name !== 'SyntaxError') throw e;
@@ -414,6 +428,13 @@ const analyze = (node, strict = false) => {
 
   let openedScope = false;
   switch (node.type) {
+    case 'IfStatement':
+      // Annex B.3.3: if (x) function f() {} is as if the function were in a block of its own
+      for (const k of [ 'consequent', 'alternate' ]) {
+        if (node[k]?.type === 'FunctionDeclaration') node[k] = { type: 'BlockStatement', body: [ node[k] ], start: node[k].start, end: node[k].end };
+      }
+      break;
+
     case 'ForStatement':
     case 'ForInStatement':
     case 'ForOfStatement':
@@ -468,7 +489,7 @@ const analyze = (node, strict = false) => {
     case 'FunctionDeclaration':
       if (node.id?.name) {
         node.id._binding = true;
-        declVar(node.id.name, (strict || evalLexicalConflict(node.id.name)) ? 'let' : 'var', node);
+        declVar(node.id.name, (strict || evalLexicalConflict(node.id.name) || annexBConflict(node.id.name)) ? 'let' : 'var', node);
       }
     case 'FunctionExpression':
     case 'ArrowFunctionExpression':
@@ -506,8 +527,48 @@ const analyze = (node, strict = false) => {
   }
 };
 
+// what a direct eval's source may use of its caller's: the enclosing classes' private
+// names, super.x (in a method, a field initialiser or a static block), super() (in a derived
+// class's constructor) and new.target (in a function other than an arrow)
+const evalContextStack = [];
+const evalContextEntry = (node, parent, key) => {
+  if (node.type === 'ClassDeclaration' || node.type === 'ClassExpression')
+    return { cls: node, names: node.body.body.filter(x => x.key?.type === 'PrivateIdentifier').map(x => x.key.name) };
+  if (node.type === 'ArrowFunctionExpression') return { arrow: true };
+  if (node.type === 'FunctionDeclaration' || node.type === 'FunctionExpression') {
+    const method = parent?.type === 'MethodDefinition' || (parent?.type === 'Property' && (parent.method || parent.kind === 'get' || parent.kind === 'set'));
+    const cls = evalContextStack.findLast(x => x.cls)?.cls;
+    return { home: method, derivedCtor: parent?.type === 'MethodDefinition' && parent.kind === 'constructor' && !!cls?.superClass };
+  }
+  if ((parent?.type === 'PropertyDefinition' && key === 'value') || node.type === 'StaticBlock') return { home: true, derivedCtor: false };
+  return null;
+};
+
+const evalContext = () => {
+  const ctx = { privateNames: [], superProperty: false, superCall: false, newTarget: false };
+  let settled = false;
+  for (let i = evalContextStack.length - 1; i >= 0; i--) {
+    const x = evalContextStack[i];
+    if (x.names) ctx.privateNames.push(...x.names);
+    else if (!settled && !x.arrow) {
+      settled = true;
+      ctx.newTarget = true;
+      ctx.superProperty = x.home;
+      ctx.superCall = x.derivedCtor;
+    }
+  }
+  return ctx;
+};
+
 const annotate = (node, parent = null, key = null) => {
   if (!node) return;
+  const ctx = evalContextEntry(node, parent, key);
+  if (ctx) evalContextStack.push(ctx);
+  annotateNode(node, parent, key);
+  if (ctx) evalContextStack.pop();
+};
+
+const annotateNode = (node, parent, key) => {
 
   let openedScope = false;
   let openedFunc = false;
@@ -736,6 +797,15 @@ const annotate = (node, parent = null, key = null) => {
       return;
 
     case 'CallExpression': {
+      // f('a', 1): each named function's calls with only literal arguments, for codegen to
+      // specialise a new Function in it whose source is made of its parameters
+      if (node.callee.type === 'Identifier' && node.arguments.length > 0 && node.arguments.every(x => x.type === 'Literal')) {
+        const calls = semantic.literalCalls;
+        if (!calls.has(node.callee.name)) calls.set(node.callee.name, []);
+        const list = calls.get(node.callee.name);
+        if (list.length < 16) list.push(node.arguments.map(x => x.value));
+      }
+
       const evalKind = evalCallKind(node);
       if (evalKind) {
         node._evalScope = true;
@@ -798,6 +868,7 @@ const semantic = (node, _scopes = null) => {
   if (!_scopes) {
     _scopes = [ node ];
     _scopes.lastFuncs = [ 0 ];
+    semantic.literalCalls = new Map();
   }
   scopes = _scopes;
 
@@ -812,3 +883,4 @@ const semantic = (node, _scopes = null) => {
 };
 export default semantic;
 semantic.objectHack = x => x;
+semantic.literalCalls = new Map();

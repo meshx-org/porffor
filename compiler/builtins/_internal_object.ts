@@ -21,7 +21,7 @@ import type {} from './porffor.d.ts';
 //   writable - 0b1000
 //  value - type (u8, 1)
 //  key - type (u8, 1)
-//  padding (u8, 1)
+//  private - 1 for a private name (#x), which no reflection sees (u8, 1)
 // 20-byte stride means the value payload is only 8-aligned every other entry: it needs unaligned loads/stores
 
 // hash key for hashmap
@@ -101,7 +101,7 @@ export const __Porffor_object_writeKey = (ptr: i32, key: any, hash: i32): void =
   Porffor.IR.storeI32(ptr, 0, hash);
 
   Porffor.IR.storeI32(ptr, 4, key);
-  Porffor.IR.storeU8(ptr, 18, Porffor.type(key));
+  Porffor.IR.storeU16(ptr, 18, Porffor.type(key)); // (and 0 in the padding: not private)
 };
 
 export const __Porffor_object_new = (capacity: i32 = 4): object => {
@@ -896,7 +896,7 @@ export const __Porffor_object_addAt = (obj: any, i: i32, keyPtr: i32, hash: i32,
   // writable, enumerable, configurable, not an accessor: a new data property
   Porffor.IR.storeU8(entryPtr, 16, 0b1110);
   Porffor.IR.storeU8(entryPtr, 17, Porffor.type(value));
-  Porffor.IR.storeU8(entryPtr, 18, Porffor.TYPES.bytestring);
+  Porffor.IR.storeU16(entryPtr, 18, Porffor.TYPES.bytestring);
   Porffor.IR.storeU16(obj, 0, i + 1);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
   return true;
@@ -925,7 +925,7 @@ export const __Porffor_object_tryAddProperty = (obj: any, keyPtr: i32, value: an
     Porffor.IR.storeU16(obj, 0, size + 1);
     Porffor.IR.storeI32(entryPtr, 0, hash);
     Porffor.IR.storeI32(entryPtr, 4, keyPtr);
-    Porffor.IR.storeU8(entryPtr, 18, Porffor.TYPES.bytestring);
+    Porffor.IR.storeU16(entryPtr, 18, Porffor.TYPES.bytestring);
   } else entryPtr = __Porffor_object_appendEntry(obj, Porffor.as(keyPtr, Porffor.TYPES.bytestring), hash);
   Porffor.IR.storeUnF64(entryPtr, 8, value);
   // writable, enumerable, configurable, not an accessor: a new data property
@@ -1865,4 +1865,126 @@ export const __Porffor_object_class_set = (obj: any, key: any, set: any): void =
   Porffor.IR.storeU8(entryPtr, 16, 0b1011);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, get);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, set);
+};
+
+// A class's private names (#x) are symbols its code holds, their properties marked private
+// (the entry's last byte): no reflection sees one, and only a class's own objects have one.
+// A private name's property on an object: its entry, 0 when the object has none
+export const __Porffor_object_privateEntry = (obj: any, key: any): i32 => {
+  if (!Porffor.object.isObject(obj)) return 0;
+  if (Porffor.type(obj) != Porffor.TYPES.object) obj = __Porffor_object_underlying(obj);
+  if (Porffor.type(obj) != Porffor.TYPES.object) return 0;
+
+  const entryPtr: i32 = __Porffor_object_lookup(obj, key, __Porffor_object_hash(key));
+  if (entryPtr == 0 || Porffor.IR.loadU8(entryPtr, 19) != 1) return 0;
+  return entryPtr;
+};
+
+export const __Porffor_privateName = (description: bytestring): Symbol => Symbol(description);
+
+// a class element's private name on obj (a field, method or accessor half): kind 0 is a field,
+// 1 a method, 2 a getter and 3 a setter. mark 1 is obj's own (it has the name); 2 a template
+// on a constructor, of a method its instances get (it does not have the name). Unlike a
+// property, one a class adds twice (a constructor returning an object that already has it)
+// is a TypeError
+export const __Porffor_object_definePrivate = (obj: any, key: any, value: any, kind: i32, mark: i32): void => {
+  if (Porffor.type(obj) != Porffor.TYPES.object) obj = __Porffor_object_underlying(obj);
+
+  const hash: i32 = __Porffor_object_hash(key);
+  let entryPtr: i32 = __Porffor_object_lookup(obj, key, hash);
+  if (entryPtr != 0) {
+    // the other half of an accessor pair
+    if (kind < 2 || (Porffor.IR.loadU8(entryPtr, 16) & 0b0001) == 0) throw new TypeError('Cannot initialize a private member twice on the same object');
+  } else {
+    entryPtr = __Porffor_object_appendEntry(obj, key, hash);
+    Porffor.IR.storeU8(entryPtr, 19, mark);
+  }
+
+  if (kind >= 2) {
+    let get: any = undefined;
+    let set: any = undefined;
+    if (Porffor.IR.loadU8(entryPtr, 16) & 0b0001) {
+      get = __Porffor_object_accessorGet(entryPtr);
+      set = __Porffor_object_accessorSet(entryPtr);
+    }
+    if (kind == 2) get = value;
+    else set = value;
+
+    __Porffor_object_writeAccessor(entryPtr, get, set);
+    Porffor.IR.storeU8(entryPtr, 16, 0b0001);
+  } else {
+    Porffor.IR.storeUnF64(entryPtr, 8, value);
+    Porffor.IR.storeU8(entryPtr, 16, kind == 0 ? 0b1000 : 0b0000);
+    Porffor.IR.storeU8(entryPtr, 17, Porffor.type(value));
+  }
+  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+};
+
+// the constructor's private methods (templates) given to a new instance, before its fields
+export const __Porffor_object_initPrivateMethod = (obj: any, ctor: any, key: any): void => {
+  if (Porffor.type(ctor) != Porffor.TYPES.object) ctor = __Porffor_object_underlying(ctor);
+  const from: i32 = __Porffor_object_lookup(ctor, key, __Porffor_object_hash(key));
+
+  const flags: i32 = Porffor.IR.loadU8(from, 16);
+  if (flags & 0b0001) {
+    const get: any = __Porffor_object_accessorGet(from);
+    const set: any = __Porffor_object_accessorSet(from);
+    if (get !== undefined) __Porffor_object_definePrivate(obj, key, get, 2, 1);
+    if (set !== undefined) __Porffor_object_definePrivate(obj, key, set, 3, 1);
+    // (a getter-only or setter-only pair still has the name)
+    if (Porffor.fastAnd(get === undefined, set === undefined)) __Porffor_object_definePrivate(obj, key, undefined, 2, 1);
+    return;
+  }
+
+  __Porffor_object_definePrivate(obj, key, __Porffor_object_readValue(from), 1, 1);
+};
+
+// obj.#x
+export const __Porffor_object_getPrivate = (obj: any, key: any): any => {
+  const entryPtr: i32 = __Porffor_object_privateEntry(obj, key);
+  if (entryPtr == 0) throw new TypeError('Cannot read a private member from an object whose class did not declare it');
+
+  if (Porffor.IR.loadU8(entryPtr, 16) & 0b0001) {
+    const get: Function = __Porffor_object_accessorGet(entryPtr);
+    if (Porffor.IR.ptr(get) == 0) throw new TypeError('Private accessor was defined without a getter');
+    return Porffor.callThis(get, obj);
+  }
+
+  return __Porffor_object_readValue(entryPtr);
+};
+
+// obj.#x = value: a field is written whatever the object's integrity (Object.freeze leaves
+// private members alone); a method is not writable, which the caller knows (setPrivateMethod)
+export const __Porffor_object_setPrivate = (obj: any, key: any, value: any): void => {
+  const entryPtr: i32 = __Porffor_object_privateEntry(obj, key);
+  if (entryPtr == 0) throw new TypeError('Cannot write a private member to an object whose class did not declare it');
+
+  if (Porffor.IR.loadU8(entryPtr, 16) & 0b0001) {
+    const set: Function = __Porffor_object_accessorSet(entryPtr);
+    if (Porffor.IR.ptr(set) == 0) throw new TypeError('Private accessor was defined without a setter');
+    Porffor.callThis(set, obj, value);
+    return;
+  }
+
+  Porffor.IR.storeUnF64(entryPtr, 8, value);
+  Porffor.IR.storeU8(entryPtr, 17, Porffor.type(value));
+  if (Porffor.type(obj) != Porffor.TYPES.object) obj = __Porffor_object_underlying(obj);
+  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+};
+
+// obj.#m = value, of a private method: a TypeError either way (which one says why)
+export const __Porffor_object_setPrivateMethod = (obj: any, key: any): void => {
+  if (__Porffor_object_privateEntry(obj, key) == 0) throw new TypeError('Cannot write a private member to an object whose class did not declare it');
+  throw new TypeError('Private method is not writable');
+};
+
+// #x in obj
+export const __Porffor_object_hasPrivate = (obj: any, key: any): boolean => {
+  if (!Porffor.object.isObject(obj)) throw new TypeError('Cannot use \'in\' operator to search for a private name in a non-object');
+  return __Porffor_object_privateEntry(obj, key) != 0;
+};
+
+// get [Symbol.species] of the built-in constructors that have one: the constructor it is read off
+export const __Porffor_species$get = function (this: any) {
+  return this;
 };

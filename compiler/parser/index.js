@@ -885,7 +885,10 @@ const canAwait = () => {
 };
 const allowSuper = () => (currentThisScope().flags & SCOPE_SUPER) > 0;
 const allowDirectSuper = () => (currentThisScope().flags & SCOPE_DIRECT_SUPER) > 0;
+// direct eval source: what its caller allows (super.x in a method, new.target in a function)
+let evalNewTarget = false;
 const allowNewDotTarget = () => {
+  if (evalNewTarget) return true;
   for (let i = scopeStack.length - 1; i >= 0; i--) {
     const flags = scopeStack[i].flags;
     if ((flags & (SCOPE_STATIC_BLOCK | SCOPE_FIELD_INIT)) ||
@@ -4580,7 +4583,10 @@ export default (src, opts = {}) => {
   strict = isModule;
   scopeStack = [];
   labels = [];
-  privateStack = [];
+  // a direct eval's source sees its caller's private names, super and new.target
+  const evalContext = opts.evalContext;
+  privateStack = evalContext?.privateNames?.length > 0 ? [ { declared: Object.fromEntries(evalContext.privateNames.map(x => [ x, 'true' ])), used: [] } ] : [];
+  evalNewTarget = !!evalContext?.newTarget;
   potentialArrowAt = -1;
   potentialArrowInForAwait = false;
   yieldPos = 0;
@@ -4589,7 +4595,7 @@ export default (src, opts = {}) => {
   undefinedExports = isModule ? new Map() : null;
   exportsSeen = isModule ? {} : null;
 
-  enterScope(SCOPE_TOP);
+  enterScope(SCOPE_TOP | (evalContext?.superProperty ? SCOPE_SUPER : 0) | (evalContext?.superCall ? SCOPE_DIRECT_SUPER : 0));
   if (!isModule && strictDirective(pos)) strict = true;
 
   next();
@@ -4607,6 +4613,11 @@ export default (src, opts = {}) => {
   if (undefinedExports) {
     for (const [ name, p ] of undefinedExports) raise(p, `Export '${name}' is not defined`);
   }
+  if (privateStack.length > 0) {
+    const { declared, used } = privateStack.pop();
+    for (const id of used) if (!Object.hasOwn(declared, id.name)) raise(id.start, `Private field '#${id.name}' must be declared in an enclosing class`);
+  }
+  evalNewTarget = false;
   exitScope();
 
   return { type: 'Program', start: 0, end: inputLen, body, sourceType: isModule ? 'module' : 'script' };

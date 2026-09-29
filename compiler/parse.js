@@ -372,7 +372,8 @@ const bindHomeObjects = (node, parent = null, parentKey = null) => {
   if (Array.isArray(node)) return node.forEach(x => bindHomeObjects(x, parent, parentKey));
   if (node.type === 'ClassDeclaration' || node.type === 'ClassExpression') {
     for (const x of node.body.body) {
-      if (x.type !== 'MethodDefinition' || x.kind === 'constructor') continue;
+      // (a constructor's too: its this may be another object, a parent's constructor's return)
+      if (x.type !== 'MethodDefinition') continue;
       if (!usesSuperProperty(x.value.params) && !usesSuperProperty(x.value.body)) continue;
       node.id ??= { type: 'Identifier', name: `${inferredName(parent, parentKey)}#home_${node.start ?? 0}`, start: node.start, end: node.start };
       x.value.homeRef = { type: 'Identifier', name: node.id.name, start: x.start, end: x.start };
@@ -387,15 +388,16 @@ const bindHomeObjects = (node, parent = null, parentKey = null) => {
   }
 };
 
-// entry: link options for a program entry ({ file?, scripts? }), null for a lone source
-export default (input, entry = null) => {
+// entry: link options for a program entry ({ file?, scripts? }), null for a lone source;
+// evalContext: a direct eval's caller's (see the parser)
+export default (input, entry = null, evalContext = null) => {
   const types = Prefs.parseTypes || Prefs.t || globalThis.file?.endsWith('.ts');
   globalThis.typedInput = types && Prefs.optTypes;
 
   const file = entry?.file ?? globalThis.file;
   const linking = entry && file && !globalThis.precompile;
   const path = linking && (file[0] === '/' ? file : process.cwd() + '/' + file);
-  let ast = linking && Prefs.module ? link(input, path, { ts: types, scripts: entry.scripts }) : parse(input, { module: !!Prefs.module, ts: types });
+  let ast = linking && Prefs.module ? link(input, path, { ts: types, scripts: entry.scripts }) : parse(input, { module: !!Prefs.module, ts: types, evalContext });
   // a script's import() calls load modules too
   if (linking && !Prefs.module && /\bimport\b/.test(input) && usesImportCall(ast)) ast = link(input, path, { ts: types, script: ast });
   if (ast._ts) globalThis.typedInput = Prefs.optTypes;

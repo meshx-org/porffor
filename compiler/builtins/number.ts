@@ -395,6 +395,32 @@ export const __Number_prototype_valueOf = function (this: any): number {
 };
 
 
+// parseInt's digits [from, to) (character indices of input) again, exactly: in radix 10 more than
+// 15 digits through StringToNumber (correctly rounded, where n * 10 + d rounds at every step);
+// in a power-of-two radix the first 53 significant bits, the next one to round on and whether
+// any below it is set (round half to even), as the spec asks for these radixes
+export const __Porffor_parseInt_exact = (input: string|bytestring, from: i32, to: i32, radix: i32): f64 => {
+  if (radix == 10) return __ecma262_StringToNumber(input.substring(from, to));
+
+  let bits: i32 = 1;
+  while ((1 << bits) < radix) bits++;
+  let m: f64 = 0, shift: i32 = 0, round: i32 = -1, sticky: boolean = false;
+  for (let k: i32 = from; k < to; k++) {
+    const c: i32 = input.charCodeAt(k);
+    const d: i32 = c <= 57 ? c - 48 : (c >= 97 ? c - 87 : c - 55);
+    for (let b: i32 = bits - 1; b >= 0; b--) {
+      const bit: i32 = (d >> b) & 1;
+      if (shift == 0 && m * 2 + bit < 9007199254740992) { m = m * 2 + bit; continue; }
+      // m holds 53 bits: this one is below them
+      shift++;
+      if (round < 0) round = bit;
+        else if (bit != 0) sticky = true;
+    }
+  }
+  if (round == 1 && (sticky || m % 2 == 1)) m += 1;
+  return m * Math.pow(2, shift);
+};
+
 export const parseInt = (input: any, radix: any): f64 => {
   // todo/perf: optimize this instead of doing a naive algo (https://kholdstare.github.io/technical/2020/05/26/faster-integer-parsing.html)
   // todo/perf: use i32s here once that becomes not annoying
@@ -448,19 +474,24 @@ export const parseInt = (input: any, radix: any): f64 => {
       }
     }
 
+    const digitsFrom: i32 = i - inputPtr;
+    let digitsTo: i32 = digitsFrom;
     while (i < endPtr) {
       const chr: i32 = Porffor.IR.loadU8(i++, 4);
 
       if (chr >= 48 && chr < nMax) {
         if (Number.isNaN(n)) n = 0;
         n = (n * radix) + chr - 48;
+        digitsTo = i - inputPtr;
       } else if (radix > 10) {
         if (chr >= 97 && chr < (87 + radix)) {
           if (Number.isNaN(n)) n = 0;
           n = (n * radix) + chr - 87;
+        digitsTo = i - inputPtr;
         } else if (chr >= 65 && chr < (55 + radix)) {
           if (Number.isNaN(n)) n = 0;
           n = (n * radix) + chr - 55;
+        digitsTo = i - inputPtr;
         } else {
           break;
         }
@@ -468,6 +499,10 @@ export const parseInt = (input: any, radix: any): f64 => {
         break;
       }
     }
+
+    // past what n * radix + d keeps exact: again, exactly
+    if (Porffor.fastOr(Porffor.fastAnd(n >= 9007199254740992, (radix & (radix - 1)) == 0), Porffor.fastAnd(radix == 10, digitsTo - digitsFrom > 15)))
+      n = __Porffor_parseInt_exact(input, digitsFrom, digitsTo, radix);
 
     if (negative) return -n;
     return n;
@@ -498,6 +533,8 @@ export const parseInt = (input: any, radix: any): f64 => {
     }
   }
 
+  const digitsFrom: i32 = (i - inputPtr) >> 1;
+  let digitsTo: i32 = digitsFrom;
   while (i < endPtr) {
     const chr: i32 = Porffor.IR.loadU16(i, 4);
     i += 2;
@@ -505,13 +542,16 @@ export const parseInt = (input: any, radix: any): f64 => {
     if (chr >= 48 && chr < nMax) {
       if (Number.isNaN(n)) n = 0;
       n = (n * radix) + chr - 48;
+      digitsTo = (i - inputPtr) >> 1;
     } else if (radix > 10) {
       if (chr >= 97 && chr < (87 + radix)) {
         if (Number.isNaN(n)) n = 0;
         n = (n * radix) + chr - 87;
+      digitsTo = (i - inputPtr) >> 1;
       } else if (chr >= 65 && chr < (55 + radix)) {
         if (Number.isNaN(n)) n = 0;
         n = (n * radix) + chr - 55;
+      digitsTo = (i - inputPtr) >> 1;
       } else {
         break;
       }
@@ -519,6 +559,9 @@ export const parseInt = (input: any, radix: any): f64 => {
       break;
     }
   }
+
+  if (Porffor.fastOr(Porffor.fastAnd(n >= 9007199254740992, (radix & (radix - 1)) == 0), Porffor.fastAnd(radix == 10, digitsTo - digitsFrom > 15)))
+    n = __Porffor_parseInt_exact(input, digitsFrom, digitsTo, radix);
 
   if (negative) return -n;
   return n;

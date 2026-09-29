@@ -1249,6 +1249,13 @@ if (cluster.isPrimary) {
 
     out += (job.i << 4);
 
+    // PORF_T262_ERRLOG=path: each failure's file and message, one file per worker (a full run at
+    // every thread, where --log-errors runs one)
+    if (!pass && process.env.PORF_T262_ERRLOG) {
+      const msg = error ? `${error?.constructor?.name ?? 'Error'}: ${error?.message ?? error}` : runIconTable[out & 0b1111];
+      fs.appendFileSync(`${process.env.PORF_T262_ERRLOG}.${process.pid}`, `${job.file}\t${String(msg).replace(/\s+/g, ' ').slice(0, 300)}\n`);
+    }
+
     if (logErrors) {
       let e = (!pass && error ? (error?.stack || error.toString()) : '');
 

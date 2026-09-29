@@ -36,7 +36,12 @@ const TO_STRING_TAGS = [ 'Map', 'Set', 'WeakMap', 'WeakSet', 'WeakRef', 'Promise
 // builtin, so no member demand), so they are always there
 const SYMBOL_METHODS = {
   DisposableStack: [ [ 'dispose', 'dispose' ] ],
-  AsyncDisposableStack: [ [ 'asyncDispose', 'disposeAsync' ] ]
+  AsyncDisposableStack: [ [ 'asyncDispose', 'disposeAsync' ] ],
+  // a __ name is a function of its own (not also a string-keyed method), made when a program
+  // names the symbol
+  RegExp: [ [ 'match', '__Porffor_regex_symbolMatch' ], [ 'matchAll', '__Porffor_regex_symbolMatchAll' ],
+    [ 'search', '__Porffor_regex_symbolSearch' ], [ 'replace', '__Porffor_regex_symbolReplace' ],
+    [ 'split', '__Porffor_regex_symbolSplit' ] ]
 };
 
 const METHOD_ATTRS = { writable: true, enumerable: false, configurable: true };
@@ -112,8 +117,10 @@ export const prototypeDescriptors = (funcNames, isConstructor) => {
     // a typed array kind's prototype has its element size, as its constructor does
     if (isTypedArrayKind) props.push({ key: 'BYTES_PER_ELEMENT', kind: 'data', value: BYTES_PER_ELEMENT[base], attrs: { writable: false, enumerable: false, configurable: false } });
 
-    for (const [ symbol, method ] of SYMBOL_METHODS[base] ?? [])
-      props.push({ symbol, kind: 'method', func: name + '_' + method, attrs: METHOD_ATTRS, always: true });
+    for (const [ symbol, method ] of SYMBOL_METHODS[base] ?? []) {
+      if (method.startsWith('__')) props.push({ symbol, kind: 'method', func: method, attrs: METHOD_ATTRS, always: true, demand: symbol });
+        else props.push({ symbol, kind: 'method', func: name + '_' + method, attrs: METHOD_ATTRS, always: true });
+    }
     // a typed array's tag is a getter on %TypedArray%.prototype; a kind's own too, in a program
     // whose kinds do not inherit from it
     if (name === '__Porffor_TypedArray_prototype' || isTypedArrayKind)

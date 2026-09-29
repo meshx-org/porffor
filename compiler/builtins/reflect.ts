@@ -110,6 +110,7 @@ export const __Reflect_ownKeys = (target: any) => {
     const endPtr: i32 = ptr + Porffor.IR.loadU16(target, 0) * 20;
 
     for (; ptr < endPtr; ptr += 20) {
+      if (Porffor.IR.loadU8(ptr, 19) != 0) continue; // a private name
       let key: any = Porffor.as(Porffor.IR.loadI32(ptr, 4), Porffor.IR.loadU8(ptr, 18));
 
       out[i++] = key;

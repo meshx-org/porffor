@@ -130,6 +130,8 @@ export const __Porffor_iter_close = (rec: any): void => {
   if (rec.builtin) {
     it.__done = true;
     if (it.__under !== undefined) __Porffor_iter_close(it.__under);
+    if (Porffor.comptime.flag`hasFunc.__Iterator_zip`) __Porffor_iter_zipClose(it);
+    if (Porffor.comptime.flag`hasFunc.__Iterator_zipKeyed`) __Porffor_iter_zipClose(it);
     return;
   }
   if (Porffor.comptime.flag`hasType.__porffor_generator`) {
@@ -264,6 +266,12 @@ const ITER_FILTER: i32 = 6;
 const ITER_TAKE: i32 = 7;
 const ITER_DROP: i32 = 8;
 const ITER_FLATMAP: i32 = 9;
+const ITER_ZIP: i32 = 10; // Iterator.zip / zipKeyed: records in __recs (__iters: null once one is padded)
+
+// Iterator.zip's modes
+const ZIP_SHORTEST: i32 = 0;
+const ZIP_LONGEST: i32 = 1;
+const ZIP_STRICT: i32 = 2;
 
 let __Porffor_iter_protoObj: any = undefined;
 let __Porffor_iter_helperProtoObj: any = undefined;
@@ -277,6 +285,8 @@ export const __Porffor_iter_helperProto = (): object => {
     if (!this.__done) {
       this.__done = true;
       if (this.__under !== undefined) __Porffor_iter_close(this.__under);
+      if (Porffor.comptime.flag`hasFunc.__Iterator_zip`) __Porffor_iter_zipClose(this);
+      if (Porffor.comptime.flag`hasFunc.__Iterator_zipKeyed`) __Porffor_iter_zipClose(this);
     }
     const result: object = {};
     result.value = value;
@@ -377,6 +387,9 @@ export const __Porffor_iter_builtinStep = (it: any): any => {
     if (it.__under.done) it.__done = true;
     return v;
   }
+  if (Porffor.comptime.flag`hasFunc.__Iterator_zip`) if (kind == ITER_ZIP) return __Porffor_iter_zipStep(it);
+  if (Porffor.comptime.flag`hasFunc.__Iterator_zipKeyed`) if (kind == ITER_ZIP) return __Porffor_iter_zipStep(it);
+
   // ITER_FLATMAP: the inner iterator's values, then the next outer value's
   if (Porffor.comptime.flag`member.flatMap`) while (true) {
     if (it.__inner !== undefined) {
@@ -592,6 +605,255 @@ export const __Iterator_from = (obj: any): object => {
   const wrap: object = __Porffor_iter_new(undefined, ITER_WRAP);
   wrap.__under = __Porffor_iter_openDirect(it);
   return wrap;
+};
+
+// ---- Iterator.zip / Iterator.zipKeyed (joint iteration) ----
+
+// IteratorCloseAll(records, a throw): each still open closed, last first, their errors ignored
+export const __Porffor_iter_closeAllThrow = (recs: any[]): void => {
+  for (let i: i32 = recs.length - 1; i >= 0; i--) {
+    try {
+      __Porffor_iter_close(recs[i]);
+    } catch {}
+  }
+};
+
+// IteratorCloseAll(records, a return): each still open closed, last first; the first error
+// is thrown once all are
+export const __Porffor_iter_closeAll = (recs: any[]): void => {
+  let threw: boolean = false;
+  let error: any = undefined;
+  for (let i: i32 = recs.length - 1; i >= 0; i--) {
+    try {
+      __Porffor_iter_close(recs[i]);
+    } catch (e) {
+      if (!threw) {
+        threw = true;
+        error = e;
+      }
+    }
+  }
+  if (threw) throw error;
+};
+
+// a zip's return, or a loop leaving it: what it zips closed
+export const __Porffor_iter_zipClose = (it: any): void => {
+  if (it.__kind != ITER_ZIP) return;
+  __Porffor_iter_closeAll(it.__recs);
+};
+
+// GetIteratorFlattenable(value, reject-strings)
+export const __Porffor_iter_flattenable = (value: any): object => {
+  if (!Porffor.object.isObject(value)) throw new TypeError('Iterator.zip: an iterable is not an object');
+  const method: any = value[Symbol.iterator];
+  let it: any = value;
+  if (method != null) it = Porffor.callThis(method, value);
+  if (!Porffor.object.isObject(it)) throw new TypeError('Iterator.zip: an iterator is not an object');
+  return __Porffor_iter_openDirect(it);
+};
+
+// the options' mode (on the new zip) and, for longest, its padding option
+export const __Porffor_iter_zipOptions = (options: any, it: any): any => {
+  it.__mode = ZIP_SHORTEST;
+  if (options === undefined) return undefined;
+  if (!Porffor.object.isObject(options)) throw new TypeError('Iterator.zip: options is not an object');
+
+  const mode: any = options.mode;
+  if (Porffor.fastAnd(mode !== undefined, mode !== 'shortest')) {
+    if (mode === 'longest') it.__mode = ZIP_LONGEST;
+    else if (mode === 'strict') it.__mode = ZIP_STRICT;
+    else throw new TypeError('Iterator.zip: mode must be "shortest", "longest" or "strict"');
+  }
+  if (it.__mode != ZIP_LONGEST) return undefined;
+
+  const padding: any = options.padding;
+  if (Porffor.fastAnd(padding !== undefined, !Porffor.object.isObject(padding))) throw new TypeError('Iterator.zip: padding is not an object');
+  return padding;
+};
+
+export const __Porffor_iter_newZip = (recs: any[], padding: any[], keys: any, it: any): object => {
+  it.__recs = recs;
+  const iters: any[] = Porffor.array.new(4);
+  const len: i32 = recs.length;
+  for (let i: i32 = 0; i < len; i++) Porffor.array.fastPush(iters, recs[i]);
+  it.__iters = iters;
+  it.__padding = padding;
+  it.__keys = keys;
+  return it;
+};
+
+export const __Iterator_zip = (iterables: any, options: any): object => {
+  if (!Porffor.object.isObject(iterables)) throw new TypeError('Iterator.zip: iterables is not an object');
+  const it: object = __Porffor_iter_new(undefined, ITER_ZIP);
+  const paddingOption: any = __Porffor_iter_zipOptions(options, it);
+
+  const recs: any[] = Porffor.array.new(4);
+  const input: any = __Porffor_iter_open(iterables);
+  while (true) {
+    let value: any = undefined;
+    try {
+      value = __Porffor_iter_step(input);
+    } catch (e) {
+      __Porffor_iter_closeAllThrow(recs);
+      throw e;
+    }
+    if (input.done) break;
+
+    let rec: any = undefined;
+    try {
+      rec = __Porffor_iter_flattenable(value);
+    } catch (e) {
+      __Porffor_iter_closeAllThrow(recs);
+      try {
+        __Porffor_iter_close(input);
+      } catch {}
+      throw e;
+    }
+    Porffor.array.fastPush(recs, rec);
+  }
+
+  const count: i32 = recs.length;
+  const padding: any[] = Porffor.array.new(4);
+  if (it.__mode == ZIP_LONGEST) {
+    if (paddingOption === undefined) {
+      for (let i: i32 = 0; i < count; i++) Porffor.array.fastPush(padding, undefined);
+    } else {
+      try {
+        const pad: any = __Porffor_iter_open(paddingOption);
+        let using: boolean = true;
+        for (let i: i32 = 0; i < count; i++) {
+          let v: any = undefined;
+          if (using) {
+            v = __Porffor_iter_step(pad);
+            if (pad.done) {
+              using = false;
+              v = undefined;
+            }
+          }
+          Porffor.array.fastPush(padding, v);
+        }
+        if (using) __Porffor_iter_close(pad);
+      } catch (e) {
+        __Porffor_iter_closeAllThrow(recs);
+        throw e;
+      }
+    }
+  }
+
+  return __Porffor_iter_newZip(recs, padding, undefined, it);
+};
+
+export const __Iterator_zipKeyed = (iterables: any, options: any): object => {
+  if (!Porffor.object.isObject(iterables)) throw new TypeError('Iterator.zipKeyed: iterables is not an object');
+  const it: object = __Porffor_iter_new(undefined, ITER_ZIP);
+  const paddingOption: any = __Porffor_iter_zipOptions(options, it);
+
+  const recs: any[] = Porffor.array.new(4);
+  const keys: any[] = Porffor.array.new(4);
+  const padding: any[] = Porffor.array.new(4);
+  try {
+    const all: any[] = __Reflect_ownKeys(iterables);
+    const len: i32 = all.length;
+    for (let i: i32 = 0; i < len; i++) {
+      const key: any = all[i];
+      const desc: any = __Reflect_getOwnPropertyDescriptor(iterables, key);
+      if (desc === undefined) continue;
+      if (!desc.enumerable) continue;
+      const value: any = iterables[key];
+      if (value === undefined) continue;
+
+      Porffor.array.fastPush(recs, __Porffor_iter_flattenable(value));
+      Porffor.array.fastPush(keys, key);
+    }
+
+    if (it.__mode == ZIP_LONGEST) {
+      const count: i32 = keys.length;
+      for (let i: i32 = 0; i < count; i++) Porffor.array.fastPush(padding, paddingOption === undefined ? undefined : paddingOption[keys[i]]);
+    }
+  } catch (e) {
+    __Porffor_iter_closeAllThrow(recs);
+    throw e;
+  }
+
+  return __Porffor_iter_newZip(recs, padding, keys, it);
+};
+
+// one step of a zip: a fresh array (an object for zipKeyed) of each iterator's next value
+export const __Porffor_iter_zipStep = (it: any): any => {
+  const recs: any[] = it.__recs;
+  const iters: any[] = it.__iters;
+  const count: i32 = iters.length;
+  if (count == 0) {
+    it.__done = true;
+    return undefined;
+  }
+
+  const mode: i32 = it.__mode;
+  const results: any[] = Porffor.array.new(4);
+  for (let i: i32 = 0; i < count; i++) {
+    const rec: any = iters[i];
+    let value: any = undefined;
+    if (rec === null) {
+      value = it.__padding[i];
+    } else {
+      try {
+        value = __Porffor_iter_step(rec);
+      } catch (e) {
+        rec.done = true;
+        it.__done = true;
+        __Porffor_iter_closeAllThrow(recs);
+        throw e;
+      }
+
+      if (rec.done) {
+        if (mode == ZIP_SHORTEST) {
+          it.__done = true;
+          __Porffor_iter_closeAll(recs);
+          return undefined;
+        }
+
+        if (mode == ZIP_STRICT) {
+          it.__done = true;
+          if (i != 0) {
+            __Porffor_iter_closeAllThrow(recs);
+            throw new TypeError('Iterator.zip: the iterables have different lengths');
+          }
+          for (let k: i32 = 1; k < count; k++) {
+            const other: any = iters[k];
+            try {
+              __Porffor_iter_step(other);
+            } catch (e) {
+              other.done = true;
+              __Porffor_iter_closeAllThrow(recs);
+              throw e;
+            }
+            if (!other.done) {
+              __Porffor_iter_closeAllThrow(recs);
+              throw new TypeError('Iterator.zip: the iterables have different lengths');
+            }
+          }
+          return undefined;
+        }
+
+        // longest: padded from here, until none is left
+        iters[i] = null;
+        let open: boolean = false;
+        for (let k: i32 = 0; k < count; k++) if (iters[k] !== null) open = true;
+        if (!open) {
+          it.__done = true;
+          return undefined;
+        }
+        value = it.__padding[i];
+      }
+    }
+    Porffor.array.fastPush(results, value);
+  }
+
+  const keys: any = it.__keys;
+  if (keys === undefined) return results;
+  const out: any = __Object_create(null, undefined);
+  for (let i: i32 = 0; i < count; i++) out[keys[i]] = results[i];
+  return out;
 };
 
 // [Symbol.iterator] of the built-in iterables, whose prototype objects carry no symbol

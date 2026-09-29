@@ -449,6 +449,8 @@ let __Porffor_regex_pPos: i32 = 0;
 let __Porffor_regex_pU16: boolean = false;
 let __Porffor_regex_pSrcType: i32 = 0;
 let __Porffor_regex_pFlags: i32 = 0;
+// the regex's own flags (pFlags changes inside a modifier group)
+let __Porffor_regex_pFlags0: i32 = 0;
 let __Porffor_regex_pCaps: i32 = 0;
 let __Porffor_regex_pTotalCaps: i32 = 0;
 let __Porffor_regex_pHasNames: boolean = false;
@@ -1735,11 +1737,11 @@ export const __Porffor_regex_parseTerm = (): i32 => {
 
   if (c == 94) { // ^
     __Porffor_regex_pPos += 1;
-    return __Porffor_regex_node(4, 0);
+    return __Porffor_regex_anchorNode(0);
   }
   if (c == 36) { // $
     __Porffor_regex_pPos += 1;
-    return __Porffor_regex_node(4, 1);
+    return __Porffor_regex_anchorNode(1);
   }
 
   if (c == 92) { // \b \B here, other escapes via parseAtomEscape
@@ -1796,6 +1798,34 @@ export const __Porffor_regex_parseTerm = (): i32 => {
         __Porffor_regex_pPos += 3;
         const g: i32 = __Porffor_regex_node(6, 1);
         Porffor.IR.storeI32(__Porffor_regex_nPtr(g), 12, __Porffor_regex_parseDisjunction());
+        if (__Porffor_regex_pAt(__Porffor_regex_pPos) != 41) __Porffor_regex_err('Regex parse: unmatched (');
+        __Porffor_regex_pPos += 1;
+        return __Porffor_regex_parseQuantifier(g);
+      }
+      // (?ims-ims: ...): a group parsed with these flags added and removed
+      if (Porffor.fastOr(c2 == 105, c2 == 109, c2 == 115, c2 == 45)) {
+        __Porffor_regex_pPos += 2;
+        let add: i32 = 0, remove: i32 = 0, removing: boolean = false;
+        while (true) {
+          const f: i32 = __Porffor_regex_pAt(__Porffor_regex_pPos);
+          __Porffor_regex_pPos += 1;
+          if (f == 58) break; // :
+          if (f == 45 && !removing) { removing = true; continue; } // -
+          let bit: i32 = 0;
+          if (f == 105) bit = 0b00000010; // i
+            else if (f == 109) bit = 0b00000100; // m
+            else if (f == 115) bit = 0b00001000; // s
+            else __Porffor_regex_err('Regex parse: invalid group');
+          if (((add | remove) & bit) != 0) __Porffor_regex_err('Regex parse: repeated modifier');
+          if (removing) remove |= bit;
+            else add |= bit;
+        }
+        if (Porffor.fastAnd(add == 0, remove == 0)) __Porffor_regex_err('Regex parse: invalid group');
+        const saved: i32 = __Porffor_regex_pFlags;
+        __Porffor_regex_pFlags = (saved | add) & ~remove;
+        const g: i32 = __Porffor_regex_node(6, 1);
+        Porffor.IR.storeI32(__Porffor_regex_nPtr(g), 12, __Porffor_regex_parseDisjunction());
+        __Porffor_regex_pFlags = saved;
         if (__Porffor_regex_pAt(__Porffor_regex_pPos) != 41) __Porffor_regex_err('Regex parse: unmatched (');
         __Porffor_regex_pPos += 1;
         return __Porffor_regex_parseQuantifier(g);
@@ -1862,6 +1892,28 @@ export const __Porffor_regex_parseAlternative = (): i32 => {
   return concat;
 };
 
+// ^ (end 0) or $ (end 1). Inside a modifier group whose m differs from the regex's own (the
+// matcher reads that), made of what the matcher has: with m, the input's end or next to a line
+// terminator; without, no character before (^) or after ($)
+export const __Porffor_regex_anchorNode = (end: i32): i32 => {
+  const m: i32 = __Porffor_regex_pFlags & 0b00000100;
+  if (m == (__Porffor_regex_pFlags0 & 0b00000100)) return __Porffor_regex_node(4, end);
+  const look: i32 = __Porffor_regex_node(7, (m != 0 ? 0 : 1) | (end == 0 ? 2 : 0)); // neg without m, behind for ^
+  if (m != 0) {
+    const start: i32 = __Porffor_regex_rangesTop;
+    __Porffor_regex_rangePush(10, 10);
+    __Porffor_regex_rangePush(13, 13);
+    __Porffor_regex_rangePush(0x2028, 0x2029);
+    Porffor.IR.storeI32(__Porffor_regex_nPtr(look), 12, __Porffor_regex_classNode(start, 3, false));
+    const alt: i32 = __Porffor_regex_node(8, 0);
+    __Porffor_regex_appendChild(alt, __Porffor_regex_node(4, end));
+    __Porffor_regex_appendChild(alt, look);
+    return alt;
+  }
+  Porffor.IR.storeI32(__Porffor_regex_nPtr(look), 12, __Porffor_regex_node(3, 0));
+  return look;
+};
+
 export const __Porffor_regex_parseDisjunction = (): i32 => {
   const disjId: i32 = __Porffor_regex_pDisj;
   __Porffor_regex_pDisj += 1;
@@ -1898,6 +1950,7 @@ export const __Porffor_regex_parse = (pattern: any, flags: i32): i32 => {
   __Porffor_regex_pLen = pattern == 0 ? 0 : (pattern as bytestring).length;
   __Porffor_regex_pPos = 0;
   __Porffor_regex_pFlags = flags;
+  __Porffor_regex_pFlags0 = flags;
   __Porffor_regex_pCaps = 0;
   __Porffor_regex_pDisj = 0;
   __Porffor_regex_nodesTop = 0;
@@ -4418,4 +4471,39 @@ export const __Porffor_regexp_offTypeGetter = (value: any, source: boolean): any
     return undefined;
   }
   throw new TypeError("RegExp.prototype getter expects 'this' to be a RegExp");
+};
+
+// RegExp.prototype's symbol-keyed methods, over what the String methods already do with a regexp
+// (this a RegExp; the generic path through a user exec is not here)
+// with g or y, [Symbol.match] and [Symbol.replace] write lastIndex (Set(rx, "lastIndex", ..., true)):
+// made non-writable, that throws, whatever the match gives
+export const __Porffor_regex_lastIndexWritable = (rx: any): void => {
+  if ((Porffor.IR.loadU16(rx, 4) & 0b00100001) == 0) return; // neither g nor y
+  const desc: any = __Object_getOwnPropertyDescriptor(rx, 'lastIndex');
+  if (desc != null && desc.writable === false) throw new TypeError('Cannot assign to read only property lastIndex');
+};
+
+export const __Porffor_regex_symbolMatch = function (this: any, string: any) {
+  if (Porffor.type(this) != Porffor.TYPES.regexp) throw new TypeError('RegExp.prototype[Symbol.match] called on a non-RegExp');
+  const s: any = ecma262.ToString(string);
+  __Porffor_regex_lastIndexWritable(this);
+  return __Porffor_regex_match(this, s);
+};
+export const __Porffor_regex_symbolMatchAll = function (this: any, string: any) {
+  if (Porffor.type(this) != Porffor.TYPES.regexp) throw new TypeError('RegExp.prototype[Symbol.matchAll] called on a non-RegExp');
+  return __Porffor_regex_matchAll(this, ecma262.ToString(string));
+};
+export const __Porffor_regex_symbolSearch = function (this: any, string: any) {
+  if (Porffor.type(this) != Porffor.TYPES.regexp) throw new TypeError('RegExp.prototype[Symbol.search] called on a non-RegExp');
+  return __Porffor_regex_search(this, ecma262.ToString(string));
+};
+export const __Porffor_regex_symbolReplace = function (this: any, string: any, replaceValue: any) {
+  if (Porffor.type(this) != Porffor.TYPES.regexp) throw new TypeError('RegExp.prototype[Symbol.replace] called on a non-RegExp');
+  const s: any = ecma262.ToString(string);
+  __Porffor_regex_lastIndexWritable(this);
+  return __Porffor_string_replace(s, this, replaceValue);
+};
+export const __Porffor_regex_symbolSplit = function (this: any, string: any, limit: any) {
+  if (Porffor.type(this) != Porffor.TYPES.regexp) throw new TypeError('RegExp.prototype[Symbol.split] called on a non-RegExp');
+  return Porffor.callThis(__String_prototype_split, ecma262.ToString(string), this, limit);
 };

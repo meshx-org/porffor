@@ -260,8 +260,19 @@ export const __Porffor_promise_aggSettle = (kind: i32, agg: any, index: i32, val
 
   if ((st[0] = st[0] - 1) == 0) {
     if (kind == 8) __ecma262_RejectPromise(agg, new AggregateError(results, 'All promises were rejected'));
-    else __ecma262_FulfillPromise(agg, results);
+    else __ecma262_FulfillPromise(agg, __Porffor_promise_keyedResult(st, results));
   }
+};
+
+// Promise.allKeyed / allSettledKeyed: the results as a null-prototype object, under the input's keys
+export const __Porffor_promise_keyedResult = (st: any[], results: any[]): any => {
+  const keys: any = st[2];
+  if (keys === undefined) return results;
+
+  const out: any = __Object_create(null, undefined);
+  const len: i32 = results.length;
+  for (let i: i32 = 0; i < len; i++) out[keys[i]] = results[i];
+  return out;
 };
 
 export const __Porffor_promise_runOne = (reaction: i32): void => {
@@ -454,53 +465,113 @@ export const __Promise_prototype_finally = function (this: any, onFinally: any) 
   return outPromise;
 };
 
-export const __Porffor_promise_combinate = (inputs: any, okKind: i32, errKind: i32): Promise => {
+export const __Porffor_promise_combinate = (inputs: any, okKind: i32, errKind: i32, keys: any = undefined): Promise => {
   const agg: Promise = __Porffor_promise_create();
 
-  const st: any[] = Porffor.array.new(2);
+  const st: any[] = Porffor.array.new(3);
   st[0] = 0;
   const results: any[] = Porffor.array.new(4);
   st[1] = results;
+  st[2] = keys;
   __Porffor_promise_setPayload(agg, st);
 
+  // IfAbruptRejectPromise: a throw getting or stepping the iterator (not iterable, a throwing
+  // next) rejects the returned promise, it is not thrown
   let count: i32 = 0;
-  for (const x of inputs) {
-    const p: any = __Promise_resolve(x);
+  try {
+    for (const x of inputs) {
+      const p: any = __Promise_resolve(x);
 
-    const okReaction: i32 = __Porffor_promise_newReaction(undefined, agg, okKind);
-    __Porffor_promise_reactionSetPayload(okReaction, count);
-    const errReaction: i32 = __Porffor_promise_newReaction(undefined, agg, errKind);
-    __Porffor_promise_reactionSetPayload(errReaction, count);
+      const okReaction: i32 = __Porffor_promise_newReaction(undefined, agg, okKind);
+      __Porffor_promise_reactionSetPayload(okReaction, count);
+      const errReaction: i32 = __Porffor_promise_newReaction(undefined, agg, errKind);
+      __Porffor_promise_reactionSetPayload(errReaction, count);
 
-    results[count] = undefined;
-    count++;
+      results[count] = undefined;
+      count++;
 
-    __Porffor_then(p, okReaction, errReaction);
+      __Porffor_then(p, okReaction, errReaction);
+    }
+  } catch (e) {
+    __ecma262_RejectPromise(agg, e);
+    return agg;
   }
 
   st[0] = count;
 
   if (count == 0) {
-    if (Porffor.fastOr(okKind == 3, okKind == 5)) __ecma262_FulfillPromise(agg, results);
+    if (Porffor.fastOr(okKind == 3, okKind == 5)) __ecma262_FulfillPromise(agg, __Porffor_promise_keyedResult(st, results));
     else if (okKind == 7) __ecma262_RejectPromise(agg, new AggregateError(results, 'All promises were rejected'));
   }
 
   return agg;
 };
 
-export const __Promise_all = (promises: any): Promise => {
+// NewPromiseCapability(C): a receiver that is not a constructor throws (not a rejection).
+// (a call with no receiver is Promise's own: a static call does not always pass one)
+export const __Porffor_promise_checkCtor = (C: any): void => {
+  if (C !== undefined && !__ecma262_IsConstructor(C)) throw new TypeError('Receiver is not a constructor');
+};
+
+export const __Promise_all = function (this: any, promises: any): Promise {
+  __Porffor_promise_checkCtor(this);
   return __Porffor_promise_combinate(promises, 3, 4);
 };
 
-export const __Promise_allSettled = (promises: any): Promise => {
+export const __Promise_allSettled = function (this: any, promises: any): Promise {
+  __Porffor_promise_checkCtor(this);
   return __Porffor_promise_combinate(promises, 5, 6);
 };
 
-export const __Promise_any = (promises: any): Promise => {
+export const __Promise_any = function (this: any, promises: any): Promise {
+  __Porffor_promise_checkCtor(this);
   return __Porffor_promise_combinate(promises, 7, 8);
 };
 
-export const __Promise_race = (promises: any): Promise => {
+// Promise.allKeyed / allSettledKeyed: an object's own enumerable properties' values, awaited
+// as Promise.all / allSettled do, settled under the same keys
+export const __Porffor_promise_combinateKeyed = (promises: any, okKind: i32, errKind: i32): Promise => {
+  const keys: any[] = Porffor.array.new(4);
+  const values: any[] = Porffor.array.new(4);
+  try {
+    if (!Porffor.object.isObject(promises)) throw new TypeError('Argument is not an object');
+
+    const all: any[] = __Reflect_ownKeys(promises);
+    const len: i32 = all.length;
+    let n: i32 = 0;
+    for (let i: i32 = 0; i < len; i++) {
+      const key: any = all[i];
+      const desc: any = __Reflect_getOwnPropertyDescriptor(promises, key);
+      if (desc === undefined) continue;
+      if (!desc.enumerable) continue;
+
+      keys[n] = key;
+      values[n] = promises[key];
+      n++;
+    }
+    keys.length = n;
+    values.length = n;
+  } catch (e) {
+    const out: Promise = __Porffor_promise_create();
+    __ecma262_RejectPromise(out, e);
+    return out;
+  }
+
+  return __Porffor_promise_combinate(values, okKind, errKind, keys);
+};
+
+export const __Promise_allKeyed = function (this: any, promises: any): Promise {
+  __Porffor_promise_checkCtor(this);
+  return __Porffor_promise_combinateKeyed(promises, 3, 4);
+};
+
+export const __Promise_allSettledKeyed = function (this: any, promises: any): Promise {
+  __Porffor_promise_checkCtor(this);
+  return __Porffor_promise_combinateKeyed(promises, 5, 6);
+};
+
+export const __Promise_race = function (this: any, promises: any): Promise {
+  __Porffor_promise_checkCtor(this);
   return __Porffor_promise_combinate(promises, 9, 10);
 };
 

@@ -536,13 +536,20 @@ export default ({ funcs, data = [], dataUnits = [], dataRelocs = [], globals = [
   const fnrecBase = off;
   off += linkFuncs.length * 8;
   // empty names reuse offset 0 (0-length bytestring in the null region)
+  // builtins whose key is a well-known symbol: named [Symbol.x]
+  const SYMBOL_KEYED_NAMES = new Map([ [ '__Porffor_regex_symbolMatch', 'match' ], [ '__Porffor_regex_symbolMatchAll', 'matchAll' ],
+    [ '__Porffor_regex_symbolSearch', 'search' ], [ '__Porffor_regex_symbolReplace', 'replace' ], [ '__Porffor_regex_symbolSplit', 'split' ] ]);
   const fnNameSegs = [];
   const fnNameOff = [];
   for (const f of linkFuncs) {
     let name = f.jsName ?? f.name;
-    name = name.startsWith('__') ? name.split('_').pop() : name.split('#')[0];
-    // a getter's name is "get x" (Map.prototype.size's is "get size")
-    if (name.endsWith('$get')) name = 'get ' + name.slice(0, -4);
+    // (a private method's, #m or get #m, is as it is: a # elsewhere starts an internal suffix)
+    if (!f.privateName) name = name.startsWith('__') ? name.split('_').pop() : name.split('#')[0];
+    // a getter's name is "get x" (Map.prototype.size's is "get size"); a symbol's in brackets
+    const symbolNamed = SYMBOL_KEYED_NAMES.get(f.name);
+    if (symbolNamed) name = `[Symbol.${symbolNamed}]`;
+    else if (f.name === '__Porffor_species$get') name = 'get [Symbol.species]';
+    else if (name.endsWith('$get')) name = 'get ' + name.slice(0, -4);
     if (name.length === 0) { fnNameOff.push(0); continue; }
     const bytes = [ name.length & 0xff, (name.length >>> 8) & 0xff, (name.length >>> 16) & 0xff, (name.length >>> 24) & 0xff ];
     for (let k = 0; k < name.length; k++) bytes.push(name.charCodeAt(k) & 0xff);
