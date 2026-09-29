@@ -1222,11 +1222,12 @@ export const __Array_prototype_toLocaleString = function (this: any[]) { return 
 
 // @porf-typed-array
 export const __Array_prototype_join = function (this: any[], _separator: any) {
+  // the length before the separator's conversion (which may change it)
+  const len: i32 = this.length;
   let separator: any = ',';
   if (Porffor.type(_separator) != Porffor.TYPES.undefined)
     separator = ecma262.ToString(_separator);
 
-  const len: i32 = this.length;
   if (len == 0) return '';
 
   const separatorLen: i32 = separator.length;

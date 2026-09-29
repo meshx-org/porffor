@@ -28,6 +28,57 @@ export const __Porffor_arraybuffer_maxOf = (buffer: any): any => {
   return undefined;
 };
 
+// Typed array views of resizable buffers, as triples in a plain array: the view, its fixed
+// length (-1 when it tracks the buffer's) and element size. resize() sets each one's length
+// word, which element access reads: a tracking view's to what now fits, and any view's to 0
+// once it is out of bounds
+let __Porffor_arraybuffer_views: any = undefined;
+
+export const __Porffor_arraybuffer_addView = (view: any, fixedLength: i32, size: i32): void => {
+  if (__Porffor_arraybuffer_views === undefined) __Porffor_arraybuffer_views = Porffor.array.new(6);
+  const views: any[] = __Porffor_arraybuffer_views;
+  Porffor.array.fastPush(views, view);
+  Porffor.array.fastPush(views, fixedLength);
+  Porffor.array.fastPush(views, size);
+};
+
+// a view's length as its buffer is now: -1 when out of bounds (or detached)
+export const __Porffor_arraybuffer_viewLength = (view: any, fixedLength: i32, size: i32): i32 => {
+  const offset: i32 = Porffor.IR.loadI32(view, 8);
+  const bufferLength: i32 = Porffor.IR.loadI32(Porffor.IR.loadI32(view, 4) - offset, 0);
+  if (bufferLength < 0) return -1;
+  if (fixedLength < 0) {
+    if (offset > bufferLength) return -1;
+    return Math.floor((bufferLength - offset) / size);
+  }
+  if (offset + fixedLength * size > bufferLength) return -1;
+  return fixedLength;
+};
+
+export const __Porffor_arraybuffer_resizeViews = (buffer: any): void => {
+  if (__Porffor_arraybuffer_views === undefined) return;
+  const views: any[] = __Porffor_arraybuffer_views;
+  const bufferPtr: i32 = Porffor.IR.ptr(buffer);
+  const len: i32 = views.length;
+  for (let i: i32 = 0; i < len; i += 3) {
+    const view: any = views[i];
+    if (Porffor.IR.loadI32(view, 4) - Porffor.IR.loadI32(view, 8) != bufferPtr) continue;
+    const n: i32 = __Porffor_arraybuffer_viewLength(view, views[i + 1], views[i + 2]);
+    Porffor.IR.storeI32(view, 0, n < 0 ? 0 : n);
+  }
+};
+
+// IsTypedArrayOutOfBounds, for a view of a resizable buffer (any other is never)
+export const __Porffor_typedArray_outOfBounds = (ta: any): boolean => {
+  if (__Porffor_arraybuffer_views === undefined) return false;
+  const views: any[] = __Porffor_arraybuffer_views;
+  const len: i32 = views.length;
+  for (let i: i32 = 0; i < len; i += 3) {
+    if (views[i] === ta) return __Porffor_arraybuffer_viewLength(ta, views[i + 1], views[i + 2]) < 0;
+  }
+  return false;
+};
+
 export const ArrayBuffer = function (length: any, options: any = undefined): ArrayBuffer { // (length is 1)
   // 1. If NewTarget is undefined, throw a TypeError exception.
   if (!new.target) throw new TypeError("Constructor ArrayBuffer requires 'new'");
@@ -152,6 +203,7 @@ export const __ArrayBuffer_prototype_resize = function (this: ArrayBuffer, newLe
   const len: i32 = Porffor.IR.loadI32(this, 0);
   if (newLen > len) Porffor.IR.fill(Porffor.IR.ptr(this) + 4 + len, 0, newLen - len);
   Porffor.IR.storeI32(this, 0, newLen);
+  __Porffor_arraybuffer_resizeViews(this);
 };
 
 export const SharedArrayBuffer = function (length: any): SharedArrayBuffer {

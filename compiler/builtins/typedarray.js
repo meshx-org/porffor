@@ -50,16 +50,33 @@ export default async ({ TYPED_ARRAY_KINDS }) => {
     let offset: i32 = 0;
     if (Porffor.type(byteOffset) != Porffor.TYPES.undefined) offset = Math.trunc(byteOffset);
     if (offset < 0) throw new RangeError('Invalid DataView byte offset (negative)');
+    if (offset % ${name}.BYTES_PER_ELEMENT != 0) throw new RangeError('Start offset of ${name} should be a multiple of BYTES_PER_ELEMENT');
 
     Porffor.IR.storeI32(outPtr, 8, offset);
     Porffor.IR.storeI32(outPtr, 4, bufferPtr + offset);
 
-    if (Porffor.type(length) == Porffor.TYPES.undefined) {
-      const bufferLen: i32 = Porffor.IR.loadI32(bufferPtr, 0);
-      len = (bufferLen - offset) / ${name}.BYTES_PER_ELEMENT;
+    // a view of a resizable buffer (only in a program that resizes one) is kept in step with it
+    let resizable: boolean = false;
+    if (Porffor.comptime.flag\`hasFunc.__ArrayBuffer_prototype_resize\`) if (Porffor.type(arg) == Porffor.TYPES.arraybuffer) resizable = __Porffor_arraybuffer_maxOf(arg) !== undefined;
 
-      if (!Number.isInteger(len)) throw new RangeError('Byte length of ${name} should be divisible by BYTES_PER_ELEMENT');
-    } else len = Math.trunc(length);
+    const bufferLen: i32 = Porffor.IR.loadI32(bufferPtr, 0);
+    if (Porffor.type(length) == Porffor.TYPES.undefined) {
+      if (offset > bufferLen) throw new RangeError('Start offset of ${name} is outside the bounds of the buffer');
+      if (resizable) {
+        // length-tracking: as long as the buffer is
+        len = Math.floor((bufferLen - offset) / ${name}.BYTES_PER_ELEMENT);
+        __Porffor_arraybuffer_addView(out, -1, ${name}.BYTES_PER_ELEMENT);
+      } else {
+        // (as a number: an i32 would truncate what is not divisible)
+        const exact: number = (bufferLen - offset) / ${name}.BYTES_PER_ELEMENT;
+        if (!Number.isInteger(exact)) throw new RangeError('Byte length of ${name} should be divisible by BYTES_PER_ELEMENT');
+        len = exact;
+      }
+    } else {
+      len = ecma262.ToIndex(length);
+      if (offset + len * ${name}.BYTES_PER_ELEMENT > bufferLen) throw new RangeError('Invalid typed array length');
+      if (resizable) __Porffor_arraybuffer_addView(out, len, ${name}.BYTES_PER_ELEMENT);
+    }
 
     byteLength = len * ${name}.BYTES_PER_ELEMENT;
   } else {
@@ -168,6 +185,7 @@ export const __${name}_prototype_byteLength$get = function (this: ${name}) {
 
 export const __${name}_prototype_byteOffset$get = function (this: ${name}) {
   if (Porffor.comptime.flag\`hasFunc.__Porffor_arraybuffer_detach\`) if (__Porffor_typedArray_detached(this)) return 0;
+  if (Porffor.comptime.flag\`hasFunc.__ArrayBuffer_prototype_resize\`) if (__Porffor_typedArray_outOfBounds(this)) return 0;
   return Porffor.IR.loadI32(this, 8);
 };
 
@@ -323,6 +341,7 @@ ${body}
   out += getter('length', `${detachedZero}
   return Porffor.IR.loadI32(this, 0);`);
   out += getter('byteOffset', `${detachedZero}
+  if (Porffor.comptime.flag\`hasFunc.__ArrayBuffer_prototype_resize\`) if (__Porffor_typedArray_outOfBounds(this)) return 0;
   return Porffor.IR.loadI32(this, 8);`);
   out += getter('buffer', `  return Porffor.IR.loadI32(this, 4) - Porffor.IR.loadI32(this, 8) as ArrayBuffer;`);
   out += getter('byteLength', `${detachedZero}
@@ -359,7 +378,8 @@ ${TYPED_ARRAY_KINDS.map(k => `    case Porffor.TYPES.${k.toLowerCase()}: return 
   // throws for a detached buffer itself), only in a program that can detach a buffer
   out = out.replace(/(export const __\w+Array_prototype_(\w+) = function \(this: \w+[^\n]*\{\n)/g, (m, head, method) =>
     method.endsWith('$get') || method === 'subarray' || head.includes('__Porffor_TypedArray_') ? m
-      : head + '  if (Porffor.comptime.flag`hasFunc.__Porffor_arraybuffer_detach`) __Porffor_typedArray_validate(this);\n');
+      : head + '  if (Porffor.comptime.flag`hasFunc.__Porffor_arraybuffer_detach`) __Porffor_typedArray_validate(this);\n' +
+        '  if (Porffor.comptime.flag`hasFunc.__ArrayBuffer_prototype_resize`) if (__Porffor_typedArray_outOfBounds(this)) throw new TypeError(\'Cannot perform %TypedArray%.prototype method on an out of bounds TypedArray\');\n');
 
   return out;
 };
