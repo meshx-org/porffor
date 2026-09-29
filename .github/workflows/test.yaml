@@ -1,0 +1,43 @@
+name: Test
+
+# the tests on their own, in any repository (ci.yaml runs them only as part of an upstream
+# release): the selfhost compiler built and verified, then the test262 harness through it
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: checkout test262
+        uses: actions/checkout@v4
+        with:
+          repository: tc39/test262
+          ref: 6eec1ac9ee144dafd8f344d73a21f36bfc9f6755
+          path: test262/test262
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: bundle selfhost compiler
+        run: node selfhosted/build.mjs
+      - name: compile bundle to c
+        run: node runtime/index.js c --compress-data selfhosted/bundle.js -o selfhosted/stage1.c
+      - name: build selfhost compiler
+        run: clang -O2 -fno-sanitize=undefined -w selfhosted/stage1.c -o selfhosted/porf -lm
+      # a selfhost compiler compiles regex literals ahead of time, so its C for a program
+      # with them (and for the compiler itself: stage2) differs from the host's by design
+      - name: verify selfhost compiler
+        run: ./selfhost verify --skip=v8_v7,regex,temporal,stage2
+      - name: test selfhost test262 harness
+        run: node test262/selfhost.js harness --threads=4 --expect-passes=112

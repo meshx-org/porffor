@@ -1,0 +1,33 @@
+name: Bench
+
+# the benchmarks in bench/, compiled natively and timed: a table in the run's summary and the
+# results as an artifact (bench-results.json)
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: run benchmarks
+        run: node bench/ci.mjs bench-results.json
+      - name: upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results.json

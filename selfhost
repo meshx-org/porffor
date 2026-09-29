@@ -125,7 +125,7 @@ ${helpRows([
   [ '--noop-precompiled', 'build a temporary bundle without precompiled builtins' ],
   [ '--bench-runs=N', 'runs per compiler for bench (default: 1)' ],
   [ '--detail', 'bench: show phase timings for representative cases' ],
-  [ '--skip=a,b', 'skip named cases for verify and bench' ],
+  [ '--skip=a,b', 'skip named cases for verify and bench (stage2: the bundle comparison)' ],
   [ '--poll=N', 'monitor poll interval in seconds (default: 5)' ],
   [ '--compare=X', 'compare report against the compile N runs ago, or nearest to a date/time (default: 1)' ],
   [ '--size-graph[=FILE]', 'write compare history binary-size SVG (default: /tmp/porffor-selfhost/size.svg)' ],
@@ -753,13 +753,16 @@ const warnUnknownSkips = (opts, names) => {
 
 const verifyParityCases = async opts => {
   const cases = parityCases.filter(x => !opts.skip.includes(x[0]));
-  warnUnknownSkips(opts, parityCases.map(x => x[0]));
+  warnUnknownSkips(opts, [ ...parityCases.map(x => x[0]), 'stage2' ]);
   for (let i = 0; i < cases.length; i++) await verifyParityCase(cases[i], opts, i === 0);
 };
 
 const verify = async opts => {
   requireBuiltSelfhost();
   await verifyParityCases(opts);
+  // (the bundle has regex literals: a selfhost compiler compiles them ahead of time, so its
+  // stage2.c is not the host's, and --skip=stage2 leaves the comparison out)
+  if (opts.skip.includes('stage2')) return;
   const stage2HostC = inTmp('stage2-host.c');
   await run('host selfhost bundle to C', nodePorf[0], [ ...nodePorf.slice(1), 'c', ...porfDebugArgs(opts), '--profile-compiler', bundle, '-o', stage2HostC ], null, opts, { silent: true });
   await run('selfhost to C', porf, [ 'c', ...porfDebugArgs(opts), bundle, '-o', stage2C ], logPath('stage2-c'), opts, { monitor: true, silent: true });
