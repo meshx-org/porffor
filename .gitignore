@@ -12,3 +12,13 @@ selfhosted/*.c
 # todo: commit some json to git history to help historical/collaborative info
 /test262/*.json
 /test262/.threads
+
+# the JS runtime and the WASI component build (runtime/, wasi/)
+node_modules/
+build/
+.wasi-porffor/
+# the web-platform-tests checkout, the programs its runner generates, and its results
+wasi/wpt/wpt/
+wasi/wpt/.work/
+wasi/wpt/*.json
+wasi/wpt/.threads

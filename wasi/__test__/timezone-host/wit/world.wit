@@ -1,0 +1,7 @@
+package meshx:timezone-host@0.1.0;
+
+/// A host's time zone as a component, plugged into the timezone fixture: wasmtime has no
+/// wasi:clocks/timezone of its own.
+world timezone-host {
+  export wasi:clocks/timezone@0.3.0;
+}

@@ -1,0 +1,8 @@
+package meshx:random-test@0.1.0;
+
+/// A guest that draws randomness: Math.random, crypto.getRandomValues, crypto.randomUUID.
+/// No imports of its own: the random bytes come through wasi-libc (wasi:random).
+world random {
+  /// errors: also try the calls that throw (needs wasm exception handling: P3)
+  export run: func(errors: bool) -> string;
+}

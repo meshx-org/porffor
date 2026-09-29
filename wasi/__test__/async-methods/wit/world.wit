@@ -1,0 +1,30 @@
+package meshx:async-methods-test@0.1.0;
+
+/// A resource with async methods, lifted by wasi-porffor.
+interface counter {
+  resource counter {
+    constructor(start: u32);
+    /// Adds after a timer: an async method that really waits on the host.
+    add: async func(amount: u32) -> u32;
+    /// A sync method beside the async ones.
+    value: func() -> u32;
+    /// An async static function, after a timer too.
+    twice: static async func(amount: u32) -> u32;
+    /// How often the timer the provider's top level set has fired.
+    fired: static func() -> u32;
+    /// Prints a line of `bytes` characters to stderr: more than a stdio buffer holds.
+    shout: static func(bytes: u32);
+  }
+}
+
+/// Exports the counter.
+world provider {
+  import wasi:clocks/monotonic-clock@0.3.0;
+  export counter;
+}
+
+/// Calls the counter's methods through the component model, plugged into a provider.
+world caller {
+  import counter;
+  export run: async func() -> string;
+}

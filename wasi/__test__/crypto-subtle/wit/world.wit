@@ -1,0 +1,7 @@
+package meshx:crypto-subtle-test@0.1.0;
+
+/// A guest that uses crypto.subtle: no imports of its own (its random bytes come through
+/// wasi-libc's wasi:random), one async export that runs the corpus.
+world crypto-subtle {
+  export run: async func() -> string;
+}

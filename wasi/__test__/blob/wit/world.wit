@@ -1,0 +1,7 @@
+package meshx:blob-test@0.1.0;
+
+/// A guest that makes and reads Blobs and Files: no imports, one async export (the readers
+/// return promises) that runs the corpus.
+world blob {
+  export run: async func() -> string;
+}

@@ -1,0 +1,7 @@
+package meshx:vite-test@0.1.0;
+
+/// A guest built by the Vite plugin: modules Vite bundles into one, one of them imported
+/// dynamically (inlined), and a string export to check the result through.
+world vite {
+  export run: async func(name: string) -> string;
+}

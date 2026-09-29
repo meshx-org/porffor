@@ -1,0 +1,76 @@
+{
+	"name": "@meshx-org/porffor",
+	"version": "0.0.1",
+	"private": true,
+	"license": "MIT",
+	"description": "Porffor, an ahead-of-time JavaScript compiler (cli/, compiler/), its JS runtime (runtime/), and a build of JavaScript into WebAssembly (WASI) components (wasi/)",
+	"type": "module",
+	"exports": {
+		"./wasi": "./wasi/src/build.mjs",
+		"./wasi/vite": "./wasi/src/vite.mjs",
+		"./runtime/fetch": "./runtime/fetch.mjs",
+		"./runtime/timers": "./runtime/timers.mjs",
+		"./runtime/abort": "./runtime/abort.mjs",
+		"./runtime/scheduler": "./runtime/scheduler.mjs",
+		"./runtime/streams": "./runtime/readable-stream.mjs",
+		"./runtime/writable-stream": "./runtime/writable-stream.mjs",
+		"./runtime/transform-stream": "./runtime/transform-stream.mjs",
+		"./runtime/text-decoder-stream": "./runtime/text-decoder-stream.mjs",
+		"./runtime/text-encoder-stream": "./runtime/text-encoder-stream.mjs",
+		"./runtime/url": "./runtime/url.mjs",
+		"./runtime/event-source": "./runtime/event-source.mjs"
+	},
+	"bin": {
+		"porf": "./cli/index.js",
+		"wasi-porffor-build": "./wasi/scripts/build-component.mjs"
+	},
+	"files": [
+		"cli",
+		"compiler",
+		"runtime",
+		"wasi/src",
+		"wasi/scripts"
+	],
+	"scripts": {
+		"format": "prettier --write runtime wasi",
+		"lint": "prettier --check runtime wasi && eslint . --cache --cache-location node_modules/.cache/eslint/",
+		"test": "vitest run --root wasi",
+		"wpt": "node wasi/wpt/index.mjs",
+		"wpt:setup": "node wasi/wpt/setup.mjs",
+		"lint:fresh": "prettier --check runtime wasi && eslint ."
+	},
+	"dependencies": {
+		"@noble/curves": "^2.4.0",
+		"@noble/hashes": "^2.2.0",
+		"esbuild": "^0.28.2"
+	},
+	"devDependencies": {
+		"@bytecodealliance/jco": "^1.34.0",
+		"@bytecodealliance/preview2-shim": "^0.25.0",
+		"@eslint/js": "^10.0.1",
+		"better-auth": "^1.6.25",
+		"eslint": "^10.11.0",
+		"globals": "^17.12.0",
+		"prettier": "^3.9.5",
+		"vite": "^8.0.8",
+		"vitest": "^4.1.11"
+	},
+	"engines": {
+		"node": ">=24"
+	},
+	"keywords": [
+		"meshx",
+		"yel",
+		"porffor",
+		"wasm",
+		"component-model"
+	],
+	"peerDependencies": {
+		"vite": ">=8"
+	},
+	"peerDependenciesMeta": {
+		"vite": {
+			"optional": true
+		}
+	}
+}

@@ -1,0 +1,6 @@
+package meshx:structured-clone-test@0.1.0;
+
+/// A guest that clones a corpus of values with structuredClone and describes the clones.
+world structured-clone {
+  export run: func() -> string;
+}

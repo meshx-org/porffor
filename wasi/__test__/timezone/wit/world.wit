@@ -1,0 +1,14 @@
+package meshx:timezone-test@0.1.0;
+
+/// A guest that reads the host's time zone (wasi:clocks/timezone) through Date and
+/// Temporal.Now.
+world timezone {
+  import wasi:clocks/timezone@0.3.0;
+
+  export run: func() -> string;
+}
+
+/// The same guest where the host gives no time zone: Date and Temporal.Now read UTC.
+world no-timezone {
+  export run: func() -> string;
+}

@@ -1,0 +1,9 @@
+package meshx:better-auth-test@0.1.0;
+
+/// better-auth as a fetch handler (export default { fetch }): the wasi:http 0.3 handler,
+/// with the environment for its secret and the clock for its timers.
+world better-auth {
+  import wasi:cli/environment@0.3.0;
+  import wasi:clocks/monotonic-clock@0.3.0;
+  export wasi:http/handler@0.3.0;
+}

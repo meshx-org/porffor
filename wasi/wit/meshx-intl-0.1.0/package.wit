@@ -1,0 +1,344 @@
+package meshx:intl@0.1.0;
+
+/// Locale-sensitive formatting and text operations, answered by the host.
+///
+/// The host already has the data: a browser or Node answers from its own `Intl`, a native
+/// host from ICU4X. A guest carries none of it, and every guest language shares one
+/// implementation. The shapes follow ECMA-402 (the JavaScript Intl API) field for field,
+/// so a JavaScript host passes values straight through; enum cases are ECMA-402's values
+/// in kebab case (`2-digit` is `two-digit`, `exceptZero` is `except-zero`).
+///
+/// Output is whatever the host's locale data says: a browser and a native host may format
+/// the same date slightly differently. What a guest may not rely on, a host may refuse
+/// with `error.range`.
+interface types {
+    /// Why a request was refused, as ECMA-402 would throw it.
+    variant error {
+        /// An invalid locale, time zone, currency or unit, or an option out of range
+        /// (JavaScript's RangeError).
+        range(string),
+        /// A value of the wrong kind (JavaScript's TypeError).
+        invalid(string),
+    }
+
+    /// One piece of formatted output. `kind` is ECMA-402's part type (`literal`,
+    /// `integer`, `month`, `dayPeriod`, `timeZoneName`, ...); `source` is set by the range
+    /// formatters (`startRange`, `endRange`, `shared`).
+    record part {
+        kind: string,
+        value: string,
+        source: option<string>,
+    }
+
+    enum locale-matcher { lookup, best-fit }
+
+    /// How numbers round, shared by number formats and plural rules.
+    enum notation { standard, scientific, engineering, compact }
+    enum rounding-mode { ceil, floor, expand, trunc, half-ceil, half-floor, half-expand, half-trunc, half-even }
+    enum rounding-priority { auto, more-precision, less-precision }
+    enum trailing-zero-display { auto, strip-if-integer }
+
+    /// A number to format: a float, or an exact decimal string (a BigInt, or a string a
+    /// caller passed, which ECMA-402 formats without rounding it through a float).
+    variant number-value {
+        float(f64),
+        decimal(string),
+    }
+}
+
+/// Locales: the user's, and what a tag means.
+interface locale {
+    use types.{error};
+
+    /// The Intl services, for `supported-locales`.
+    enum service { collator, date-time-format, list-format, number-format, plural-rules }
+
+    /// The keys of `Intl.supportedValuesOf`.
+    enum supported-key { calendar, collation, currency, numbering-system, time-zone, unit }
+
+    /// The options of `new Intl.Locale(tag, options)`, which override the tag's.
+    record locale-options {
+        language: option<string>,
+        script: option<string>,
+        region: option<string>,
+        calendar: option<string>,
+        collation: option<string>,
+        hour-cycle: option<string>,
+        case-first: option<string>,
+        numeric: option<bool>,
+        numbering-system: option<string>,
+    }
+
+    record week-rules {
+        /// 1 = Monday ... 7 = Sunday
+        first-day: u8,
+        weekend: list<u8>,
+    }
+
+    enum direction { ltr, rtl }
+
+    /// The user's locale, as the host decides it (a host may answer a neutral one).
+    default-locale: func() -> string;
+    /// `Intl.getCanonicalLocales`: each tag canonicalized, duplicates dropped.
+    canonicalize: func(locales: list<string>) -> result<list<string>, error>;
+    /// `new Intl.Locale(tag, options).toString()`.
+    build: func(tag: string, options: locale-options) -> result<string, error>;
+    /// `Intl.Locale#maximize` / `#minimize`: likely subtags added or removed.
+    maximize: func(tag: string) -> result<string, error>;
+    minimize: func(tag: string) -> result<string, error>;
+    week-info: func(tag: string) -> result<week-rules, error>;
+    text-direction: func(tag: string) -> result<direction, error>;
+    /// `supportedLocalesOf` of each service.
+    supported-locales: func(service: service, locales: list<string>) -> result<list<string>, error>;
+    supported-values: func(key: supported-key) -> list<string>;
+}
+
+/// Time zones, as building blocks (a guest with its own calendar code needs offsets).
+interface time-zone {
+    use types.{error};
+
+    /// The user's time zone, an IANA id (a host may answer `UTC`).
+    default-time-zone: func() -> string;
+    /// The canonical IANA id for `id`, or none when it names no zone.
+    canonicalize: func(id: string) -> option<string>;
+    /// The zone's offset from UTC at an instant, in minutes.
+    offset-at: func(id: string, epoch-ms: f64) -> result<s32, error>;
+}
+
+/// `Intl.DateTimeFormat`.
+interface date-time {
+    use types.{error, part, locale-matcher};
+
+    enum text-width { narrow, short, long }
+    enum numeric-width { numeric, two-digit }
+    enum month-width { numeric, two-digit, narrow, short, long }
+    enum hour-cycle { h11, h12, h23, h24 }
+    enum time-zone-name { short, long, short-offset, long-offset, short-generic, long-generic }
+    enum format-matcher { basic, best-fit }
+    enum style { full, long, medium, short }
+
+    record date-time-options {
+        locale-matcher: option<locale-matcher>,
+        calendar: option<string>,
+        numbering-system: option<string>,
+        hour12: option<bool>,
+        hour-cycle: option<hour-cycle>,
+        time-zone: option<string>,
+        weekday: option<text-width>,
+        era: option<text-width>,
+        year: option<numeric-width>,
+        month: option<month-width>,
+        day: option<numeric-width>,
+        day-period: option<text-width>,
+        hour: option<numeric-width>,
+        minute: option<numeric-width>,
+        second: option<numeric-width>,
+        fractional-second-digits: option<u8>,
+        time-zone-name: option<time-zone-name>,
+        format-matcher: option<format-matcher>,
+        date-style: option<style>,
+        time-style: option<style>,
+    }
+
+    /// `resolvedOptions()`: what the formatter settled on. `options` holds the resolved
+    /// components (the ones that are set).
+    record resolved-date-time-options {
+        locale: string,
+        calendar: string,
+        numbering-system: string,
+        time-zone: string,
+        options: date-time-options,
+    }
+
+    resource date-time-format {
+        create: static func(locales: list<string>, options: date-time-options) -> result<date-time-format, error>;
+        /// Times are milliseconds since the epoch, as a JavaScript Date holds them.
+        format: func(epoch-ms: f64) -> result<string, error>;
+        format-to-parts: func(epoch-ms: f64) -> result<list<part>, error>;
+        format-range: func(start-ms: f64, end-ms: f64) -> result<string, error>;
+        format-range-to-parts: func(start-ms: f64, end-ms: f64) -> result<list<part>, error>;
+        resolved-options: func() -> resolved-date-time-options;
+    }
+}
+
+/// `Intl.NumberFormat`.
+interface number {
+    use types.{error, part, locale-matcher, number-value, notation, rounding-mode, rounding-priority, trailing-zero-display};
+
+    enum number-style { decimal, percent, currency, unit }
+    enum currency-display { code, symbol, narrow-symbol, name }
+    enum currency-sign { standard, accounting }
+    enum unit-display { short, narrow, long }
+    enum compact-display { short, long }
+    /// ECMA-402's `useGrouping`; `off` is `false`.
+    enum use-grouping { always, auto, min2, off }
+    enum sign-display { auto, never, always, except-zero, negative }
+    record number-options {
+        locale-matcher: option<locale-matcher>,
+        numbering-system: option<string>,
+        style: option<number-style>,
+        currency: option<string>,
+        currency-display: option<currency-display>,
+        currency-sign: option<currency-sign>,
+        unit: option<string>,
+        unit-display: option<unit-display>,
+        minimum-integer-digits: option<u8>,
+        minimum-fraction-digits: option<u8>,
+        maximum-fraction-digits: option<u8>,
+        minimum-significant-digits: option<u8>,
+        maximum-significant-digits: option<u8>,
+        rounding-increment: option<u16>,
+        rounding-mode: option<rounding-mode>,
+        rounding-priority: option<rounding-priority>,
+        trailing-zero-display: option<trailing-zero-display>,
+        notation: option<notation>,
+        compact-display: option<compact-display>,
+        use-grouping: option<use-grouping>,
+        sign-display: option<sign-display>,
+    }
+
+    record resolved-number-options {
+        locale: string,
+        numbering-system: string,
+        options: number-options,
+    }
+
+    resource number-format {
+        create: static func(locales: list<string>, options: number-options) -> result<number-format, error>;
+        format: func(value: number-value) -> result<string, error>;
+        format-to-parts: func(value: number-value) -> result<list<part>, error>;
+        format-range: func(start: number-value, end: number-value) -> result<string, error>;
+        format-range-to-parts: func(start: number-value, end: number-value) -> result<list<part>, error>;
+        resolved-options: func() -> resolved-number-options;
+    }
+}
+
+/// `Intl.PluralRules`.
+interface plural {
+    use types.{error, locale-matcher, notation, rounding-mode, rounding-priority, trailing-zero-display};
+
+    enum plural-type { cardinal, ordinal }
+    enum plural-category { zero, one, two, few, many, other }
+
+    record plural-options {
+        locale-matcher: option<locale-matcher>,
+        %type: option<plural-type>,
+        notation: option<notation>,
+        minimum-integer-digits: option<u8>,
+        minimum-fraction-digits: option<u8>,
+        maximum-fraction-digits: option<u8>,
+        minimum-significant-digits: option<u8>,
+        maximum-significant-digits: option<u8>,
+        rounding-increment: option<u16>,
+        rounding-mode: option<rounding-mode>,
+        rounding-priority: option<rounding-priority>,
+        trailing-zero-display: option<trailing-zero-display>,
+    }
+
+    record resolved-plural-options {
+        locale: string,
+        plural-categories: list<plural-category>,
+        options: plural-options,
+    }
+
+    resource plural-rules {
+        create: static func(locales: list<string>, options: plural-options) -> result<plural-rules, error>;
+        select: func(n: f64) -> plural-category;
+        select-range: func(start: f64, end: f64) -> result<plural-category, error>;
+        resolved-options: func() -> resolved-plural-options;
+    }
+}
+
+/// `Intl.ListFormat`.
+interface %list {
+    use types.{error, part, locale-matcher};
+
+    enum list-type { conjunction, disjunction, unit }
+    enum list-style { long, short, narrow }
+
+    record list-options {
+        locale-matcher: option<locale-matcher>,
+        %type: option<list-type>,
+        style: option<list-style>,
+    }
+
+    record resolved-list-options {
+        locale: string,
+        %type: list-type,
+        style: list-style,
+    }
+
+    resource list-format {
+        create: static func(locales: list<string>, options: list-options) -> result<list-format, error>;
+        format: func(items: list<string>) -> string;
+        format-to-parts: func(items: list<string>) -> list<part>;
+        resolved-options: func() -> resolved-list-options;
+    }
+}
+
+/// Unicode text operations that need data: normalization, locale-aware case and order.
+interface text {
+    use types.{error, locale-matcher};
+
+    enum normalization-form { nfc, nfd, nfkc, nfkd }
+
+    /// `String.prototype.normalize`.
+    normalize: func(s: string, form: normalization-form) -> string;
+    /// `toLocaleLowerCase` / `toLocaleUpperCase` (Turkish dotless i and the like).
+    to-lower: func(s: string, locale: string) -> result<string, error>;
+    to-upper: func(s: string, locale: string) -> result<string, error>;
+
+    enum usage { sort, search }
+    enum sensitivity { base, accent, case, %variant }
+    enum case-first { upper, lower, false }
+
+    record collator-options {
+        locale-matcher: option<locale-matcher>,
+        usage: option<usage>,
+        sensitivity: option<sensitivity>,
+        ignore-punctuation: option<bool>,
+        numeric: option<bool>,
+        case-first: option<case-first>,
+        collation: option<string>,
+    }
+
+    record resolved-collator-options {
+        locale: string,
+        collation: string,
+        options: collator-options,
+    }
+
+    /// `Intl.Collator` (and `localeCompare`).
+    resource collator {
+        create: static func(locales: list<string>, options: collator-options) -> result<collator, error>;
+        /// -1, 0 or 1
+        compare: func(a: string, b: string) -> s8;
+        resolved-options: func() -> resolved-collator-options;
+    }
+}
+
+/// A provider of the whole interface: a host library compiled as a component (ICU4X's is
+/// crates/intl), composed into a guest where the host does not answer meshx:intl itself.
+world provider {
+    // exported too, so the provider imports nothing and a guest's types import is
+    // filled from it when they are composed
+    export types;
+    export locale;
+    export time-zone;
+    export date-time;
+    export number;
+    export plural;
+    export %list;
+    export text;
+}
+
+/// Everything, for a guest that wants the whole of Intl: `include meshx:intl/imports@0.1.0;`
+world imports {
+    import locale;
+    import time-zone;
+    import date-time;
+    import number;
+    import plural;
+    import %list;
+    import text;
+}

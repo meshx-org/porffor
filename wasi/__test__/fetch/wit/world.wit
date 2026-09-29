@@ -1,0 +1,9 @@
+package meshx:fetch-test@0.1.0;
+
+/// A guest that makes outgoing requests with fetch(), over wasi:http 0.3 (and aborts
+/// some of them, on timers over wasi:clocks 0.3).
+world fetcher {
+  import wasi:http/client@0.3.0;
+  import wasi:clocks/monotonic-clock@0.3.0;
+  export run: async func(url: string) -> string;
+}

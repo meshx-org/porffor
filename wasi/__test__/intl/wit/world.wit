@@ -1,0 +1,8 @@
+package meshx:intl-test@0.1.0;
+
+/// A guest that formats with Intl, answered by the host through meshx:intl.
+world intl {
+  include meshx:intl/imports@0.1.0;
+
+  export run: func() -> string;
+}

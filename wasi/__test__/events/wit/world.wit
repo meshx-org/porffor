@@ -1,0 +1,6 @@
+package meshx:events-test@0.1.0;
+
+/// A guest that dispatches events through EventTarget, CustomEvent and AbortSignal.
+world events {
+  export run: func() -> string;
+}

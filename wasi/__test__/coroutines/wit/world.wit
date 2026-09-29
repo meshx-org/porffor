@@ -1,0 +1,8 @@
+package meshx:coroutines-test@0.1.0;
+
+/// A guest that runs coroutines: async functions, generators and async generators, one
+/// named case at a time (cases.mjs). No imports of its own.
+world coroutines {
+  /// name: a case in cases.mjs; what it saw, as one string
+  export run: async func(name: string) -> string;
+}

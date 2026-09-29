@@ -1,0 +1,6 @@
+package meshx:url-test@0.1.0;
+
+/// A guest that parses URLs: no imports, one export that runs the corpus.
+world url {
+  export run: func() -> string;
+}

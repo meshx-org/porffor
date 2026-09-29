@@ -1,0 +1,10 @@
+package meshx:server-test@0.1.0;
+
+/// A guest that serves HTTP: a fetch handler (export default { fetch }) as the
+/// wasi:http 0.3 handler, with the environment, timers and outgoing requests.
+world server {
+  import wasi:cli/environment@0.3.0;
+  import wasi:http/client@0.3.0;
+  import wasi:clocks/monotonic-clock@0.3.0;
+  export wasi:http/handler@0.3.0;
+}
