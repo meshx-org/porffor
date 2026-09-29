@@ -12,7 +12,7 @@ const inTmp = file => path.join(tmpDir, file);
 const bundle = inSelfhost('bundle.js');
 const stage1C = inSelfhost('stage1.c');
 const porf = inSelfhost('porf');
-const nodePorf = [ process.execPath, 'runtime/index.js' ];
+const nodePorf = [ process.execPath, 'cli/index.js' ];
 const compileHistory = inTmp('compile-history.jsonl');
 const stage2C = inTmp('stage2.c');
 const stage2Native = inTmp('stage2-native');

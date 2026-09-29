@@ -32,7 +32,7 @@ jobs:
       - name: bundle selfhost compiler
         run: node selfhosted/build.mjs
       - name: compile bundle to c
-        run: node runtime/index.js c --compress-data selfhosted/bundle.js -o selfhosted/stage1.c
+        run: node cli/index.js c --compress-data selfhosted/bundle.js -o selfhosted/stage1.c
       - name: build selfhost compiler
         run: clang -O2 -fno-sanitize=undefined -w selfhosted/stage1.c -o selfhosted/porf -lm
       # a selfhost compiler compiles regex literals ahead of time, so its C for a program

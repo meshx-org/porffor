@@ -140,7 +140,7 @@ export default { REPLServer, start };` ]
 ]);
 
 const entrySource = `import '${root}/selfhosted/native.js';
-import '${root}/runtime/index.js';
+import '${root}/cli/index.js';
 `;
 
 const modules = [];
@@ -274,14 +274,14 @@ const UWS_PATCH_DIR = (() => {
     source = replaced;
   }
 
-  if (file.endsWith('/runtime/native-fetch.js')) {
+  if (file.endsWith('/cli/native-fetch.js')) {
     const replaced = source.replace(`const FETCH_GLOBALS = fs.readFileSync(new URL('./fetch-globals.js', import.meta.url), 'utf8');`,
-      `const FETCH_GLOBALS = ${JSON.stringify(fs.readFileSync(path.join(root, 'runtime/fetch-globals.js'), 'utf8'))};`);
+      `const FETCH_GLOBALS = ${JSON.stringify(fs.readFileSync(path.join(root, 'cli/fetch-globals.js'), 'utf8'))};`);
     if (replaced === source) throw new Error('selfhost native-fetch globals rewrite failed');
     source = replaced;
   }
 
-  if (file.endsWith('/runtime/repl.js')) {
+  if (file.endsWith('/cli/repl.js')) {
     const replImports = [];
     source = source.replace(/^\s*import[^\n]*\n/gm, match => {
       replImports.push(match);
@@ -293,7 +293,7 @@ ${source}
 `;
   }
 
-  if (file.endsWith('/runtime/index.js')) {
+  if (file.endsWith('/cli/index.js')) {
     source = `import __porfforStartRepl from './repl.js';
 import __porfforCompile from '../compiler/index.js';
 ` + source;

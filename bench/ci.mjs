@@ -30,7 +30,7 @@ await Promise.all(Array.from({ length: os.cpus().length }, async () => {
     const base = path.join(outDir, file.replace(/\W/g, '_'));
     try {
       const t0 = performance.now();
-      await run(process.execPath, [ '--stack-size=65500', path.join(root, 'runtime/index.js'), 'c', path.join(benchDir, file), '-o', base + '.c' ], { maxBuffer: 1 << 26 });
+      await run(process.execPath, [ '--stack-size=65500', path.join(root, 'cli/index.js'), 'c', path.join(benchDir, file), '-o', base + '.c' ], { maxBuffer: 1 << 26 });
       const compileMs = performance.now() - t0;
       await run(cc, [ '-O3', '-w', base + '.c', '-o', base, '-lm' ], { maxBuffer: 1 << 26 });
       built[file] = { compileMs, cSize: fs.statSync(base + '.c').size, binSize: fs.statSync(base).size, bin: base };

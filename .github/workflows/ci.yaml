@@ -59,7 +59,7 @@ jobs:
           const sha = process.env.GITHUB_SHA.slice(0, 7);
           const date = new Date().toISOString().slice(0, 10);
           const version = `${release} (${sha} ${date})`;
-          const path = 'runtime/index.js';
+          const path = 'cli/index.js';
           const src = fs.readFileSync(path, 'utf8');
           const replaced = src.replace(/globalThis\.version = '.*?';/, `globalThis.version = '${version}';`);
           if (replaced === src) throw new Error('version string not found');
@@ -73,7 +73,7 @@ jobs:
       - name: bundle selfhost compiler
         run: node selfhosted/build.mjs
       - name: compile bundle to c
-        run: node runtime/index.js c --compress-data selfhosted/bundle.js -o selfhosted/stage1.c
+        run: node cli/index.js c --compress-data selfhosted/bundle.js -o selfhosted/stage1.c
       - name: profile selfhost compiler
         run: |
           mkdir -p /tmp/porffor-pgo
@@ -199,7 +199,7 @@ jobs:
         run: |
           node --input-type=module - <<'EOF'
           import fs from 'node:fs';
-          const path = 'runtime/index.js';
+          const path = 'cli/index.js';
           const pattern = /globalThis\.version = '.*?';/;
           const src = fs.readFileSync(path, 'utf8');
           if (!pattern.test(src)) throw new Error('version string not found');

@@ -785,7 +785,7 @@ const nativeEnv = () => {
 
 const argv = [];
 if (nativeArgc() > 0) argv.push(nativeArgv(0));
-argv.push('runtime/index.js');
+argv.push('cli/index.js');
 for (let i = 1; i < nativeArgc(); i++) argv.push(nativeArgv(i));
 
 globalThis.setInterval = () => 0;
