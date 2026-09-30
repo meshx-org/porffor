@@ -45,7 +45,7 @@ export const __Porffor_printHexDigit = (arg: number): void => {
     case 0xb: Porffor.printStatic('b'); return;
     case 0xa: Porffor.printStatic('a'); return;
 
-    default: Porffor.c`{ const jsval _s = porf_num_to_str(arg.val); porf_out((const char*)(MEM + (u32)_s.val + 4), (int)*(u32*)(MEM + (u32)_s.val)); }`;
+    default: Porffor.c`{ char _nb[32]; porf_out(_nb, porf_num_to_buf(arg.val, _nb)); }`;
   }
 };
 
@@ -75,7 +75,7 @@ export const __Porffor_print = (arg: any, colors: boolean = true, depth: number 
     case Porffor.TYPES.number:
       if (colors) Porffor.printStatic('\x1b[33m'); // yellow
       // as Number::toString (%.15g lost digits: 0.1 + 0.2 printed 0.3), and -0 as -0 as Node
-      Porffor.c`if (arg.val == 0 && signbit(arg.val)) porf_out("-0", 2); else { const jsval s = porf_num_to_str(arg.val); porf_out((const char*)(MEM + (u32)s.val + 4), (int)*(u32*)(MEM + (u32)s.val)); }`;
+      Porffor.c`if (arg.val == 0 && signbit(arg.val)) porf_out("-0", 2); else { char _nb[32]; porf_out(_nb, porf_num_to_buf(arg.val, _nb)); }`;
       if (colors) Porffor.printStatic('\x1b[0m');
       return;
 
@@ -254,10 +254,13 @@ export const __Porffor_print = (arg: any, colors: boolean = true, depth: number 
       if (colors) Porffor.printStatic('\x1b[0m');
       Porffor.printStatic('): <');
 
-      const buffer = new Uint8Array(arg);
-      const bufferLen = buffer.length - 1;
+      // its bytes read where they are (after its i32 length), not through a Uint8Array: printing
+      // a buffer would bring the typed arrays, and with them typed array keys in every
+      // property read (program.typedArrays), into any program that prints something
+      const bufferLen: i32 = arg.byteLength - 1;
+      const bytes: i32 = Porffor.IR.ptr(arg);
       for (let i: i32 = 0; i <= bufferLen; i++) {
-        const ele = buffer[i];
+        const ele: i32 = Porffor.IR.loadU8(bytes + i, 4);
         __Porffor_printHexDigit((ele & 0xF0) / 16);
         __Porffor_printHexDigit(ele & 0xF);
         if (i != bufferLen) Porffor.printStatic(' ');
@@ -266,7 +269,7 @@ export const __Porffor_print = (arg: any, colors: boolean = true, depth: number 
       Porffor.printStatic('>,\n  byteLength: ');
       if (colors) Porffor.printStatic('\x1b[33m'); // yellow
       const byteLength: number = arg.byteLength;
-      Porffor.c`{ const jsval _s = porf_num_to_str(byteLength); porf_out((const char*)(MEM + (u32)_s.val + 4), (int)*(u32*)(MEM + (u32)_s.val)); }`;
+      Porffor.c`{ char _nb[32]; porf_out(_nb, porf_num_to_buf(byteLength, _nb)); }`;
       if (colors) Porffor.printStatic('\x1b[0m');
       Porffor.printStatic('\n}');
       return;
@@ -525,41 +528,55 @@ export const __console_dir = (obj: any, options: any): void => {
 
 export const __console_dirxml = (obj: any): void => __console_dir(obj);
 
+// a count's or a timer's label: 'default', else the label as a string (its toString runs,
+// and what it throws is thrown)
+export const __Porffor_consoleLabel = (label: any): any => {
+  if (label === undefined) return 'default';
+  return ecma262.ToString(label);
+};
+
 const countMap = new Map();
 export const __console_count = (label: any): void => {
-  label ??= 'default';
+  label = __Porffor_consoleLabel(label);
   const val = (countMap.get(label) ?? 0) + 1;
   countMap.set(label, val);
 
   __Porffor_consoleIndent();
   __Porffor_consolePrint(label);
   Porffor.printStatic(': ');
-  Porffor.c`{ const jsval _s = porf_num_to_str(val.val); porf_out((const char*)(MEM + (u32)_s.val + 4), (int)*(u32*)(MEM + (u32)_s.val)); }`;
+  Porffor.c`{ char _nb[32]; porf_out(_nb, porf_num_to_buf(val.val, _nb)); }`;
   Porffor.printStatic('\n');
 };
 
 export const __console_countReset = (label: any): void => {
-  label ??= 'default';
-  countMap.set(label, -1);
-  __console_count(label);
+  label = __Porffor_consoleLabel(label);
+  if (countMap.has(label)) {
+    countMap.set(label, 0);
+    return;
+  }
+
+  Porffor.printStatic("Count for '");
+  __Porffor_consolePrint(label);
+  Porffor.printStatic("' does not exist\n");
 };
 
 const timeMap = new Map();
 export const __console_time = (label: any): void => {
-  label ??= 'default';
+  label = __Porffor_consoleLabel(label);
 
   // warn if label already exists
   if (timeMap.has(label)) {
     Porffor.printStatic("Warning: Timer '");
     __Porffor_consolePrint(label);
     Porffor.printStatic("' already exists for console.time()\n");
+    return;
   }
 
   timeMap.set(label, performance.now());
 };
 
-export const __console_timeLog = (label: any): void => {
-  label ??= 'default';
+export const __console_timeLog = (label: any, ...data: any[]): void => {
+  label = __Porffor_consoleLabel(label);
   __Porffor_consoleIndent();
 
   const val = timeMap.get(label);
@@ -574,13 +591,39 @@ export const __console_timeLog = (label: any): void => {
   Porffor.printStatic(': ');
 
   const elapsed: number = performance.now() - val;
-  Porffor.c`{ const jsval _s = porf_num_to_str(elapsed); porf_out((const char*)(MEM + (u32)_s.val + 4), (int)*(u32*)(MEM + (u32)_s.val)); }`;
-  Porffor.printStatic(' ms\n');
+  Porffor.c`{ char _nb[32]; porf_out(_nb, porf_num_to_buf(elapsed, _nb)); }`;
+  Porffor.printStatic(' ms');
+  const dataLen: i32 = data.length;
+  for (let i: i32 = 0; i < dataLen; i++) {
+    Porffor.printStatic(' ');
+    __Porffor_consolePrint(data[i]);
+  }
+  Porffor.printStatic('\n');
 };
 
 export const __console_timeEnd = (label: any): void => {
-  label ??= 'default';
+  label = __Porffor_consoleLabel(label);
 
   __console_timeLog(label);
   timeMap.delete(label);
+};
+
+// no frames to print (Porffor keeps none): the message, as Node's first line, to stderr
+export const __console_trace = (...args: any[]): void => {
+  Porffor.c`fflush(PORF_CONSOLE_OUT); porf_print_out = PORF_CONSOLE_ERR;`;
+  __Porffor_consoleIndent();
+  Porffor.printStatic('Trace');
+  const argLen: i32 = args.length;
+  for (let i: i32 = 0; i < argLen; i++) {
+    if (i == 0) Porffor.printStatic(': ');
+      else Porffor.printStatic(' ');
+    __Porffor_consolePrint(args[i]);
+  }
+  Porffor.printStatic('\n');
+  Porffor.c`fflush(PORF_CONSOLE_ERR); porf_print_out = NULL;`;
+};
+
+// the data logged as it is (no table drawn), as a console may when it cannot tabulate
+export const __console_table = (tabularData: any, properties: any): void => {
+  __console_log(tabularData);
 };

@@ -2,12 +2,11 @@ import type {} from './porffor.d.ts';
 
 // 21.1.1.1 Number (value)
 // https://tc39.es/ecma262/multipage/numbers-and-dates.html#sec-number-constructor-number-value
-export const Number = function (value: any): number|any {
+export const Number = function (_argc: i32, value: any): number|any {
   let n: number = 0;
 
-  // 1. If value is present, then
-  // todo: handle undefined (NaN) and not present (0) args differently
-  if (Porffor.type(value) != Porffor.TYPES.undefined) {
+  // 1. If value is present, then (an undefined given is NaN, none at all 0)
+  if (_argc > 0) {
     // a. Let prim be ? ToNumeric(value).
     const prim: any = ecma262.ToNumeric(value);
 

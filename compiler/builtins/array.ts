@@ -179,7 +179,7 @@ export const __Array_fromAsync = async function (items: any, mapper: any = undef
   const mapping: boolean = Porffor.type(mapper) != Porffor.TYPES.undefined;
   if (mapping && Porffor.type(mapper) != Porffor.TYPES.function) throw new TypeError('Called Array.fromAsync with a non-function mapper');
 
-  if (Porffor.fastOr(
+  let iterable: boolean = Porffor.fastOr(
     Porffor.type(items) == Porffor.TYPES.array,
     (Porffor.type(items) | 0b10000000) == Porffor.TYPES.bytestring,
     Porffor.type(items) == Porffor.TYPES.set,
@@ -187,7 +187,18 @@ export const __Array_fromAsync = async function (items: any, mapper: any = undef
     Porffor.type(items) == Porffor.TYPES.__porffor_generator,
     Porffor.type(items) == Porffor.TYPES.__porffor_asyncgenerator,
     Porffor.fastAnd(Porffor.type(items) >= Porffor.TYPES.uint8clampedarray, Porffor.type(items) <= Porffor.TYPES.float64array)
-  )) {
+  );
+  // any other object with a [Symbol.asyncIterator] or a [Symbol.iterator] is iterated (the
+  // sync one's values awaited), not read as an array-like: only a program that names them
+  // can give an object either
+  if (Porffor.comptime.flag`program.usesIterProtocol`) {
+    if (!iterable) if (__Porffor_object_isObject(items)) {
+      if (items[Symbol.asyncIterator] != null) iterable = true;
+        else if (items[Symbol.iterator] != null) iterable = true;
+    }
+  }
+
+  if (iterable) {
     let i: i32 = 0;
     if (mapping) {
       for await (const x of items) {
@@ -1183,52 +1194,8 @@ export const __Array_prototype_sort = function (this: any[], callbackFn: any) {
 
 // @porf-typed-array
 export const __Array_prototype_toString = function (this: any[]) {
-  // todo: this is bytestring only!
-
-  const len: i32 = this.length;
-  if (len == 0) return '';
-
-  const parts: any[] = Porffor.array.new(len);
-  const partLens: i32 = Porffor.malloc(len * 4);
-
-  let outLen: i32 = 0;
-  if (len > 1) outLen = len - 1;
-
-  let i: i32 = 0;
-  while (i < len) {
-    const element: any = this[i++];
-    let partLen: i32 = 0;
-    if (element != 0 || Porffor.fastAnd(
-      Porffor.type(element) != Porffor.TYPES.undefined, // undefined
-      Porffor.type(element) != Porffor.TYPES.object // null
-    )) {
-      const part: bytestring = ecma262.ToString(element);
-      parts[i - 1] = part;
-      partLen = part.length;
-      outLen += partLen;
-    }
-
-    Porffor.IR.storeI32(partLens + (i - 1) * 4, 0, partLen);
-  }
-
-  const out: bytestring = Porffor.malloc(outLen + 6);
-  Porffor.IR.storeI32(out, 0, outLen);
-
-  let outPtr: i32 = Porffor.IR.ptr(out);
-  i = 0;
-  while (i < len) {
-    if (i > 0) Porffor.IR.storeU8(outPtr++, 4, 44);
-
-    const part: bytestring = parts[i];
-    const partLen: i32 = Porffor.IR.loadI32(partLens + i * 4, 0);
-    i++;
-    if (partLen != 0) {
-      Porffor.IR.copy(outPtr + 4, Porffor.IR.ptr(part) + 4, partLen);
-      outPtr += partLen;
-    }
-  }
-
-  return out;
+  // join's: its elements may be two-byte strings (join builds either kind of string)
+  return Porffor.callThis(__Array_prototype_join, this, undefined);
 };
 
 // @porf-typed-array

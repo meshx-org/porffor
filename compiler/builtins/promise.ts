@@ -33,7 +33,7 @@ export const __Porffor_promise_payload = (promise: any): any => {
 };
 
 export const __Porffor_promise_newReaction = (handler: any, promise: any, kind: i32): i32 => {
-  const out: i32 = Porffor.malloc(40);
+  const out: i32 = Porffor.malloc(48);
   Porffor.IR.storeJv(out, 0, handler);
   Porffor.IR.storeJv(out, 8, promise);
   Porffor.IR.storeJv(out, 16, undefined);
@@ -41,8 +41,31 @@ export const __Porffor_promise_newReaction = (handler: any, promise: any, kind: 
   Porffor.IR.storeI32(out, 28, 0);
   Porffor.IR.storeU8(out, 32, kind);
   Porffor.IR.storeU8(out, 33, 0);
+  // the async context now: current again while the reaction runs (runOneInContext)
+  Porffor.c`*(jsbits*)(MEM + (u32)out + PORF_REACTION_CONTEXT) = porf_async_context;`;
   Porffor.c`porf_gc_barrier((u32)out, PORF_GC_KIND_PROMISE_REACTION);`;
   return out;
+};
+
+// the current async context (AsyncLocalStorage's frame: runtime/node/async_hooks.mjs); what a
+// reaction made now carries, and has current while it runs
+export const __Porffor_asyncContext_get = (): any => {
+  let out: any = undefined;
+  Porffor.c`if (porf_async_context != 0) out = porf_unpack(porf_async_context);`;
+  return out;
+};
+
+export const __Porffor_asyncContext_set = (value: any): void => {
+  Porffor.c`porf_async_context = value.type == 0 /* undefined */ ? 0 : porf_pack(value);`;
+};
+
+// a reaction, run in the async context it was made in (then the one before is current again)
+export const __Porffor_promise_runOneInContext = (reaction: i32): void => {
+  // (the raw bits, as they are: 0 is no context)
+  let saved: f64 = 0;
+  Porffor.c`memcpy(&saved, &porf_async_context, 8); porf_async_context = *(jsbits*)(MEM + (u32)reaction + PORF_REACTION_CONTEXT);`;
+  __Porffor_promise_runOne(reaction);
+  Porffor.c`memcpy(&porf_async_context, &saved, 8);`;
 };
 
 export const __Porffor_promise_reactionSetPayload = (reaction: i32, payload: i32): void => {
@@ -183,8 +206,18 @@ export const __Porffor_promise_resolve = (value: any, promise: any): void => {
     let probe: any = value;
     let lastProbe: any = probe;
     while (Porffor.type(probe) == Porffor.TYPES.object) {
+      // (null ends the chain)
+      if (Porffor.IR.ptr(probe) == 0) {
+        probe = undefined;
+        break;
+      }
       if (Porffor.object.lookup(probe, 'then', thenHash) != 0) break;
-      probe = __Porffor_object_getPrototype(probe);
+      const next: any = __Porffor_object_getPrototype(probe);
+      // no prototype of its own is Object.prototype's (a then defined there counts too)
+      if (Porffor.type(next) == Porffor.TYPES.undefined) {
+        if (Porffor.IR.ptr(probe) == Porffor.IR.ptr(__Object_prototype)) break;
+        probe = __Object_prototype;
+      } else probe = next;
       if (Porffor.IR.ptr(probe) == Porffor.IR.ptr(lastProbe)) break;
       lastProbe = probe;
     }
@@ -269,7 +302,10 @@ export const __Porffor_promise_keyedResult = (st: any[], results: any[]): any =>
   const keys: any = st[2];
   if (keys === undefined) return results;
 
-  const out: any = __Object_create(null, undefined);
+  // (a plain object, its prototype null: not Object.create, which brings its property
+  // descriptors into every program that combines promises)
+  const out: object = {};
+  __Porffor_object_setPrototype(out, null);
   const len: i32 = results.length;
   for (let i: i32 = 0; i < len; i++) out[keys[i]] = results[i];
   return out;
@@ -280,11 +316,6 @@ export const __Porffor_promise_runOne = (reaction: i32): void => {
 
   if (kind == 11) {
     Porffor.c`porf_promise_run_coro_reaction((u32)reaction);`;
-    return;
-  }
-
-  if (kind == 12) {
-    Porffor.c`porf_native_fetch_run_response_reaction((u32)reaction);`;
     return;
   }
 
@@ -355,7 +386,7 @@ export const __Porffor_promise_runJobs = (): void => {
     const reaction: i32 = __Porffor_promise_dequeueReaction();
     if (reaction == 0) break;
 
-    __Porffor_promise_runOne(reaction);
+    __Porffor_promise_runOneInContext(reaction);
   }
 
   while (pendingRejections.length > 0) {
@@ -623,10 +654,24 @@ export const __Porffor_promise_awaitSync = (value: any): any => {
 
   let state: i32 = __Porffor_promise_state(value);
   if (state == 0) {
+    // whether the event loop had nothing left after its last turn, with no job run since
+    let loopDone: i32 = 0;
     while (__Porffor_promise_state(value) == 0) {
       const reaction: i32 = __Porffor_promise_dequeueReaction();
-      if (reaction == 0) throw new TypeError('Deadlock: awaited pending promise with no pending jobs');
-      __Porffor_promise_runOne(reaction);
+      if (reaction == 0) {
+        if (loopDone) throw new TypeError('Deadlock: awaited pending promise with no pending jobs');
+        // no job left: a turn of the event loop (the runtime's: a timer, I/O), when there is one
+        // with anything pending on it. The turn that leaves nothing pending may still have settled
+        // the promise or queued its jobs (the last callback): only once those have run and
+        // nothing more came of them is it a deadlock
+        let pending: i32 = 0;
+        Porffor.c`if (porf_event_loop_step) pending = porf_event_loop_step();`;
+        if (pending == 0) loopDone = 1;
+        continue;
+      }
+      // a job may start another operation on the loop
+      loopDone = 0;
+      __Porffor_promise_runOneInContext(reaction);
     }
     state = __Porffor_promise_state(value);
   }

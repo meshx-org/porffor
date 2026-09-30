@@ -46,10 +46,13 @@ const isSelfReferenceContext = (currentFunc, owner) => {
   return false;
 };
 
+// a loop's body block is entered afresh each iteration (a while loop's too): its lets are
+// per-iteration bindings even when the loop header declares none
 const isLoopScope = scope =>
   scope?.type === 'ForStatement' ||
   scope?.type === 'ForInStatement' ||
-  scope?.type === 'ForOfStatement';
+  scope?.type === 'ForOfStatement' ||
+  !!scope?._loopBody;
 
 const bindingHasLoopScope = variable => {
   const funcInd = scopes.indexOf(variable.func);
@@ -78,6 +81,9 @@ const resolveVariable = name => {
   }
 };
 
+const nodeWithin = (node, outer) =>
+  outer != null && node.start >= outer.start && node.end <= outer.end;
+
 const markWrite = node => {
   if (!node || typeof node !== 'object') return;
 
@@ -85,6 +91,11 @@ const markWrite = node => {
     const variable = node._resolvedVariable ?? node._variable ?? resolveVariable(node.name);
     if (variable) {
       variable.node._writes = (variable.node._writes ?? 0) + 1;
+      // a for (let ...) binding written outside its test and update: the value a closure
+      // snapshots at creation can go stale (codegen boxes it per iteration instead)
+      const loop = variable.scope;
+      if (loop?.type === 'ForStatement' && !nodeWithin(node, loop.test) && !nodeWithin(node, loop.update))
+        variable.node._loopBodyWrites = (variable.node._loopBodyWrites ?? 0) + 1;
     }
     return;
   }
@@ -438,6 +449,10 @@ const analyze = (node, strict = false) => {
     case 'ForStatement':
     case 'ForInStatement':
     case 'ForOfStatement':
+    case 'WhileStatement':
+    case 'DoWhileStatement':
+      if (node.body?.type === 'BlockStatement') node.body._loopBody = true;
+      if (node.type === 'WhileStatement' || node.type === 'DoWhileStatement') break;
     case 'SwitchStatement':
     case 'BlockStatement':
       scopes.push(node);
@@ -721,6 +736,7 @@ const annotateNode = (node, parent, key) => {
               // pass loop captures through intermediate closures
               const capture = currentFunc._captures[node.name];
               if (capture.perIteration) {
+                variable.node._perIterationCaptured = true;
                 for (let cursor = currentFunc._parentFunc; cursor !== variable.func; cursor = cursor._parentFunc) {
                   cursor._captures ??= Object.create(null);
                   cursor._captures[node.name] ??= capture;

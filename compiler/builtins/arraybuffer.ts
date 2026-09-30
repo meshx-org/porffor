@@ -88,12 +88,16 @@ export const ArrayBuffer = function (length: any, options: any = undefined): Arr
 
   // 3. Let requestedMaxByteLength be ? GetArrayBufferMaxByteLengthOption(options).
   let max: number = -1;
-  // read as the plain object it is (read as any, every type with a maxByteLength would come in)
-  if (Porffor.fastAnd(Porffor.type(options) == Porffor.TYPES.object, options !== null)) {
-    const maxOption: any = (options as object).maxByteLength;
-    if (maxOption !== undefined) {
-      max = ecma262.ToIndex(maxOption);
-      if (byteLength > max) throw new RangeError('Invalid ArrayBuffer length (over maxByteLength)');
+  // read as the plain object it is (read as any, every type with a maxByteLength would come in),
+  // in a program that can make a resizable buffer at all (program.resizableBuffers): the read is
+  // the generic property read, and brings what that reaches into every program with a buffer
+  if (Porffor.comptime.flag`program.resizableBuffers`) {
+    if (Porffor.fastAnd(Porffor.type(options) == Porffor.TYPES.object, options !== null)) {
+      const maxOption: any = (options as object).maxByteLength;
+      if (maxOption !== undefined) {
+        max = ecma262.ToIndex(maxOption);
+        if (byteLength > max) throw new RangeError('Invalid ArrayBuffer length (over maxByteLength)');
+      }
     }
   }
 

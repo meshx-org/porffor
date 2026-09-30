@@ -26,6 +26,8 @@ let __Porffor_json_allow: any = undefined;
 // set by putProperty, putEntry and putEntries when they wrote nothing (the offset they
 // return is then the one they were given); read right after the call
 let __Porffor_json_skipped: boolean = false;
+// the objects and arrays being serialized, by depth: meeting one again is a cycle
+let __Porffor_json_stack: any = undefined;
 
 // room for n more bytes at off, the buffer moved to a bigger one if there is not
 export const __Porffor_json_ensure = (off: i32, n: i32): void => {
@@ -327,6 +329,12 @@ export const __Porffor_json_serialize = (off: i32, holder: any, value: any, key:
 
   const hasSpace: boolean = space !== undefined;
 
+  // a value that contains itself has no JSON (SerializeJSONObject's stack check)
+  const stack: any[] = __Porffor_json_stack;
+  for (let i: i32 = 0; i < depth; i++) if (stack[i] === value) throw new TypeError('Converting circular structure to JSON');
+  if (depth < stack.length) stack[depth] = value;
+    else Porffor.array.fastPush(stack, value);
+
   if (t == Porffor.TYPES.array) {
     off = __Porffor_json_putChar(off, 91); // [
     const len: i32 = (value as any[]).length;
@@ -443,12 +451,14 @@ export const __JSON_stringify = (value: any, replacer: any, space: any) => {
   const outerWide: boolean = __Porffor_json_wide;
   const outerReplacer: any = __Porffor_json_replacer;
   const outerAllow: any = __Porffor_json_allow;
+  const outerStack: any = __Porffor_json_stack;
 
   __Porffor_json_cap = 4096;
   __Porffor_json_buf = Porffor.malloc(8 + __Porffor_json_cap);
   __Porffor_json_wide = false;
   __Porffor_json_replacer = replacerFn;
   __Porffor_json_allow = allow;
+  __Porffor_json_stack = Porffor.array.new(8);
   // the root's holder, a replacer's this for it: { '': value }
   let root: any = undefined;
   if (replacerFn !== undefined) {
@@ -464,6 +474,7 @@ export const __JSON_stringify = (value: any, replacer: any, space: any) => {
   __Porffor_json_wide = outerWide;
   __Porffor_json_replacer = outerReplacer;
   __Porffor_json_allow = outerAllow;
+  __Porffor_json_stack = outerStack;
   if (len == -1) return undefined;
 
   Porffor.IR.storeI32(buffer, 0, len);

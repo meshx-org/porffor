@@ -108,6 +108,8 @@ export default async ({ TYPED_ARRAY_KINDS }) => {
     Porffor.IR.fill(bufferPtr + 4, 0, byteLength);
 
     if (src !== undefined) {
+      // (element stores check the index against the length: set it first)
+      Porffor.IR.storeI32(outPtr, 0, len);
       for (let i: i32 = 0; i < len; i++) out[i] = src[i];
     }
   }
@@ -156,6 +158,10 @@ export const __${name}_from = function (this: any, arg: any, mapFn: any): any {
       }
     }
     len = i;
+  } else if (Porffor.type(arg) == Porffor.TYPES.object) {
+    // any other iterable, or an array-like ({ length: n }): Array.from's reading, mapFn and all
+    const items: any[] = __Array_from(arg, mapFn);
+    for (const x of items) arr[len++] = x;
   }
 
   arr.length = len;

@@ -48,7 +48,10 @@ export const __Porffor_object_hash = (key: any): i32 => {
   // bytestring or string, xxh32-based hash
   let p: i32 = Porffor.IR.ptr(key);
   const len: i32 = Porffor.IR.loadI32(key, 0);
-  let hash: i32 = 374761393;
+  // seeded with the length, as xxh32 is: a zero byte adds nothing to a word, so without it a key
+  // and the key with a NUL on its end would be the same key (lookup compares hashes only).
+  // Written out below as constants: '__proto__' is 593337848, 'lastIndex' -641535064
+  let hash: i32 = 374761393 + len;
 
   if (Porffor.type(key) == Porffor.TYPES.string) {
     const stringEnd: i32 = p + len * 2;
@@ -375,6 +378,11 @@ export const __Porffor_object_underlying = (_obj: any): any => {
     if (objType == Porffor.TYPES.function) {
       __Porffor_object_fastAdd(underlying, 'length', __Porffor_funcLut_length(obj), 0b0010);
       __Porffor_object_fastAdd(underlying, 'name', __Porffor_funcLut_name(obj), 0b0010);
+      // an async function inherits %AsyncFunction.prototype% (only a program with promises
+      // can have one)
+      if (Porffor.comptime.flag`hasType.promise`) {
+        if (__Porffor_funcLut_kind(_obj) == 1) __Porffor_object_setPrototype(underlying, __Porffor_asyncFunction_proto());
+      }
 
       if (ecma262.IsConstructor(_obj)) { // constructor
         const builtinProto: any = __Porffor_object_builtinPrototype(_obj);
@@ -661,11 +669,24 @@ export const __Porffor_array_propertyKeyIndex = (key: any): i32 => {
 export const __Porffor_object_readError = (obj: any, key: any): any => {
   const what: bytestring = Porffor.type(obj) == Porffor.TYPES.undefined ? 'undefined' : 'null';
   const t: i32 = Porffor.type(key);
-  if (t == Porffor.TYPES.symbol) return new TypeError(`Cannot read properties of ${what} (reading '${key.toString()}')`);
+  // (a symbol key only in a program with symbols: its toString brings Symbol's prototype in)
+  if (Porffor.comptime.flag`hasType.symbol`) {
+    if (t == Porffor.TYPES.symbol) return new TypeError(`Cannot read properties of ${what} (reading '${key.toString()}')`);
+  }
   if (Porffor.fastOr(t == Porffor.TYPES.string, t == Porffor.TYPES.bytestring, t == Porffor.TYPES.number)) {
     return new TypeError(`Cannot read properties of ${what} (reading '${key}')`);
   }
   return new TypeError(`Cannot read properties of ${what}`);
+};
+
+// CanonicalNumericIndexString: the number a typed array's string key names ('1', '-0', '1.5',
+// 'NaN': an element, valid or not, never an ordinary property), or undefined for any other key
+export const __Porffor_typedArray_canonicalIndex = (key: any): any => {
+  if (Porffor.type(key) == Porffor.TYPES.symbol) return undefined;
+  if (key === '-0') return -0;
+  const n: number = ecma262.ToNumber(key);
+  if (ecma262.ToString(n) === key) return n;
+  return undefined;
 };
 
 export const __Porffor_object_get = (_obj: any, key: any): any => {
@@ -682,12 +703,23 @@ export const __Porffor_object_get = (_obj: any, key: any): any => {
   }
 
   key = ecma262.ToPropertyKey(key);
+  if (Porffor.comptime.flag`program.typedArrays`) {
+    if (trueType != Porffor.TYPES.object) if (__Porffor_object_isTypedArray(_obj)) {
+      const index: any = __Porffor_typedArray_canonicalIndex(key);
+      if (index !== undefined) return _obj[index];
+    }
+  }
   // [Symbol.iterator] of the built-in iterables (their prototype objects carry no symbol
   // keys), in a program that can name it at all
   if (Porffor.comptime.flag`program.usesIterProtocol`) {
-    if (Porffor.type(key) == Porffor.TYPES.symbol) if (key === Symbol.iterator) {
-      const method: any = __Porffor_iter_builtinMethod(trueType);
-      if (method !== undefined) return method;
+    if (Porffor.type(key) == Porffor.TYPES.symbol) {
+      if (key === Symbol.iterator) {
+        const method: any = __Porffor_iter_builtinMethod(trueType);
+        if (method !== undefined) return method;
+      } else if (key === Symbol.asyncIterator) {
+        // an async generator is its own async iterator (%AsyncIteratorPrototype%'s method)
+        if (trueType == Porffor.TYPES.__porffor_asyncgenerator) return __Porffor_iter_self;
+      }
     }
   }
   if (trueType == Porffor.TYPES.array) {
@@ -712,7 +744,7 @@ export const __Porffor_object_get = (_obj: any, key: any): any => {
     } else obj = __Porffor_object_getPrototypeWithHidden(trueType == Porffor.TYPES.array ? _obj : obj, trueType);
 
     // todo/opt: put this behind comptime flag if only __proto__ is used
-    if (hash == 212292208) if (Porffor.strcmp(key, '__proto__')) {
+    if (hash == 593337848) if (Porffor.strcmp(key, '__proto__')) {
       // get prototype
       return obj;
     }
@@ -741,6 +773,10 @@ export const __Porffor_object_get = (_obj: any, key: any): any => {
       // this, a subclass's included: only in a program that names species or subclasses
       if (Porffor.comptime.flag`member.species`) {
         if (Porffor.type(key) == Porffor.TYPES.symbol) if (key === Symbol.species) return __Porffor_object_speciesGet(_obj);
+      }
+      // and [Symbol.iterator] of the built-in prototypes (Array.prototype's, ...), on the chain
+      if (Porffor.comptime.flag`program.usesIterProtocol`) {
+        if (Porffor.type(key) == Porffor.TYPES.symbol) return __Porffor_iter_protoMethod(_obj, key);
       }
       return undefined;
     }
@@ -965,6 +1001,12 @@ export const __Porffor_object_get_withHash = (_obj: any, key: any, hash: i32): a
   if (Porffor.comptime.flag`hasType.proxy`) {
     if (trueType == Porffor.TYPES.proxy) return __Porffor_proxy_get(_obj, key, _obj);
   }
+  if (Porffor.comptime.flag`program.typedArrays`) {
+    if (trueType != Porffor.TYPES.object) if (__Porffor_object_isTypedArray(_obj)) {
+      const index: any = __Porffor_typedArray_canonicalIndex(key);
+      if (index !== undefined) return _obj[index];
+    }
+  }
   // whether the receiver has own properties to look at (an array or a string without a side
   // table has none but its length and indices), and whether its prototype chain is its
   // type's default one (so a miss on it can be remembered)
@@ -1056,6 +1098,16 @@ export const __Porffor_object_set = (_obj: any, key: any, value: any): any => {
   if (Porffor.comptime.flag`hasType.proxy`) {
     if (trueType == Porffor.TYPES.proxy) return __Porffor_proxy_set(_obj, ecma262.ToPropertyKey(key), value, _obj, false);
   }
+  if (Porffor.comptime.flag`program.typedArrays`) {
+    if (trueType != Porffor.TYPES.object) if (__Porffor_object_isTypedArray(_obj)) {
+      key = ecma262.ToPropertyKey(key);
+      const index: any = __Porffor_typedArray_canonicalIndex(key);
+      if (index !== undefined) {
+        _obj[index] = value;
+        return value;
+      }
+    }
+  }
   if (Porffor.type(obj) != Porffor.TYPES.object) {
     obj = __Porffor_object_underlying(obj);
     if (Porffor.type(obj) != Porffor.TYPES.object) return value;
@@ -1093,7 +1145,7 @@ export const __Porffor_object_set = (_obj: any, key: any, value: any): any => {
     }
   }
 
-  if (trueType == Porffor.TYPES.regexp) if (hash == -1322609992) if (Porffor.strcmp(key, 'lastIndex')) {
+  if (trueType == Porffor.TYPES.regexp) if (hash == -641535064) if (Porffor.strcmp(key, 'lastIndex')) {
     Porffor.IR.storeI32(_obj, 8, ecma262.ToIntegerOrInfinity(value));
     return value;
   }
@@ -1101,7 +1153,7 @@ export const __Porffor_object_set = (_obj: any, key: any, value: any): any => {
   let entryPtr: i32 = __Porffor_object_lookup(obj, key, hash);
   let flags: i32;
   if (entryPtr == 0) {
-    if (hash == 212292208) if (Porffor.strcmp(key, '__proto__')) {
+    if (hash == 593337848) if (Porffor.strcmp(key, '__proto__')) {
       // set prototype
       __Porffor_object_setPrototype(obj, value);
       return value;
@@ -1183,6 +1235,15 @@ export const __Porffor_object_set_withHash = (_obj: any, key: any, value: any, h
   if (Porffor.comptime.flag`hasType.proxy`) {
     if (trueType == Porffor.TYPES.proxy) return __Porffor_proxy_set(_obj, key, value, _obj, false);
   }
+  if (Porffor.comptime.flag`program.typedArrays`) {
+    if (trueType != Porffor.TYPES.object) if (__Porffor_object_isTypedArray(_obj)) {
+      const index: any = __Porffor_typedArray_canonicalIndex(key);
+      if (index !== undefined) {
+        _obj[index] = value;
+        return value;
+      }
+    }
+  }
   if (Porffor.type(obj) != Porffor.TYPES.object) {
     obj = __Porffor_object_underlying(obj);
     if (Porffor.type(obj) != Porffor.TYPES.object) return value;
@@ -1190,7 +1251,7 @@ export const __Porffor_object_set_withHash = (_obj: any, key: any, value: any, h
 
   if (Porffor.IR.ptr(obj) == 0) throw new TypeError('Cannot set property of null');
 
-  if (trueType == Porffor.TYPES.regexp) if (hash == -1322609992) if (Porffor.strcmp(key, 'lastIndex')) {
+  if (trueType == Porffor.TYPES.regexp) if (hash == -641535064) if (Porffor.strcmp(key, 'lastIndex')) {
     Porffor.IR.storeI32(_obj, 8, ecma262.ToIntegerOrInfinity(value));
     return value;
   }
@@ -1274,6 +1335,16 @@ export const __Porffor_object_setStrict = (_obj: any, key: any, value: any): any
   if (Porffor.comptime.flag`hasType.proxy`) {
     if (trueType == Porffor.TYPES.proxy) return __Porffor_proxy_set(_obj, ecma262.ToPropertyKey(key), value, _obj, true);
   }
+  if (Porffor.comptime.flag`program.typedArrays`) {
+    if (trueType != Porffor.TYPES.object) if (__Porffor_object_isTypedArray(_obj)) {
+      key = ecma262.ToPropertyKey(key);
+      const index: any = __Porffor_typedArray_canonicalIndex(key);
+      if (index !== undefined) {
+        _obj[index] = value;
+        return value;
+      }
+    }
+  }
   if (Porffor.type(obj) != Porffor.TYPES.object) {
     obj = __Porffor_object_underlying(obj);
     if (Porffor.type(obj) != Porffor.TYPES.object) return value;
@@ -1311,7 +1382,7 @@ export const __Porffor_object_setStrict = (_obj: any, key: any, value: any): any
     }
   }
 
-  if (trueType == Porffor.TYPES.regexp) if (hash == -1322609992) if (Porffor.strcmp(key, 'lastIndex')) {
+  if (trueType == Porffor.TYPES.regexp) if (hash == -641535064) if (Porffor.strcmp(key, 'lastIndex')) {
     Porffor.IR.storeI32(_obj, 8, ecma262.ToIntegerOrInfinity(value));
     return value;
   }
@@ -1319,7 +1390,7 @@ export const __Porffor_object_setStrict = (_obj: any, key: any, value: any): any
   let entryPtr: i32 = __Porffor_object_lookup(obj, key, hash);
   let flags: i32;
   if (entryPtr == 0) {
-    if (hash == 212292208) if (Porffor.strcmp(key, '__proto__')) {
+    if (hash == 593337848) if (Porffor.strcmp(key, '__proto__')) {
       // set prototype
       __Porffor_object_setPrototype(obj, value);
       return value;
@@ -1402,6 +1473,15 @@ export const __Porffor_object_setStrict_withHash = (_obj: any, key: any, value: 
   if (Porffor.comptime.flag`hasType.proxy`) {
     if (trueType == Porffor.TYPES.proxy) return __Porffor_proxy_set(_obj, key, value, _obj, true);
   }
+  if (Porffor.comptime.flag`program.typedArrays`) {
+    if (trueType != Porffor.TYPES.object) if (__Porffor_object_isTypedArray(_obj)) {
+      const index: any = __Porffor_typedArray_canonicalIndex(key);
+      if (index !== undefined) {
+        _obj[index] = value;
+        return value;
+      }
+    }
+  }
   if (Porffor.type(obj) != Porffor.TYPES.object) {
     obj = __Porffor_object_underlying(obj);
     if (Porffor.type(obj) != Porffor.TYPES.object) return value;
@@ -1409,7 +1489,7 @@ export const __Porffor_object_setStrict_withHash = (_obj: any, key: any, value: 
 
   if (Porffor.IR.ptr(obj) == 0) throw new TypeError('Cannot set property of null');
 
-  if (trueType == Porffor.TYPES.regexp) if (hash == -1322609992) if (Porffor.strcmp(key, 'lastIndex')) {
+  if (trueType == Porffor.TYPES.regexp) if (hash == -641535064) if (Porffor.strcmp(key, 'lastIndex')) {
     Porffor.IR.storeI32(_obj, 8, ecma262.ToIntegerOrInfinity(value));
     return value;
   }
@@ -1700,7 +1780,7 @@ export const __Porffor_object_expr_init = (obj: any, key: any, value: any): void
   const hash: i32 = __Porffor_object_hash(key);
   let entryPtr: i32 = __Porffor_object_lookup(obj, key, hash);
   if (entryPtr == 0) {
-    if (hash == 212292208) if (Porffor.strcmp(key, '__proto__')) {
+    if (hash == 593337848) if (Porffor.strcmp(key, '__proto__')) {
       // set prototype
       __Porffor_object_setPrototype(obj, value);
       return value;

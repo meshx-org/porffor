@@ -21,8 +21,11 @@ export const ${name} = function (
   const obj: ${name} = Porffor.malloc(8);
   Porffor.IR.storeJv(obj, 0, message);
 
-  // InstallErrorCause: an options object with a cause gives the error its cause
-  if (Porffor.object.isObject(options)) if ('cause' in options) obj.cause = options.cause;
+  // InstallErrorCause: an options object with a cause gives the error its cause (a program that
+  // never names cause cannot give one, nor see it: program.errorCause)
+  if (Porffor.comptime.flag\`program.errorCause\`) {
+    if (Porffor.object.isObject(options)) if ('cause' in options) obj.cause = options.cause;
+  }
 
   // https://tc39.es/ecma262/multipage/fundamental-objects.html#sec-aggregate-error
   ${name === 'AggregateError' ? `
@@ -49,6 +52,12 @@ export const __${name}_prototype_name$get = function (this: ${name}) {
 
 export const __${name}_prototype_message$get = function (this: ${name}) {
   return Porffor.IR.loadJv(this, 0);
+};
+
+// the stack: Porffor keeps no frames, so only the error's own line (a stack's first, as V8
+// writes it)
+export const __${name}_prototype_stack$get = function (this: any) {
+  return Porffor.callThis(__${name}_prototype_toString, this);
 };
 
 // generic per spec: reads name and message off any this, so a subclass instance's own

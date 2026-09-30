@@ -324,8 +324,56 @@ const directCallOnlyFunctionNode = node =>
   !nodeHasPerIterationCaptures(node) &&
   directCallOnlyRefs(node);
 
+// a closure snapshots a per-iteration binding's value when it is made. That is only right
+// while nothing writes the binding afterwards: one written in the loop body or by a closure
+// lives in a box instead (a one-slot env, a fresh one per iteration), and the snapshot copies
+// the box. A for (let ...) binding written only by its test and update keeps the snapshot.
+const perIterationBox = node => {
+  if (!node?._perIterationCaptured || node.type !== 'Identifier') return false;
+  const variable = node._variable;
+  if (variable?.kind === 'const') return false;
+  return variable?.scope?.type === 'ForStatement' ? (node._loopBodyWrites ?? 0) > 0 : (node._writes ?? 0) > 0;
+};
+
+const boxLocalName = name => `#box_${name}`;
+
+// the binding node behind a name a function snapshots (its own capture, or one of a captured
+// function's)
+const snapshotCaptureNode = (func, name) => {
+  const own = func.closureCaptures?.[name];
+  if (own) return own.node;
+  for (const n in func.closureCaptures ?? {}) {
+    const inner = func.closureCaptures[n]?.node?._func?.closureCaptures?.[name];
+    if (inner) return inner.node;
+  }
+  return null;
+};
+
+const ownBoxedBinding = (scope, name) => perIterationBox(scope.closureOwnLocals?.[name]?.node);
+
+// a new box for a boxed binding, holding value
+const allocBindingBox = (scope, name, value = valUndefined()) => {
+  const v = reuse(scope, value);
+  assign(scope, local(scope, boxLocalName(name)), makeClosureEnv(scope, valUndefined(), 1, [ v ]));
+};
+
+// the next iteration's copy of each boxed for (let ...) binding (CreatePerIterationEnvironment)
+const copyLoopBindingBoxes = (scope, init) => {
+  if (init?.type !== 'VariableDeclaration' || init.kind !== 'let') return;
+  for (const d of init.declarations) {
+    if (d.id?.type !== 'Identifier' || !ownBoxedBinding(scope, d.id.name)) continue;
+    const box = boxSlotNode(identNode(boxLocalName(d.id.name)));
+    allocBindingBox(scope, d.id.name, generate(scope, box));
+  }
+};
+
+const boxSlotNode = box => memberNode(box, { type: 'Literal', value: 1 }, true, {
+  _closureSlot: 1,
+  _skipChainDepth: true
+});
+
 const closureBindingNeedsSlot = capture =>
-  !directCallOnlyFunctionNode(capture?.node);
+  !directCallOnlyFunctionNode(capture?.node) && !perIterationBox(capture?.node);
 
 // own env layout: name -> 1-based slot
 const closureLayout = scope => {
@@ -383,12 +431,20 @@ const closureOwnerMatches = (scope, owner) =>
     scope.ast._variables === owner._variables
   );
 
-const closureEnvNode = (scope, name, owner) => {
+// rawBox: a boxed binding's box itself (what a snapshot copies), not the value in it
+const closureEnvNode = (scope, name, owner, rawBox = false) => {
   let node = identNode(hasClosureOwnEnv(scope) ? '#closure_env_local' : '#closure_env');
   let slot;
+  const start = scope;
   for (;; scope = scope.parentFunc) {
     if (closureOwnerMatches(scope, owner)) {
       if (name == null) return node;
+      if (ownBoxedBinding(scope, name)) {
+        // the box sits in the owner's local, other functions reach it through their snapshot
+        if (scope !== start) throw new Error(`boxed binding ${name} read outside a snapshot in ${start.name}`);
+        const box = identNode(boxLocalName(name));
+        return rawBox ? box : boxSlotNode(box);
+      }
       slot = closureLayout(scope).slots[name] ?? 0;
       break;
     }
@@ -398,7 +454,13 @@ const closureEnvNode = (scope, name, owner) => {
     // snapshots sit between a function's own env and its parent's
     const names = getClosureSnapshotCaptureNames(scope);
     slot = names.indexOf(name) + 1;
-    if (slot) break;
+    if (slot) {
+      if (perIterationBox(snapshotCaptureNode(scope, name))) {
+        const box = memberNode(node, { type: 'Literal', value: slot }, true, { _closureSlot: slot, _skipChainDepth: true });
+        return rawBox ? box : boxSlotNode(box);
+      }
+      break;
+    }
     if (names.length) {
       node = memberNode(node, { type: 'Literal', value: 0 }, true, { _closureSlot: 0 });
     }
@@ -461,7 +523,7 @@ const closureEnvFor = (scope, func) => {
   const parent = reuse(scope, env);
   const values = [];
   for (const name of snap) {
-    values.push(reuse(scope, generate(scope, { type: 'Identifier', name, _closureFunc: func.closureCaptures?.[name]?.func })));
+    values.push(reuse(scope, generate(scope, { type: 'Identifier', name, _closureFunc: func.closureCaptures?.[name]?.func, _rawBox: true })));
   }
   return reuse(scope, makeClosureEnv(scope, parent, values.length, values));
 };
@@ -909,7 +971,7 @@ const generateIdent = (scope, decl) => {
   if (closureOwner) {
     const func = decl._resolvedVariable?.node?._porfforFunc ?? resolveNamedFunction(scope, decl.name);
     if (func) useFunctionValue(func, decl._markFunctionReferenced !== false);
-    return generate(scope, closureEnvNode(scope, decl.name, closureOwner));
+    return generate(scope, closureEnvNode(scope, decl.name, closureOwner, decl._rawBox));
   }
 
   if (decl._builtinMember && decl.name in builtinFuncs) return materializeFunctionValue(scope, includeBuiltin(scope, decl.name));
@@ -929,6 +991,10 @@ const generateIdent = (scope, decl) => {
 
   const boundFunc = decl._resolvedVariable?.node?._porfforFunc;
   if (boundFunc && decl._resolvedVariable.scope.type !== 'Program' && !decl._resolvedVariable.node._writes) return materializeFunctionValue(scope, boundFunc);
+  // a const holding a function expression that no binding stores (generateVarDstr keeps it
+  // lazy): the function it was declared with, not whichever function has its name
+  const constFunc = decl._resolvedVariable?.kind === 'const' ? decl._resolvedVariable.node?._func : null;
+  if (constFunc && !(decl.name in scope.locals) && !(decl.name in globals)) return materializeFunctionValue(scope, constFunc);
 
   if (decl.name in scope.locals) (scope.locals[decl.name].metadata ??= {}).read = true;
   return lookup(scope, decl.name, !(decl.name === 'arguments' && decl._resolvedBinding), decl._markFunctionReferenced !== false)
@@ -1757,7 +1823,7 @@ const getNodeType = (scope, node) => {
     }
     if (ret == null) {
       // `x.call(...)` -> type of x
-      if (name == null && node.callee.type === 'MemberExpression' && node.callee.property.name === 'call') name = node.callee.object.name;
+      if (name == null && node.callee.type === 'MemberExpression' && !node.callee.computed && node.callee.property.name === 'call') name = node.callee.object.name;
       if (name != null) {
         // (a name several functions share resolves to none: taking any one of them, by
         // funcByName, typed a call by another function's return)
@@ -1831,7 +1897,8 @@ const getNodeType = (scope, node) => {
     ret = arg === TYPES.bigint ? TYPES.bigint : usesBigInt && arg !== TYPES.number ? null : TYPES.number;
   }
   else if (node.type === 'MemberExpression') {
-    const name = node.property.name;
+    // o[length] reads the variable length's value as the key, not .length
+    const name = node.computed ? null : node.property.name;
     if (name === 'length' && (hasFuncWithName(node.object.name) || Prefs.fastLength)) ret = TYPES.number;
     else {
       const objType = getNodeType(scope, node.object);
@@ -2008,7 +2075,7 @@ const getKnownThisSlots = node => {
     if (node.type === 'AssignmentExpression' &&
         node.left?.type === 'MemberExpression' &&
         node.left.object?.type === 'ThisExpression' &&
-        node.left.property?.type === 'Identifier') {
+        !node.left.computed && node.left.property?.type === 'Identifier') {
       slots.add(node.left.property.name);
       return;
     }
@@ -2394,6 +2461,10 @@ const generateCall = (scope, decl) => {
         : arg);
 
       const protoBC = {};
+      const member = decl.callee.type === 'ChainExpression' ? decl.callee.expression : decl.callee;
+      const fallbackCallee = name || member.type !== 'MemberExpression' || member.object.type === 'Super' ? decl.callee
+        : decl.callee.type === 'ChainExpression' ? { ...decl.callee, expression: { ...member, object: targetIdent } }
+        : { ...member, object: targetIdent };
       for (const x of builtinProtoCands) {
         const tn = x.split('_prototype_')[0].toLowerCase();
         const t = TYPES[tn.slice(2)] ?? TYPES[tn];
@@ -2431,15 +2502,58 @@ const generateCall = (scope, decl) => {
           continue;
         }
 
+        // a function's own bind (a class's static bind: AsyncLocalStorage.bind) is called, not
+        // Function.prototype's: looked for only where the program may give one (see above)
+        if (t === TYPES.function && functionOwnMethodNames.has(protoName)) {
+          protoBC[t] = () => {
+            const out = tmp(scope, T.jsval);
+            const own = generate(scope, {
+              type: 'CallExpression',
+              callee: { type: 'Identifier', name: '__Object_hasOwn' },
+              arguments: [ targetIdent, { type: 'Literal', value: protoName } ]
+            });
+            emitIf(scope, JvTruthy(reuse(scope, own)),
+              () => assign(scope, out, coerceValue(generate(scope, { ...decl, callee: fallbackCallee, arguments: callArgs, _protoInternalCall: true }), T.jsval)),
+              () => assign(scope, out, coerceValue(builtinCall(callArgs), T.jsval)));
+            return out;
+          };
+          continue;
+        }
+
+        // a subclass's override of this method (see subclassOverrides): the builtin only when
+        // the value's prototype is the builtin's own
+        const ctorName = x.split('_prototype_')[0].slice(2);
+        if (subclassOverrides.get(ctorName)?.has(protoName)) {
+          protoBC[t] = () => {
+            const out = tmp(scope, T.jsval);
+            const proto = generate(scope, {
+              type: 'CallExpression',
+              callee: { type: 'Identifier', name: '__Object_getPrototypeOf' },
+              arguments: [ targetIdent ]
+            });
+            const intrinsic = generate(scope, {
+              type: 'MemberExpression', computed: false, optional: false,
+              object: { type: 'Identifier', name: ctorName },
+              property: { type: 'Identifier', name: 'prototype' }
+            });
+            const same = generate(scope, {
+              type: 'BinaryExpression', operator: '===',
+              left: { type: 'Identifier', name: reuseNamed(scope, proto)[N_A] },
+              right: { type: 'Identifier', name: reuseNamed(scope, intrinsic)[N_A] }
+            });
+            emitIf(scope, JvTruthy(reuse(scope, same)),
+              () => assign(scope, out, coerceValue(builtinCall(callArgs), T.jsval)),
+              () => assign(scope, out, coerceValue(generate(scope, { ...decl, callee: fallbackCallee, arguments: callArgs, _protoInternalCall: true }), T.jsval)));
+            return out;
+          };
+          continue;
+        }
+
         protoBC[t] = () => builtinCall(callArgs);
       }
 
       // the fallback call reads the object through targetTmp too: regenerating decl as-is
       // would evaluate the object expression a second time (f().push(x) calling f twice)
-      const member = decl.callee.type === 'ChainExpression' ? decl.callee.expression : decl.callee;
-      const fallbackCallee = name || member.type !== 'MemberExpression' || member.object.type === 'Super' ? decl.callee
-        : decl.callee.type === 'ChainExpression' ? { ...decl.callee, expression: { ...member, object: targetIdent } }
-        : { ...member, object: targetIdent };
 
       protoBC.default = () => Prefs.neverFallbackBuiltinProto && !decl.optional
         ? internalThrow(scope, 'TypeError', `'${protoName}' proto func tried to be called on a type without an impl`)
@@ -2531,7 +2645,10 @@ const generateCall = (scope, decl) => {
     if (isBuiltinMember) {
       isBuiltin = true;
     } else if (!func && !rebound && !isLocal && !closureBacked && name) {
-      func = resolveNamedFunction(scope, name);
+      // a const bound to a function expression calls that function (another function may
+      // have its name)
+      if (decl.callee._resolvedVariable?.kind === 'const' && !(name in globals)) func = decl.callee._resolvedVariable.node?._func;
+      func ??= resolveNamedFunction(scope, name);
       if (!func && name in funcIndex) func = funcByName(name);
       if (!func && name in builtinFuncs) isBuiltin = true;
     }
@@ -2813,6 +2930,11 @@ const useType = x => {
   if (usedTypes.has(x)) return;
   usedTypes.add(x);
   factSet('hasType', x);
+  // any typed array kind: what builtins handling typed arrays generically wait on
+  if (!typedArraysUsed && TYPED_ARRAY_TYPES.has(x)) {
+    typedArraysUsed = true;
+    factSet('program', 'typedArrays');
+  }
 };
 
 const typeUsed = (scope, x) => {
@@ -3379,6 +3501,10 @@ const generateVarDstr = (scope, kind, pattern, init, defaultValue, global) => {
     }
 
     if (scope.closureOwnLocals?.[name] && (!redecl || init)) {
+      // a loop header's declaration is a new binding each iteration: a new box (a block's
+      // are made at its entry, generateBlock)
+      if (ownBoxedBinding(scope, name) && scope.closureOwnLocals[name].node._variable?.scope?.type !== 'BlockStatement')
+        allocBindingBox(scope, name);
       mirrorToClosureEnv(scope, name, init ? closureLocalReadNode(name) : DEFAULT_VALUE);
     }
 
@@ -3569,6 +3695,9 @@ const bindMemberTarget = (scope, member, prefix, coerceKey = false) => {
   let property = member.property;
   if (member.computed && member._closureSlot == null) {
     const keyName = prefix + 'key' + id;
+    // a number key is its own property key (and keeps an array's or typed array's
+    // element path)
+    if (coerceKey && knownType(scope, getNodeType(scope, member.property)) === TYPES.number) coerceKey = false;
     generateVarDstr(scope, 'const', keyName, coerceKey ? {
       type: 'CallExpression',
       callee: { type: 'Identifier', name: '__ecma262_ToPropertyKey' },
@@ -3613,7 +3742,8 @@ const ctHash = prop => {
 const hashString = prop => {
   let i = 0;
   const len = prop.length;
-  let hash = 374761393;
+  // (seeded with the length, as __Porffor_object_hash is)
+  let hash = (374761393 + len) | 0;
 
   const rotl = (n, k) => (n << k) | (n >>> (32 - k));
   const read = () => (prop.charCodeAt(i + 3) << 24 | prop.charCodeAt(i + 2) << 16 | prop.charCodeAt(i + 1) << 8 | prop.charCodeAt(i));
@@ -3725,7 +3855,7 @@ const generateAssign = (scope, decl, valueUnused = false) => {
     return valueUnused ? valUndefined() : value;
   }
 
-  if (type === 'MemberExpression' && decl.left.property.name === 'length' && !decl._internalAssign) {
+  if (type === 'MemberExpression' && !decl.left.computed && decl.left.property.name === 'length' && !decl._internalAssign) {
     const known = knownType(scope, getNodeType(scope, decl.left.object));
 
     const storeLength = (p, ensureArray = null) => {
@@ -3841,32 +3971,51 @@ const generateAssign = (scope, decl, valueUnused = false) => {
       return res;
     };
 
-    const taAddr = size => reuse(scope, Bin('+', T.u32, Load('u32', JvPtr(obj), 4),
-      size === 1 ? Convert(T.u32, numValue(prop), 0) : Bin('*', T.u32, Convert(T.u32, numValue(prop), 0), Const(T.u32, size))));
-    const taSet = (ctype, size, signed) => () => {
-      const addr = taAddr(size);
+    // the number an element store writes: the value's ToNumber (a string, an object's valueOf),
+    // skipped where the value is known to be a number
+    const taNumber = v => v[N_TYPE] === T.f64 || (op === '=' && getNodeType(scope, decl.right) === TYPES.number) ? numValue(v)
+      : numValue(builtinCall(scope, '__ecma262_ToNumber', [ v ]));
+    // an element store: the value is converted first (its valueOf runs either way), then
+    // written only to an integer index below the length; a compound op reads undefined
+    // (NaN) for any other key
+    const taStore = (size, read, convert, write) => () => {
+      const { idx, valid } = typedArrayIndexKey(scope, obj, prop);
+      const inRange = reuse(scope, valid);
+      const addr = reuse(scope, taAddr(obj, idx, size));
+      let previous = null;
+      if (op !== '=') {
+        previous = tmp(scope, T.jsval);
+        emitIf(scope, inRange, () => assign(scope, previous, read(addr)), () => assign(scope, previous, valUndefined()));
+      }
       const v = reuse(scope, op === '=' ? simpleValue
-        : performOp(scope, op, Box(Convert(T.f64, Load(ctype, addr, 4)), Const(T.i32, TYPES.number)), generate(scope, decl.right), TYPES.number, getNodeType(scope, decl.right)));
-      const f = numValue(v);
+        : performOp(scope, op, previous, generate(scope, decl.right), null, getNodeType(scope, decl.right)));
+      const converted = reuse(scope, convert(v));
+      emitIf(scope, inRange, () => stmt(scope, write(addr, converted)));
+      return v[N_TYPE] === T.jsval ? v : valNumber(v);
+    };
+    const taSet = (ctype, size, signed) => taStore(size,
+      addr => Box(Convert(T.f64, Load(ctype, addr, 4), signed ? CONVERT_SIGNED : 0), Const(T.i32, TYPES.number)),
+      v => taNumber(v),
       // an integer element is the low bits of ToUint32 (wrapped modulo 2^32, never
       // saturated: u32[i] = -1 stores 0xffffffff, i8[i] = 200 stores -56)
-      const int = () => toUint32(scope, f);
-      stmt(scope, Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' || ctype === 'f16' ? f : signed ? Convert(T.i32, int(), 0) : int()));
-      return v[N_TYPE] === T.jsval ? v : valNumber(v);
-    };
-    const taSetClamped = () => {
-      const addr = taAddr(1);
-      const v = reuse(scope, op === '=' ? simpleValue
-        : performOp(scope, op, Box(Convert(T.f64, Load('u8', addr, 4)), Const(T.i32, TYPES.number)), generate(scope, decl.right), TYPES.number, getNodeType(scope, decl.right)));
-      // ToUint8Clamp: clamped to 0..255, then rounded half to even (1.5 is 2, 2.5 is 2; NaN is 0)
-      stmt(scope, Store('u8', addr, 4, Convert(T.u32, Call('porf_nearest', [ Bin('min', T.f64, Bin('max', T.f64, numValue(v), Const(T.f64, 0)), Const(T.f64, 255)) ], T.f64), 0)));
-      return v[N_TYPE] === T.jsval ? v : valNumber(v);
-    };
+      (addr, f) => Store(ctype, addr, 4, ctype === 'f64' || ctype === 'f32' || ctype === 'f16' ? f : signed ? Convert(T.i32, toUint32(scope, f), 0) : toUint32(scope, f)));
+    // ToUint8Clamp: clamped to 0..255, then rounded half to even (1.5 is 2, 2.5 is 2; NaN is 0)
+    const taSetClamped = taStore(1,
+      addr => Box(Convert(T.f64, Load('u8', addr, 4)), Const(T.i32, TYPES.number)),
+      v => Convert(T.u32, Call('porf_nearest', [ Bin('min', T.f64, Bin('max', T.f64, taNumber(v), Const(T.f64, 0)), Const(T.f64, 255)) ], T.f64), 0),
+      (addr, u) => Store('u8', addr, 4, u));
     const taSetBig = () => {
-      const addr = taAddr(8);
+      const { idx, valid } = typedArrayIndexKey(scope, obj, prop);
+      const inRange = reuse(scope, valid);
+      const addr = reuse(scope, taAddr(obj, idx, 8));
+      let previous = null;
+      if (op !== '=') {
+        previous = tmp(scope, T.jsval);
+        emitIf(scope, inRange, () => assign(scope, previous, builtinCall(scope, '__Porffor_bigint_fromS64', [ Load('i64', addr, 4) ])), () => assign(scope, previous, valUndefined()));
+      }
       const v = reuse(scope, op === '=' ? builtinCall(scope, '__ecma262_ToBigInt', [ simpleValue ])
-        : performOp(scope, op, builtinCall(scope, '__Porffor_bigint_fromS64', [ Load('i64', addr, 4) ]), builtinCall(scope, '__ecma262_ToBigInt', [ generate(scope, decl.right) ]), TYPES.bigint, TYPES.bigint));
-      stmt(scope, Store('i64', addr, 4, builtinCall(scope, '__Porffor_bigint_toI64', [ v ])));
+        : builtinCall(scope, '__ecma262_ToBigInt', [ performOp(scope, op, previous, generate(scope, decl.right), null, getNodeType(scope, decl.right)) ]));
+      emitIf(scope, inRange, () => stmt(scope, Store('i64', addr, 4, builtinCall(scope, '__Porffor_bigint_toI64', [ v ]))));
       return v;
     };
 
@@ -4485,7 +4634,10 @@ const genLoop = (scope, decl, type) => {
     finally { scope.blockStack.pop(); }
   }
 
-  const updateStmts = type === 'for' && decl.update ? collect(scope, () => genStmt(scope, decl.update)) : [];
+  const updateStmts = type === 'for' ? collect(scope, () => {
+    copyLoopBindingBoxes(scope, decl.init);
+    if (decl.update) genStmt(scope, decl.update);
+  }) : [];
   const testInBody = condStmts.length > 0 || type === 'dowhile';
   // the for (;; update) clause takes one expression: a statement (an optional chain's
   // labelled block, an if) runs at the end of the body instead
@@ -5248,6 +5400,22 @@ const generateArray = (scope, decl, name = '$undeclared', staticAlloc = false) =
 const toPropertyKey = (scope, key, computed = false) =>
   computed ? builtinCall(scope, '__ecma262_ToPropertyKey', [ key[N_TYPE] === T.jsval ? key : valNumber(key) ]) : key;
 
+// a typed array element's address, base + index * size (the data pointer is at +4)
+const taAddr = (obj, idx, size) => Bin('+', T.u32, Load('u32', JvPtr(obj), 4),
+  size === 1 ? idx : Bin('*', T.u32, idx, Const(T.u32, size)));
+
+// a number key of a typed array: its index, valid for an integer below the length
+const typedArrayIndexKey = (scope, obj, prop) => {
+  const num = reuse(scope, numValue(prop));
+  const idx = reuse(scope, Convert(T.u32, num, 0));
+  return {
+    idx,
+    valid: Bin('&&', T.i32,
+      Bin('==', T.i32, num, Convert(T.f64, idx, 0)),
+      Bin('<', T.i32, idx, Load('u32', JvPtr(obj), 0)))
+  };
+};
+
 const denseArrayIndexKey = (scope, prop) => {
   const num = reuse(scope, numValue(prop));
   const idx = reuse(scope, Convert(T.u32, num, 0));
@@ -5494,6 +5662,32 @@ const generateObject = (scope, decl) => {
 let memberDemands;
 // the program uses a typed array's constructor as a value (not only new Uint8Array(...))
 let typedArrayCtorValue = false;
+// whether a typed array kind is in the program (program.typedArrays)
+let typedArraysUsed = false;
+// whether the program can make or use a resizable ArrayBuffer (program.resizableBuffers): it
+// names maxByteLength, resize or resizable somewhere (a read, a call, an options object's key, a
+// string). Only then does new ArrayBuffer read its options, which takes the generic property read
+// and everything it reaches; a buffer that is never resized nor asked about is a fixed one
+let resizableBuffers = true;
+// whether the program can give an error a cause (program.errorCause): it names cause somewhere.
+// Only then does an error's constructor look for one in its options ('cause' in options: the
+// generic in, own keys and all), so a program that throws needs none of it
+let errorCause = true;
+
+// whether the program names any of these (an identifier: a binding, a property read or key; or
+// a string): a feature a builtin supports only for a program that can reach it
+const programNames = (node, names) => {
+  let found = false;
+  const walk = n => {
+    if (found || !n || typeof n !== 'object') return;
+    if (Array.isArray(n)) { for (const x of n) walk(x); return; }
+    if ((n.type === 'Identifier' && names.has(n.name)) || (n.type === 'Literal' && names.has(n.value))) { found = true; return; }
+    for (const k in n) if (k[0] !== '_' && n[k] && typeof n[k] === 'object') walk(n[k]);
+  };
+  walk(node);
+  return found;
+};
+const TYPED_ARRAY_TYPES = new Set(TYPED_ARRAY_KINDS.map(x => TYPES[x.toLowerCase()]));
 let calledMembers;
 // the program can make its own iterators (parse.js): for...of and friends need the protocol
 let usesIterProtocol = true;
@@ -5527,6 +5721,28 @@ const demandMemberRead = decl => {
     ? (decl.property.type === 'Literal' && typeof decl.property.value === 'string' ? decl.property.value : null)
     : decl.property.name;
   if (propName && propName !== '__proto__') demandMember(propName);
+  // the global object read by a name known only at run time (globalThis[name], self[name]): the
+  // globals it can find are the ones the program spells as strings ('Int8Array' in a list)
+  if (!propName && decl.computed && decl.object.type === 'Identifier' && GLOBAL_OBJECT_NAMES.has(decl.object.name) && !programStringsDemanded) {
+    programStringsDemanded = true;
+    for (const x of programStrings) if (x !== '__proto__') demandMember(x);
+  }
+};
+
+const GLOBAL_OBJECT_NAMES = new Set([ 'globalThis', 'self', 'window', 'global' ]);
+// the program's string literals that could name a global (identifier-shaped), and whether a
+// computed global read has demanded them
+let programStrings = new Set(), programStringsDemanded = false;
+const scanProgramStrings = node => {
+  const out = new Set();
+  const walk = n => {
+    if (!n || typeof n !== 'object') return;
+    if (Array.isArray(n)) { for (const x of n) walk(x); return; }
+    if (n.type === 'Literal' && typeof n.value === 'string' && /^[A-Za-z_$][\w$]*$/.test(n.value)) out.add(n.value);
+    for (const k in n) if (k[0] !== '_' && n[k] && typeof n[k] === 'object') walk(n[k]);
+  };
+  walk(node);
+  return out;
 };
 
 const primObjAlias = {
@@ -5745,7 +5961,7 @@ const generateMember = (scope, decl, objValue = null) => {
 
   // builtin prototype getters dispatch to __X_prototype_NAME$get by the object's runtime type
   let extraBC = [];
-  if (builtinPrototypeGetters.has(decl.property.name)) {
+  if (!decl.computed && builtinPrototypeGetters.has(decl.property.name)) {
     const bc = [];
     const cands = builtinPrototypeGetters.get(decl.property.name) ?? [];
     for (const x of cands) {
@@ -5806,15 +6022,22 @@ const generateMember = (scope, decl, objValue = null) => {
     return res;
   };
 
-  const taAddr = size => Bin('+', T.u32, Load('u32', JvPtr(obj), 4),
-    size === 1 ? Convert(T.u32, numValue(prop), 0) : Bin('*', T.u32, Convert(T.u32, numValue(prop), 0), Const(T.u32, size)));
-  const taGet = (ctype, size, signed = true) => () => {
-    const loaded = Load(ctype, taAddr(size), 4);
+  // a typed array's element: only for an integer index below its length, any other number
+  // key is undefined (an integer-indexed object has no such property, nor looks further)
+  const taGetChecked = (size, load) => () => {
+    if (decl._inBounds) return load(taAddr(obj, Convert(T.u32, numValue(prop), 0), size));
+    const { idx, valid } = typedArrayIndexKey(scope, obj, prop);
+    const res = tmp(scope, T.jsval);
+    emitIf(scope, valid, () => assign(scope, res, load(taAddr(obj, idx, size))), () => assign(scope, res, valUndefined()));
+    return res;
+  };
+  const taGet = (ctype, size, signed = true) => taGetChecked(size, addr => {
+    const loaded = Load(ctype, addr, 4);
     const f = ctype === 'f32' || ctype === 'f64' || ctype === 'f16' ? loaded : Convert(T.f64, loaded, signed ? CONVERT_SIGNED : 0);
     return Box(f, Const(T.i32, TYPES.number));
-  };
-  const taGetBig = signed => () =>
-    builtinCall(scope, signed ? '__Porffor_bigint_fromS64' : '__Porffor_bigint_fromU64', [ Load('i64', taAddr(8), 4) ]);
+  });
+  const taGetBig = signed => taGetChecked(8, addr =>
+    builtinCall(scope, signed ? '__Porffor_bigint_fromS64' : '__Porffor_bigint_fromU64', [ Load('i64', addr, 4) ]));
 
   // s[i]: a character only for an integer index below the length (s[99], s[-1] and s[1.5]
   // are property reads, which find nothing on a string but what its prototype has)
@@ -5864,7 +6087,7 @@ const generateMember = (scope, decl, objValue = null) => {
   if (!decl.optional && objectKnownValue === null)
     return internalThrow(scope, 'TypeError', propertyErrorMessage('read', 'null', decl));
 
-  if (decl.property.name === 'length') return lengthMemberGet();
+  if (!decl.computed && decl.property.name === 'length') return lengthMemberGet();
 
   // o[i] on a value of no known type, in a program: an array's element and a bytestring's
   // character inline, every other type's through one shared builtin (a UTF-16 string's
@@ -6554,7 +6777,7 @@ const giveUpFact = () => {
   return true;
 };
 
-const programFlagValue = name => name === 'usesIterProtocol' ? usesIterProtocol : name === 'typedArrayCtorValue' ? typedArrayCtorValue : name === 'regexScripts' ? regexScripts : name === 'regexStrings' ? regexStrings : name === 'regexEmoji' ? regexEmoji : false;
+const programFlagValue = name => name === 'usesIterProtocol' ? usesIterProtocol : name === 'resizableBuffers' ? resizableBuffers : name === 'errorCause' ? errorCause : name === 'typedArrayCtorValue' ? typedArrayCtorValue : name === 'typedArrays' ? typedArraysUsed : name === 'regexScripts' ? regexScripts : name === 'regexStrings' ? regexStrings : name === 'regexEmoji' ? regexEmoji : false;
 
 const generateFunc = (scope, decl, forceNoExpr = false) => {
   doNotMarkFuncRef = false;
@@ -6957,6 +7180,12 @@ const generateBlock = (scope, decl) => {
     }
   }
 
+  // the block's boxed bindings are new on each entry, before its functions snapshot them
+  for (const k in decl._variables ?? {}) {
+    const name = decl._variables[k].node?.name;
+    if (name != null && ownBoxedBinding(scope, name)) allocBindingBox(scope, name);
+  }
+
   inferBranchStart(scope);
   let last = -1;
   if (scope.inEval) {
@@ -7089,8 +7318,55 @@ const inferDirectCallParamTypes = root => {
 
 let globals, funcs, funcsByIndex, funcIndex, funcNameCollisions, currentFuncIndex, depth, data, dataUnits, dataRelocs, dataCache, modular, rawHead, builtinGlobalInits, includedBuiltinGlobalInits, usedTypes, globalInfer, builtinFuncs, builtinVars, builtinPrototypeFuncs, builtinStaticFuncs, builtinPrototypeGetters, builtinPrototypeObjectGetters, topLevelFunc, tdzGlobals, implicitGlobalNames, programWrittenNames;
 
+// the names among Function.prototype's methods (bind, call, apply, toString) the program may give
+// a function as its own: a class's static member, or an assignment (F.call = ...). A call of one
+// of these on a function then looks for the function's own first; any other stays the builtin
+const FUNCTION_METHOD_NAMES = new Set([ 'bind', 'call', 'apply', 'toString' ]);
+let functionOwnMethodNames = new Set();
+const scanFunctionOwnMethodNames = node => {
+  const out = new Set();
+  const walk = n => {
+    if (!n || typeof n !== 'object') return;
+    if (Array.isArray(n)) { for (const x of n) walk(x); return; }
+    if ((n.type === 'MethodDefinition' || n.type === 'PropertyDefinition') && n.static && !n.computed && FUNCTION_METHOD_NAMES.has(n.key?.name)) out.add(n.key.name);
+    if (n.type === 'AssignmentExpression' && n.left.type === 'MemberExpression' && !n.left.computed && FUNCTION_METHOD_NAMES.has(n.left.property?.name)) out.add(n.left.property.name);
+    for (const k in n) if (k[0] !== '_' && n[k] && typeof n[k] === 'object') walk(n[k]);
+  };
+  walk(node);
+  return out;
+};
+
+// the methods a class extending a builtin with its own prototype methods (Uint8Array, Array, Map,
+// ...) defines, by the builtin's name: a call of one of these on a value of that builtin's type
+// looks at the value's prototype first (a subclass instance's override wins), any other call
+// stays the builtin (node:buffer's Buffer overrides Uint8Array's toString, slice, fill...)
+let subclassOverrides = new Map();
+const scanSubclassOverrides = node => {
+  const out = new Map();
+  const walk = n => {
+    if (!n || typeof n !== 'object') return;
+    if (Array.isArray(n)) { for (const x of n) walk(x); return; }
+    if ((n.type === 'ClassDeclaration' || n.type === 'ClassExpression') && n.superClass?.type === 'Identifier') {
+      const names = out.get(n.superClass.name) ?? new Set();
+      for (const m of n.body?.body ?? []) {
+        if (m.type === 'MethodDefinition' && !m.static && !m.computed && m.kind === 'method' && m.key?.name) names.add(m.key.name);
+      }
+      if (names.size > 0) out.set(n.superClass.name, names);
+    }
+    for (const k in n) if (k[0] !== '_' && n[k] && typeof n[k] === 'object') walk(n[k]);
+  };
+  walk(node);
+  return out;
+};
+
 export default (program, opts = {}) => {
   const entryName = opts.entryName ?? '#main';
+  functionOwnMethodNames = globalThis.precompile ? new Set() : scanFunctionOwnMethodNames(program);
+  programStrings = globalThis.precompile ? new Set() : scanProgramStrings(program);
+  resizableBuffers = globalThis.precompile ? true : programNames(program, new Set([ 'maxByteLength', 'resize', 'resizable' ]));
+  errorCause = globalThis.precompile ? true : programNames(program, new Set([ 'cause' ]));
+  programStringsDemanded = false;
+  subclassOverrides = globalThis.precompile ? new Map() : scanSubclassOverrides(program);
   globals = Object.create(null);
   globals['#ind'] = 0;
   funcs = []; funcsByIndex = [];
@@ -7111,6 +7387,7 @@ export default (program, opts = {}) => {
   irFinalizers = [];
   memberDemands = new Set();
   typedArrayCtorValue = false;
+  typedArraysUsed = false;
   calledMembers = new Set();
   usesIterProtocol = !!program._usesIterProtocol;
   // builtins are typed: a BigInt reaches their arithmetic only where they say so
@@ -7315,7 +7592,44 @@ export default (program, opts = {}) => {
   }
   irFinalizers.length = 0;
 
-  if (builtinGlobalInits.length !== 0) topLevelFunc.body.unshift(...builtinGlobalInits);
+  // a builtin global's initializer runs only when some compiled function reads that global: an
+  // initializer is made as soon as code naming the global is generated, and code a comptime flag
+  // then drops leaves one behind (Symbol.species in a gated-off branch made every program call
+  // Symbol at startup). Kept initializers can read other builtin globals: to a fixpoint
+  if (builtinGlobalInits.length !== 0) {
+    const read = new Set();
+    const seen = new Set();
+    const walkIR = n => {
+      if (!n || typeof n !== 'object' || seen.has(n)) return;
+      seen.add(n);
+      if (Array.isArray(n)) {
+        if (n[N_KIND] === K.Global && typeof n[3] === 'string') read.add(n[3]);
+        for (const x of n) if (x && typeof x === 'object') walkIR(x);
+        return;
+      }
+      for (const k in n) walkIR(n[k]);
+    };
+    for (const f of funcs) if (f.body) walkIR(f.body);
+    const kept = [];
+    let pending = builtinGlobalInits;
+    for (let changed = true; changed;) {
+      changed = false;
+      const rest = [];
+      for (const init of pending) {
+        // (an init is Assign(Global(name), value): its own target is no read of it)
+        if (read.has(init[3][3])) {
+          kept.push(init);
+          walkIR(init[4]);
+          changed = true;
+        } else rest.push(init);
+      }
+      pending = rest;
+    }
+    // (in the order they were made: one can read another made before it)
+    const order = new Map(builtinGlobalInits.map((x, i) => [ x, i ]));
+    kept.sort((a, b) => order.get(a) - order.get(b));
+    if (kept.length !== 0) topLevelFunc.body.unshift(...kept);
+  }
   // hoisted top-level let/const/class start uninitialised (read before: a ReferenceError)
   for (const name of tdzGlobals)
     if ((globals[name]?.type ?? T.jsval) === T.jsval) topLevelFunc.body.unshift(Assign(Global(name, T.jsval), tdzMarker()));
@@ -7328,6 +7642,25 @@ export default (program, opts = {}) => {
   for (const site of devirtualizeSites) if (!site.done) tallyDevirtualize(`${site.plural}: a candidate never compiled (dynamic)`, site.name);
   if (devirtualizeTally) for (const [ reason, { count, names } ] of [ ...devirtualizeTally ].sort((a, b) => b[1].count - a[1].count))
     console.log(`devirtualize: ${String(count).padStart(5)}  ${reason}   (.${[ ...names ].join('(), .')}())`);
+
+  // PORF_WHY=1 (or =name, a part of the names to show): each compiled function, and the chain of
+  // functions that included it (the first includer of each), from the program down: what brought
+  // a builtin into a program that never names it
+  if (process.env.PORF_WHY && !globalThis.precompile) {
+    const includer = new Map();
+    for (const f of funcs) if (f.body) for (const name of f.includes ?? []) if (!includer.has(name)) includer.set(name, f.name);
+    const filter = process.env.PORF_WHY === '1' ? null : process.env.PORF_WHY;
+    for (const f of funcs) {
+      if (!f.body || (filter && !f.name.includes(filter))) continue;
+      const chain = [ f.name ];
+      for (let at = f.name; includer.has(at) && chain.length < 32;) {
+        at = includer.get(at);
+        if (chain.includes(at)) break;
+        chain.push(at);
+      }
+      console.error(`why: ${chain.join(' <- ')}`);
+    }
+  }
 
   const renderGlobals = [];
   for (const name in globals) {

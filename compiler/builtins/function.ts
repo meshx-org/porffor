@@ -10,6 +10,26 @@ export const Function = function (source: string) {
   throw new SyntaxError('Dynamic code evaluation is not supported');
 };
 
+// %AsyncFunction%: an async function's constructor, which (as Function) makes no function from
+// source here: Porffor compiles ahead of time
+export const __Porffor_AsyncFunction = function (source: string) {
+  throw new SyntaxError('Dynamic code evaluation is not supported');
+};
+
+let __Porffor_asyncFunctionProtoObj: any = undefined;
+
+// %AsyncFunction.prototype%: an async function's [[Prototype]] (its property store's, made
+// when the function's is: _internal_object.ts), itself inheriting Function.prototype
+export const __Porffor_asyncFunction_proto = (): object => {
+  if (__Porffor_asyncFunctionProtoObj !== undefined) return __Porffor_asyncFunctionProtoObj;
+  const p: object = {};
+  __Porffor_object_fastAdd(p, 'constructor', __Porffor_AsyncFunction, 0b0010);
+  __Porffor_object_fastAdd(p, Symbol.toStringTag, 'AsyncFunction', 0b0010);
+  __Object_setPrototypeOf(p, __Function_prototype);
+  __Porffor_asyncFunctionProtoObj = p;
+  return p;
+};
+
 export const __Function_prototype_toString = function (this: Function) {
   const out: bytestring = Porffor.malloc(256);
   Porffor.IR.storeI32(out, 0, 0);

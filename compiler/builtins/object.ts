@@ -23,48 +23,100 @@ export const __Object_keys = (obj: any): any[] => {
   if (Porffor.comptime.flag`hasType.proxy`) {
     if (Porffor.type(obj) == Porffor.TYPES.proxy) return __Porffor_proxy_keys(obj, true, true);
   }
-  const out: any[] = Porffor.array.new(4);
+  return __Porffor_object_ownKeys(obj, true, false, true);
+};
 
+// [[OwnPropertyKeys]]: the integer index keys ascending, then the other string keys, then the
+// symbols, each kind in the order it was made. strings and symbols pick the kinds, enumerable
+// leaves out the rest (EnumerableOwnProperties). An array's and a typed array's elements are
+// its first indices; a private name is no key
+export const __Porffor_object_ownKeys = (obj: any, strings: boolean, symbols: boolean, enumerable: boolean): any[] => {
+  const out: any[] = Porffor.array.new(4);
   let i: i32 = 0;
-  let arrayLen: i32 = -1;
-  if (Porffor.type(obj) == Porffor.TYPES.array) {
-    const arrayObj: any[] = obj as any[];
-    arrayLen = arrayObj.length;
-    obj = __Porffor_object_underlying(obj);
-    const objectEntries: i32 = Porffor.type(obj) == Porffor.TYPES.object ? Porffor.IR.loadU16(obj, 0) : 0;
-    for (let j: i32 = 0; j < arrayLen; j++) {
-      const key: any = Porffor.callThis(__Number_prototype_toString, j);
-      if (objectEntries != 0) {
-        const entryPtr: i32 = Porffor.object.lookup(obj, key, __Porffor_object_hash(key));
-        if (entryPtr != 0) {
-          if (Porffor.object.isEnumerable(entryPtr)) out[i++] = key;
-          continue;
+
+  // the indices below this are elements, listed already
+  let elements: i32 = -1;
+  if (strings) {
+    if (Porffor.type(obj) == Porffor.TYPES.array) {
+      const arrayObj: any[] = obj as any[];
+      elements = arrayObj.length;
+      const store: any = __Porffor_object_underlying(obj);
+      const storeEntries: i32 = Porffor.type(store) == Porffor.TYPES.object ? Porffor.IR.loadU16(store, 0) : 0;
+      for (let j: i32 = 0; j < elements; j++) {
+        const key: any = Porffor.callThis(__Number_prototype_toString, j);
+        // an index defined as a property (an accessor, a non-enumerable one) is in the store
+        if (storeEntries != 0) {
+          const entryPtr: i32 = Porffor.object.lookup(store, key, __Porffor_object_hash(key));
+          if (entryPtr != 0) {
+            if (Porffor.fastOr(!enumerable, Porffor.object.isEnumerable(entryPtr))) out[i++] = key;
+            continue;
+          }
         }
+        if (!__Porffor_array_has(arrayObj, j)) continue;
+        out[i++] = key;
       }
-      if (!__Porffor_array_has(arrayObj, j)) continue;
-      out[i++] = key;
+    } else if (Porffor.comptime.flag`program.typedArrays`) {
+      if (__Porffor_object_isTypedArray(obj)) {
+        // no holes: every index below the length (none on a detached or out of bounds view)
+        elements = 0;
+        if (!__Porffor_typedArray_detached(obj)) if (!__Porffor_typedArray_outOfBounds(obj)) elements = Porffor.IR.loadI32(obj, 0);
+        for (let j: i32 = 0; j < elements; j++) out[i++] = Porffor.callThis(__Number_prototype_toString, j);
+      }
     }
-  } else {
-    obj = __Porffor_object_underlying(obj);
   }
 
-  if (Porffor.type(obj) == Porffor.TYPES.object) {
-    let ptr: i32 = Porffor.object.entriesPtr(obj);
-    const endPtr: i32 = ptr + Porffor.IR.loadU16(obj, 0) * 20;
+  const store: any = __Porffor_object_underlying(obj);
+  if (Porffor.type(store) == Porffor.TYPES.object) {
+    const entriesPtr: i32 = Porffor.object.entriesPtr(store);
+    const endPtr: i32 = entriesPtr + Porffor.IR.loadU16(store, 0) * 20;
 
-    for (; ptr < endPtr; ptr += 20) {
-      if (!Porffor.object.isEnumerable(ptr)) continue;
-
-      // if key is a symbol skip it
-      if (Porffor.IR.loadU8(ptr, 18) == Porffor.TYPES.symbol) continue;
-
-      let key: any = Porffor.as(Porffor.IR.loadI32(ptr, 4), Porffor.IR.loadU8(ptr, 18));
-      if (arrayLen != -1) {
-        const idx: i32 = __Porffor_array_propertyKeyIndex(key);
-        if (Porffor.fastAnd(idx != -1, idx < arrayLen)) continue;
+    if (strings) {
+      // index keys, sorted by insertion into these two (few, and usually in order already)
+      let indices: any = null;
+      let indexKeys: any = null;
+      let n: i32 = 0;
+      for (let ptr: i32 = entriesPtr; ptr < endPtr; ptr += 20) {
+        if (Porffor.IR.loadU8(ptr, 18) == Porffor.TYPES.symbol) continue;
+        if (enumerable) if (!Porffor.object.isEnumerable(ptr)) continue;
+        const key: any = Porffor.as(Porffor.IR.loadI32(ptr, 4), Porffor.IR.loadU8(ptr, 18));
+        const index: i32 = __Porffor_array_propertyKeyIndex(key);
+        if (Porffor.fastOr(index == -1, index < elements)) continue;
+        if (indices == null) {
+          indices = Porffor.array.new(4);
+          indexKeys = Porffor.array.new(4);
+        }
+        let at: i32 = n++;
+        while (at > 0) {
+          if (indices[at - 1] <= index) break;
+          indices[at] = indices[at - 1];
+          indexKeys[at] = indexKeys[at - 1];
+          at--;
+        }
+        indices[at] = index;
+        indexKeys[at] = key;
       }
+      for (let j: i32 = 0; j < n; j++) out[i++] = indexKeys[j];
 
-      out[i++] = key;
+      for (let ptr: i32 = entriesPtr; ptr < endPtr; ptr += 20) {
+        if (Porffor.IR.loadU8(ptr, 18) == Porffor.TYPES.symbol) continue;
+        if (enumerable) if (!Porffor.object.isEnumerable(ptr)) continue;
+        const key: any = Porffor.as(Porffor.IR.loadI32(ptr, 4), Porffor.IR.loadU8(ptr, 18));
+        if (n != 0) if (__Porffor_array_propertyKeyIndex(key) != -1) continue;
+        if (elements > 0) {
+          const index: i32 = __Porffor_array_propertyKeyIndex(key);
+          if (Porffor.fastAnd(index != -1, index < elements)) continue;
+        }
+        out[i++] = key;
+      }
+    }
+
+    if (symbols) {
+      for (let ptr: i32 = entriesPtr; ptr < endPtr; ptr += 20) {
+        if (Porffor.IR.loadU8(ptr, 18) != Porffor.TYPES.symbol) continue;
+        if (Porffor.IR.loadU8(ptr, 19) != 0) continue; // a private name
+        if (enumerable) if (!Porffor.object.isEnumerable(ptr)) continue;
+        out[i++] = Porffor.as(Porffor.IR.loadI32(ptr, 4), Porffor.IR.loadU8(ptr, 18));
+      }
     }
   }
 
@@ -210,6 +262,17 @@ export const __Porffor_object_in = (obj: any, prop: any): boolean => {
 };
 
 export const __Porffor_object_instanceof = (obj: any, constr: any, checkProto: any): boolean => {
+  // InstanceofOperator: the right's [Symbol.hasInstance] decides, when it has one (only a
+  // program that names the symbol can give it one)
+  if (Porffor.comptime.flag`member.hasInstance`) {
+    if (!Porffor.object.isObject(constr)) throw new TypeError('instanceof right-hand side is not an object');
+    const hasInstance: any = constr[Symbol.hasInstance];
+    if (hasInstance != null) {
+      if (Porffor.type(hasInstance) != Porffor.TYPES.function) throw new TypeError('instanceof right-hand side has a [Symbol.hasInstance] that is not a function');
+      return !!Porffor.callThis(hasInstance, constr, obj);
+    }
+  }
+
   if (Porffor.type(constr) != Porffor.TYPES.function) {
     throw new TypeError('instanceof right-hand side is not a function');
   }
@@ -245,6 +308,17 @@ export const __Object_assign = (target: any, ...sources: any[]): any => {
       for (let j: i32 = 0; j < arrayLen; j++) {
         if (!__Porffor_array_has(src as any[], j)) continue;
         target[Porffor.callThis(__Number_prototype_toString, j)] = (src as any[])[j];
+      }
+    } else if (Porffor.comptime.flag`program.typedArrays`) {
+      if (__Porffor_object_isTypedArray(src)) {
+        // its elements, every index below its length
+        const keys: any[] = __Porffor_object_ownKeys(src, true, false, true);
+        const n: i32 = keys.length;
+        for (let j: i32 = 0; j < n; j++) {
+          const key: any = keys[j];
+          if (__Porffor_array_propertyKeyIndex(key) == -1) break;
+          target[key] = src[j];
+        }
       }
     }
 
@@ -487,56 +561,12 @@ export const __Object_getOwnPropertyNames = (obj: any): any[] => {
   if (Porffor.comptime.flag`hasType.proxy`) {
     if (Porffor.type(obj) == Porffor.TYPES.proxy) return __Porffor_proxy_keys(obj, false, true);
   }
-  const out: any[] = Porffor.array.new(4);
-
-  let i: i32 = 0;
-  if (Porffor.type(obj) == Porffor.TYPES.array) {
-    const arrayLen: i32 = (obj as any[]).length;
-    for (let j: i32 = 0; j < arrayLen; j++) {
-      if (!__Porffor_array_has(obj as any[], j)) continue;
-      out[i++] = Porffor.callThis(__Number_prototype_toString, j);
-    }
-  }
-
-  obj = __Porffor_object_underlying(obj);
-  if (Porffor.type(obj) == Porffor.TYPES.object) {
-    let ptr: i32 = Porffor.object.entriesPtr(obj);
-    const endPtr: i32 = ptr + Porffor.IR.loadU16(obj, 0) * 20;
-
-    for (; ptr < endPtr; ptr += 20) {
-      if (Porffor.IR.loadU8(ptr, 18) == Porffor.TYPES.symbol) continue;
-
-      let key: any = Porffor.as(Porffor.IR.loadI32(ptr, 4), Porffor.IR.loadU8(ptr, 18));
-      out[i++] = key;
-    }
-  }
-
-  out.length = i;
-  return out;
+  return __Porffor_object_ownKeys(obj, true, false, false);
 };
 
 export const __Object_getOwnPropertySymbols = (obj: any): any[] => {
   if (obj == null) throw new TypeError('Argument is nullish, expected object');
-  const out: any[] = Porffor.array.new(4);
-
-  obj = __Porffor_object_underlying(obj);
-  if (Porffor.type(obj) == Porffor.TYPES.object) {
-    let ptr: i32 = Porffor.object.entriesPtr(obj);
-    const endPtr: i32 = ptr + Porffor.IR.loadU16(obj, 0) * 20;
-
-    let i: i32 = 0;
-    for (; ptr < endPtr; ptr += 20) {
-      if (Porffor.IR.loadU8(ptr, 18) != Porffor.TYPES.symbol) continue;
-      if (Porffor.IR.loadU8(ptr, 19) != 0) continue; // a private name
-
-      let key: any = Porffor.as(Porffor.IR.loadI32(ptr, 4), Porffor.IR.loadU8(ptr, 18));
-      out[i++] = key;
-    }
-
-    out.length = i;
-  }
-
-  return out;
+  return __Porffor_object_ownKeys(obj, false, true, false);
 };
 
 
@@ -815,6 +845,17 @@ export const __Porffor_object_spread = (dst: object, src: any): object => {
     for (let j: i32 = 0; j < arrayLen; j++) {
       if (!__Porffor_array_has(src as any[], j)) continue;
       Porffor.object.expr.init(dst, Porffor.callThis(__Number_prototype_toString, j), (src as any[])[j]);
+    }
+  } else if (Porffor.comptime.flag`program.typedArrays`) {
+    if (__Porffor_object_isTypedArray(src)) {
+      // its elements, every index below its length
+      const keys: any[] = __Porffor_object_ownKeys(src, true, false, true);
+      const n: i32 = keys.length;
+      for (let j: i32 = 0; j < n; j++) {
+        const key: any = keys[j];
+        if (__Porffor_array_propertyKeyIndex(key) == -1) break;
+        Porffor.object.expr.init(dst, key, src[j]);
+      }
     }
   }
 

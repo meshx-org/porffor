@@ -55,6 +55,12 @@ export const __Porffor_object_builtinPrototype = (f: any): any => {`;
   }`;
   }
 
+  // %AsyncFunction%'s is %AsyncFunction.prototype% (function.ts), made on first use
+  out += `
+  if (Porffor.comptime.flag\`hasFunc.__Porffor_AsyncFunction\`) {
+    if (f == __Porffor_AsyncFunction) return __Porffor_asyncFunction_proto();
+  }`;
+
   // %TypedArray% is reached only through a kind (its own prototype): gated on the kinds, as
   // __Porffor_object_builtinParent is (it is brought in there, after these flags are settled)
   const typedArrayKinds = TYPED_ARRAY_KINDS.map(x => x.slice(0, -5));

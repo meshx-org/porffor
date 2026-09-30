@@ -8,8 +8,24 @@ export const __Reflect_get = (target: any, prop: any) => {
 };
 
 // todo: support receiver
-export const __Reflect_set = (target: any, prop: any, value: any) => {
+export const __Reflect_set = (target: any, prop: any, value: any, receiver: any = undefined) => {
   if (!Porffor.object.isObject(target)) throw new TypeError('Target is a non-object');
+
+  // a typed array's element for another receiver ([[Set]] 10.4.5.5): an index that is not
+  // valid sets nothing (the value not even converted), a valid one is the receiver's to set
+  if (Porffor.comptime.flag`program.typedArrays`) if (receiver !== undefined) if (receiver !== target) if (__Porffor_object_isTypedArray(target)) {
+    const index: any = __Porffor_typedArray_canonicalIndex(ecma262.ToPropertyKey(prop));
+    if (index !== undefined) {
+      if (Porffor.fastOr(!Number.isInteger(index), index < 0, index >= target.length, Object.is(index, -0))) return true;
+      if (!Porffor.object.isObject(receiver)) return false;
+      try {
+        receiver[prop] = value;
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  }
 
   try {
     target[prop] = value;
@@ -92,33 +108,7 @@ export const __Reflect_ownKeys = (target: any) => {
   if (Porffor.comptime.flag`hasType.proxy`) {
     if (Porffor.type(target) == Porffor.TYPES.proxy) return __Porffor_proxy_ownKeys(target);
   }
-
-  const out: any[] = Porffor.array.new(4);
-  let i: i32 = 0;
-
-  if (Porffor.type(target) == Porffor.TYPES.array) {
-    const arrayLen: i32 = (target as any[]).length;
-    for (let j: i32 = 0; j < arrayLen; j++) {
-      if (!__Porffor_array_has(target as any[], j)) continue;
-      out[i++] = Porffor.callThis(__Number_prototype_toString, j);
-    }
-  }
-
-  target = __Porffor_object_underlying(target);
-  if (Porffor.type(target) == Porffor.TYPES.object) {
-    let ptr: i32 = Porffor.object.entriesPtr(target);
-    const endPtr: i32 = ptr + Porffor.IR.loadU16(target, 0) * 20;
-
-    for (; ptr < endPtr; ptr += 20) {
-      if (Porffor.IR.loadU8(ptr, 19) != 0) continue; // a private name
-      let key: any = Porffor.as(Porffor.IR.loadI32(ptr, 4), Porffor.IR.loadU8(ptr, 18));
-
-      out[i++] = key;
-    }
-  }
-
-  out.length = i;
-  return out;
+  return __Porffor_object_ownKeys(target, true, true, false);
 };
 
 

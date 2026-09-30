@@ -1,11 +1,13 @@
+// @porf --closures
 import type {} from './porffor.d.ts';
 
 // Proxy: the get, set, has, deleteProperty, ownKeys and getOwnPropertyDescriptor traps.
 // A proxy is its own type holding [target, handler] (16 bytes, both traced by the GC).
 // The object operations in _internal_object.ts / object.ts / reflect.ts hand a proxy to
 // the functions below, and every operation whose trap is missing falls through to the
-// target. Not implemented yet: apply/construct (callable proxies), the prototype and
-// extensibility traps, defineProperty and invariant checks. A revoked proxy
+// target. A function's proxy runs its apply and construct traps (see Proxy). Not
+// implemented yet: the prototype and extensibility traps, defineProperty and invariant
+// checks. A revoked proxy
 // (Proxy.revocable) has neither target nor handler, and every operation on it throws.
 
 // Returns any, not Proxy: a return annotation re-tags the returned value, which would
@@ -18,9 +20,26 @@ export const Proxy = function (target: any, handler: any): any {
   if (!Porffor.object.isObject(target)) throw new TypeError('Cannot create proxy with a non-object as target');
   if (!Porffor.object.isObject(handler)) throw new TypeError('Cannot create proxy with a non-object as handler');
 
-  // No apply/construct traps yet: a proxy of a function is the function itself, as
-  // before, so it stays callable and constructible (its other traps do not run).
-  if (Porffor.type(target) == Porffor.TYPES.function) return target;
+  // A proxy of a function is callable: with an apply or a construct trap, a function that
+  // runs them (its other traps do not run, and a property of it is its own, not the
+  // target's); with neither, the function itself, which stays callable and constructible.
+  if (Porffor.type(target) == Porffor.TYPES.function) {
+    if (Porffor.fastAnd(handler.apply == null, handler.construct == null)) return target;
+    const callable = function (...args: any[]) {
+      if (new.target === undefined) {
+        const apply: any = handler.apply;
+        if (apply == null) return Porffor.call(target, args, this, undefined);
+        return Porffor.callThis(apply, handler, target, this, args);
+      }
+      const construct: any = handler.construct;
+      // constructed without a trap: the target's instance (its prototype, not this function's)
+      if (construct == null) return Porffor.call(target, args, null, new.target === callable ? target : new.target);
+      const out: any = Porffor.callThis(construct, handler, target, args, new.target);
+      if (Porffor.fastOr(out == null, !Porffor.object.isObject(out))) throw new TypeError("'construct' on proxy: trap returned non-object");
+      return out;
+    };
+    return callable;
+  }
 
   const out: Proxy = Porffor.malloc(16);
   Porffor.IR.storeJv(out, 0, target);
@@ -173,11 +192,20 @@ export const __Porffor_proxy_ownKeys = (proxy: any): any[] => {
 
   const out: any[] = Porffor.array.new(4);
   const len: i32 = list.length;
+  // the keys seen, to find a duplicate (a Set of them past a few: SameValue for strings and
+  // symbols is SameValueZero)
+  const seen: any = len > 8 ? new Set() : undefined;
   for (let i: i32 = 0; i < len; i++) {
     const key: any = list[i];
     const t: i32 = Porffor.type(key);
     if (Porffor.fastAnd((t | 0b10000000) != Porffor.TYPES.bytestring, t != Porffor.TYPES.symbol))
       throw new TypeError("'ownKeys' on proxy: trap result contains a non-property-key");
+    if (seen === undefined) {
+      for (let j: i32 = 0; j < i; j++) if (out[j] === key) throw new TypeError("'ownKeys' on proxy: trap returned duplicate entries");
+    } else {
+      if (seen.has(key)) throw new TypeError("'ownKeys' on proxy: trap returned duplicate entries");
+      seen.add(key);
+    }
     out[i] = key;
   }
   return out;

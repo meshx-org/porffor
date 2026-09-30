@@ -749,6 +749,9 @@ return porf_box((f64)dst, ${TYPES.string});`, false) ]
   _.__Porffor_funcLut_length = lutFn(TYPES.number, `return porf_box_num((f64)${lutRead('porf_fnlen')});`);
 
   _.__Porffor_funcLut_flags = lutFn(TYPES.number, `return porf_box_num((f64)((${lutRead('porf_fnflags')} >> 3) & 3));`);
+  // what kind of function the program's own is: 1 async, 2 generator, 4 async generator, 0 any
+  // other and every builtin (ir.js FN_*; render.js porf_fnkind)
+  _.__Porffor_funcLut_kind = lutFn(TYPES.number, `return porf_box_num((f64)${lutRead('porf_fnkind')});`);
   // a class's constructor (its prototype is read-only)
   _.__Porffor_funcLut_isClass = lutFn(TYPES.boolean, `return porf_box((f64)((${lutRead('porf_fnflags')} >> 7) & 1), ${TYPES.boolean});`);
 

@@ -148,6 +148,13 @@ const NEVER_INLINE = new Set([
 // the cold side of each method, compiled for size and kept out of its fast one
 const coldBuiltin = name => name.startsWith('__Porffor_arrayGeneric_');
 
+// FNV-1a over a string, base 36
+const symHash = str => {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) h = Math.imul(h ^ str.charCodeAt(i), 0x01000193);
+  return (h >>> 0).toString(36);
+};
+
 const sanitizeMemo = new Map();
 const sanitizeUsed = new Set();
 export const sanitize = str => {
@@ -394,7 +401,16 @@ export default ({ funcs, data = [], dataUnits = [], dataRelocs = [], globals = [
     let sym = syms[f.index];
     if (sym) return sym;
     sym = `p_${sanitize(unitOf(f))}_${sanitize(String(f.name))}`;
-    while (symsUsed[sym]) sym += '_';
+    // tcc keeps only an identifier's first 256 characters or so: a longer name (an anonymous
+    // function's, named for its source) is cut short, with a hash of the rest to keep it apart,
+    // and a name taken already gets a number (a run of '_' grows past that limit when many
+    // functions share a name)
+    if (sym.length > 200) sym = sym.slice(0, 180) + '_' + symHash(sym);
+    if (symsUsed[sym]) {
+      let n = 2;
+      while (symsUsed[`${sym}_${n}`]) n++;
+      sym = `${sym}_${n}`;
+    }
     symsUsed[sym] = true;
     syms[f.index] = sym;
     return sym;
@@ -429,15 +445,10 @@ export default ({ funcs, data = [], dataUnits = [], dataRelocs = [], globals = [
     return `${cCallableProto(f)} {\n  ${body}\n}\n`;
   };
 
-  const nativeFetchFuncSym = name => {
-    const f = funcByName.get(name);
-    if (!f) throw new Error(`missing native fetch function ${name}`);
-    return fnSym(f);
-  };
-
   // flags are derived here (only consumer), no stored func.flags. coroFlags = FN_* kind, fnFlags byte:
   // bits 0-2 coroutine kind, 3 callable (has return type), 4 constructor, 5 generator init suspension,
   // 6 stackless (runs as a step function over a heap frame, see stackless.js), 7 a class's constructor
+  const usesFnKind = funcByName.has('__Porffor_funcLut_kind');
   const FN_CORO_INIT = 1 << 5;
   const FN_STACKLESS = 1 << 6;
   // the coroutines that run without a stack of their own (all but a few: see stackless.js),
@@ -1551,6 +1562,9 @@ ${st}jsval porf_call3(jsval fn, jsval thisv, jsval a0, jsval a1, jsval a2);
   // bit 4 constructor, funcLut.flags recovers legacy callable|constr<<1 via (flags >> 3) & 3
   link.push(`${st}const u8 porf_fnflags[] = { ${linkFuncs.map(fnFlags).join(', ') || '0'} };\n`);
   if (usesSyncAsync) link.push(`${st}const u8 porf_fnneeds_coro[] = { ${linkFuncs.map(f => needsCoro(f) ? 1 : 0).join(', ') || '0'} };\n`);
+  // porf_fnkind: a program's own function's coroutine kind (a builtin's 0: Array.fromAsync is
+  // no async function to the program), for __Porffor_funcLut_kind
+  if (usesFnKind) link.push(`${st}const u8 porf_fnkind[] = { ${linkFuncs.map(f => f?.internal ? 0 : coroKind(f)).join(', ') || '0'} };\n`);
   link.push(`${st}const u16 porf_fnlen[] = { ${linkFuncs.map(f => f.jsLength ?? 0).join(', ') || '0'} };\n`);
   link.push(`${st}const u32 porf_fnname[] = { ${fnNameOff.join(', ') || '0'} };\n`);
   link.push(`const u32 porf_static_end = ${staticEnd}u;\n`);
@@ -2002,303 +2016,34 @@ PORF_NOINLINE ${st}jsval porf_call3(jsval fn, jsval thisv, jsval a0, jsval a1, j
 }
 #endif\n`);
 
-  if (prefs.nativeFetch) {
-    const main = funcByName.get(entry);
-    if (!main) throw new Error('missing native fetch entry function');
-    const promiseRunJobs = funcByName.get('__Porffor_promise_runJobs');
-    const drainPromiseJobs = promiseRunJobs ? `(void)${fnSym(promiseRunJobs)}(${promiseRunJobs.params.length === 0 ? '' : 'JV_UNDEFINED, JV_UNDEFINED'});` : '(void)0;';
-
-    emit(`
-${prefs.eventLoop ? `void porf_native_fetch_timer_start(u32 id, i32 delay_ms, i32 repeat);
-void porf_native_fetch_timer_clear(u32 id);` : ''}
-void porf_native_fetch_response_complete(void* pending, f64 value, i32 type, i32 is_reject);
-
-typedef struct {
-  u32 id;
-  jsval callback;
-  jsval args;
-  i32 callback_root;
-  i32 args_root;
-  i32 repeat;
-  i32 active;
-} porf_native_timer_record;
-
-static porf_native_timer_record* porf_native_timers = NULL;
-static u32 porf_native_timers_len = 0;
-static u32 porf_native_timers_cap = 0;
-static u32 porf_native_next_timer_id = 1;
-
-static porf_native_timer_record* porf_native_find_timer(u32 id) {
-  for (u32 i = 0; i < porf_native_timers_len; i++) {
-    if (porf_native_timers[i].active && porf_native_timers[i].id == id) return porf_native_timers + i;
-  }
-  return NULL;
-}
-
-static void porf_native_release_timer(porf_native_timer_record* timer) {
-  if (!timer || !timer->active) return;
-  timer->active = 0;
-  if (timer->callback_root >= 0) porf_gc_native_root_remove(timer->callback_root);
-  if (timer->args_root >= 0) porf_gc_native_root_remove(timer->args_root);
-  timer->callback_root = -1;
-  timer->args_root = -1;
-  timer->callback = JV_UNDEFINED;
-  timer->args = JV_UNDEFINED;
-}
-
-${st}u32 porf_native_fetch_set_timer(jsval callback, jsval args, jsval delay_value, i32 repeat) {
-  if (callback.type != ${TYPES.function}) porf_throw_new(${TYPES.typeerror}, 0);
-  f64 delay_ms = delay_value.type == ${TYPES.number} ? delay_value.val : 0;
-  if (delay_ms != delay_ms || delay_ms < 0) delay_ms = 0;
-  if (delay_ms > 2147483647.0) delay_ms = 2147483647.0;
-
-  if (porf_native_timers_len == porf_native_timers_cap) {
-    const u32 new_cap = porf_native_timers_cap == 0 ? 16u : porf_native_timers_cap * 2u;
-    porf_native_timer_record* grown = realloc(porf_native_timers, (size_t)new_cap * sizeof(*grown));
-    if (!grown) abort();
-    for (u32 i = porf_native_timers_cap; i < new_cap; i++) {
-      grown[i].id = 0;
-      grown[i].callback = JV_UNDEFINED;
-      grown[i].args = JV_UNDEFINED;
-      grown[i].callback_root = -1;
-      grown[i].args_root = -1;
-      grown[i].repeat = 0;
-      grown[i].active = 0;
-    }
-    porf_native_timers = grown;
-    porf_native_timers_cap = new_cap;
-  }
-
-  porf_native_timer_record* timer = NULL;
-  for (u32 i = 0; i < porf_native_timers_len; i++) {
-    if (!porf_native_timers[i].active) {
-      timer = porf_native_timers + i;
-      break;
-    }
-  }
-  if (!timer) timer = porf_native_timers + porf_native_timers_len++;
-
-  u32 id = porf_native_next_timer_id++;
-  if (id == 0) id = porf_native_next_timer_id++;
-  timer->id = id;
-  timer->callback = callback;
-  timer->args = args;
-  timer->callback_root = porf_gc_native_root_add(callback.val, callback.type);
-  timer->args_root = porf_gc_native_root_add(args.val, args.type);
-  timer->repeat = repeat != 0;
-  timer->active = 1;
-${prefs.eventLoop ? '  porf_native_fetch_timer_start(id, (i32)delay_ms, timer->repeat ? (i32)delay_ms : 0);' : '  // event loop disabled (no --event-loop): timer never fires'}
-  return id;
-}
-
-${st}void porf_native_fetch_clear_timer(jsval timer_value) {
-  u32 id = timer_value.type == ${TYPES.number} ? (u32)timer_value.val : (u32)timer_value.val;
-  porf_native_timer_record* timer = porf_native_find_timer(id);
-  if (!timer) return;
-  porf_native_release_timer(timer);
-${prefs.eventLoop ? '  porf_native_fetch_timer_clear(id);' : ''}
-}
-
-void porf_native_fetch_fire_timer(u32 id) {
-  porf_native_timer_record* timer = porf_native_find_timer(id);
-  if (!timer) return;
-  const jsval callback = timer->callback;
-  const jsval args = timer->args;
-  const i32 repeat = timer->repeat;
-  if (!repeat) porf_native_release_timer(timer);
-  (void)porf_call_dynamic_arr(callback, JV_UNDEFINED, JV_UNDEFINED, args);
-  ${drainPromiseJobs}
-}
-
-static u32 porf_native_fetch_new_response_reaction(void* pending, i32 is_throw) {
-  const u32 reaction = porf_alloc(PORF_REACTION_SIZE, 0);
-  *(u64*)(MEM + reaction + PORF_REACTION_HANDLER) = (u64)(uintptr_t)pending;
-  *(jsbits*)(MEM + reaction + PORF_REACTION_OUT_PROMISE) = JV_UNDEFINED_BITS;
-  *(jsbits*)(MEM + reaction + PORF_REACTION_VALUE) = JV_UNDEFINED_BITS;
-  *(u32*)(MEM + reaction + PORF_REACTION_NEXT) = 0;
-  *(u32*)(MEM + reaction + PORF_REACTION_PAYLOAD) = (u32)is_throw;
-  *(u8*)(MEM + reaction + PORF_REACTION_KIND) = 12;
-  *(u8*)(MEM + reaction + PORF_REACTION_FLAGS) = 0;
-  porf_gc_barrier(reaction, PORF_GC_KIND_PROMISE_REACTION);
-  return reaction;
-}
-
-static void porf_native_fetch_append_response_reaction(u32 promise, u32 reaction, i32 reject) {
-  const u32 head_off = reject ? PORF_PROMISE_REJECT_HEAD : PORF_PROMISE_FULFILL_HEAD;
-  const u32 tail_off = reject ? PORF_PROMISE_REJECT_TAIL : PORF_PROMISE_FULFILL_TAIL;
-  const u32 tail = *(u32*)(MEM + promise + tail_off);
-  if (tail == 0) {
-    *(u32*)(MEM + promise + head_off) = reaction;
-  } else {
-    *(u32*)(MEM + tail + PORF_REACTION_NEXT) = reaction;
-    porf_gc_barrier(tail, PORF_GC_KIND_PROMISE_REACTION);
-  }
-  *(u32*)(MEM + promise + tail_off) = reaction;
-  porf_gc_barrier(promise, ${TYPES.promise});
-}
-
-void porf_native_fetch_attach_response(jsval promise, void* pending, u32* fulfill_out, u32* reject_out) {
-  const u32 p = (u32)promise.val;
-  const u32 fulfill = porf_native_fetch_new_response_reaction(pending, 0);
-  const u32 reject = porf_native_fetch_new_response_reaction(pending, 1);
-  porf_native_fetch_append_response_reaction(p, fulfill, 0);
-  porf_native_fetch_append_response_reaction(p, reject, 1);
-  if (fulfill_out) *fulfill_out = fulfill;
-  if (reject_out) *reject_out = reject;
-}
-
-void porf_native_fetch_cancel_response_reaction(u32 reaction) {
-  if (reaction == 0) return;
-  *(u64*)(MEM + reaction + PORF_REACTION_HANDLER) = 0;
-}
-
-static void porf_native_fetch_run_response_reaction_c(u32 reaction) {
-  void* pending = (void*)(uintptr_t)*(u64*)(MEM + reaction + PORF_REACTION_HANDLER);
-  const jsval value = porf_unpack(*(jsbits*)(MEM + reaction + PORF_REACTION_VALUE));
-  const i32 is_throw = (i32)*(u32*)(MEM + reaction + PORF_REACTION_PAYLOAD);
-  porf_native_fetch_response_complete(pending, value.val, value.type, is_throw);
-}
-
-int porf_native_fetch_is_pending_promise(jsval value) {
-  return value.type == ${TYPES.promise} && *(u8*)(MEM + (u32)value.val + PORF_PROMISE_STATE) == 0;
-}
-
-int porf_native_fetch_promise_state(jsval value) {
-  if (value.type != ${TYPES.promise}) return -1;
-  return *(u8*)(MEM + (u32)value.val + PORF_PROMISE_STATE);
-}
-
-jsval porf_native_fetch_promise_result(jsval value) {
-  return porf_unpack(*(jsbits*)(MEM + (u32)value.val + PORF_PROMISE_RESULT));
-}
-
-u32 porf_native_fetch_alloc(u32 bytes, u32 type) {
-  return porf_alloc(bytes, type);
-}
-
-u32 porf_native_fetch_alloc_bytestring(const char* input, size_t len) {
-  const u32 ptr = porf_bstr_new((u32)len);
-  if (len > 0) memcpy(MEM + ptr + 4, input, len);
-  return ptr;
-}
-
-void porf_native_fetch_runtime_init(void) {
-#ifdef _WIN32
-  porf_err("Porffor native fetch server is not yet implemented on Windows\\n");
-  exit(1);
-#else
-  signal(SIGPIPE, SIG_IGN);
-  porf_init(0, NULL);
-  porf_data_init();
-  porf_native_fetch_run_response_reaction_impl = porf_native_fetch_run_response_reaction_c;
-  ${gcEnabled ? 'volatile int porf_stack_anchor = 0;\n  porf_c_stack_top = (void*)&porf_stack_anchor;\n  ' : ''}${fnSym(main)}();
-#endif
-}
-
-void porf_native_fetch_collect_normal(void) {
-${gcEnabled ? `  if (porf_heap_base == 0) return;
-  porf_gc_collect_idle();` : '  (void)0;'}
-}
-
-void porf_native_fetch_collect_normal_from(void* stack_top) {
-${gcEnabled ? `  if (porf_heap_base == 0) return;
-  void* prev_stack_top = porf_c_stack_top;
-  porf_c_stack_top = stack_top;
-  porf_gc_collect_idle();
-  porf_c_stack_top = prev_stack_top;` : '  (void)stack_top;'}
-}
-
-int porf_native_fetch_should_collect(void) {
-${gcEnabled ? '  return porf_heap_base != 0 && (porf_gc_should_collect_for(0) || porf_gc_idle_minor_due());' : '  return 0;'}
-}
-
-jsval porf_native_fetch_call_handler(f64 method_value, i32 method_type, f64 url_value, i32 url_type, f64 headers_value, i32 headers_type, f64 body_value, i32 body_type) {
-  return ${nativeFetchFuncSym('__Porffor_fetch_native_handle')}(JV_UNDEFINED, JV_UNDEFINED, (jsval){method_value, method_type}, (jsval){url_value, url_type}, (jsval){headers_value, headers_type}, (jsval){body_value, body_type});
-}
-
-void porf_native_fetch_drain_microtasks(void) {
-  ${drainPromiseJobs}
-}
-
-void porf_native_fetch_finalize_response(f64 response_value, i32 response_type, NativeFetchResponseParts* out) {
-  NativeFetchResponseParts* prev = porf_native_fetch_response_parts_out;
-  porf_native_fetch_response_parts_out = out;
-  *out = (NativeFetchResponseParts){200, JV_UNDEFINED, JV_UNDEFINED};
-  (void)${nativeFetchFuncSym('__porffor_native_fetch_response_finalize')}(JV_UNDEFINED, JV_UNDEFINED, (jsval){response_value, response_type});
-  porf_native_fetch_response_parts_out = prev;
-}
-
-f64 porf_native_fetch_get_port(void) {
-  return __porffor_native_fetch_port.val;
-}
-
-int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_len, char** out_owned) {
-  if (!out_buf || !out_len || !out_owned) return -1;
-
-  *out_buf = NULL;
-  *out_len = 0;
-  *out_owned = NULL;
-
-  if (value.type == ${TYPES.bytestring}) {
-    const u32 ptr = (u32)value.val;
-    *out_buf = (const char*)(MEM + ptr + 4);
-    *out_len = (size_t)*(u32*)(MEM + ptr);
-    return 0;
-  }
-
-  if (value.type == ${TYPES.string}) {
-    const u32 ptr = (u32)value.val;
-    const size_t len = (size_t)*(u32*)(MEM + ptr);
-    const u16* chars = (const u16*)(MEM + ptr + 4);
-    char* utf8 = malloc(len * 3 + 1);
-    if (!utf8) return -1;
-
-    size_t out_len_local = 0;
-    for (size_t i = 0; i < len; i++) {
-      u16 c = chars[i];
-      if (c < 0x80) {
-        utf8[out_len_local++] = (char)c;
-      } else if (c < 0x800) {
-        utf8[out_len_local++] = (char)(0xc0 | (c >> 6));
-        utf8[out_len_local++] = (char)(0x80 | (c & 0x3f));
-      } else {
-        utf8[out_len_local++] = (char)(0xe0 | (c >> 12));
-        utf8[out_len_local++] = (char)(0x80 | ((c >> 6) & 0x3f));
-        utf8[out_len_local++] = (char)(0x80 | (c & 0x3f));
-      }
-    }
-
-    utf8[out_len_local] = '\\0';
-    *out_buf = utf8;
-    *out_len = out_len_local;
-    *out_owned = utf8;
-    return 0;
-  }
-
-  return -1;
-}
-`);
-  }
-
   cur = partsOf('main');
+  // the event loop's hooks (split: defined once, here)
+  if (split) emit(`void (*porf_event_loop)(void) = 0;\nint (*porf_event_loop_step)(void) = 0;\n`);
   for (const f of cCallables) {
     cur.protos[f.index] = f;
     emit(cCallableDef(f));
   }
 
-  if (entry && !prefs.nativeFetch) {
+  if (entry) {
     // porf_start runs the program's top level; main is porf_start then exit. An embedder
     // defines PORF_NO_MAIN, calls porf_start once, then calls into the program (Porffor.c
     // functions) and drains its job queue with porf_run_jobs.
     const runJobs = funcByName.get('__Porffor_promise_runJobs');
     if (runJobs) cur.protos[runJobs.index] = runJobs;
     emit(`${st}void porf_run_jobs(void) {\n  ${runJobs ? `(void)${fnSym(runJobs)}();` : '// no job queue'}\n}\n\n`);
-    emit(`${st}void porf_start(int argc, char** argv) {\n  porf_init(argc, argv);\n  porf_data_init();\n  ${gcEnabled ? 'volatile int porf_stack_anchor = 0;\n  porf_c_stack_top = (void*)&porf_stack_anchor;\n  ' : ''}${fnSym(funcByName.get(entry))}();\n}\n\n`);
+    // then its event loop, when the runtime started one (a timer: runtime/host/native/timers.js)
+    emit(`${st}void porf_start(int argc, char** argv) {\n  porf_init(argc, argv);\n  porf_data_init();\n  ${gcEnabled ? 'volatile int porf_stack_anchor = 0;\n  porf_c_stack_top = (void*)&porf_stack_anchor;\n  ' : ''}${fnSym(funcByName.get(entry))}();\n  if (porf_event_loop) porf_event_loop();\n}\n\n`);
     emit(`#ifndef PORF_NO_MAIN\nint main(int argc, char** argv) {\n  porf_start(argc, argv);\n  return 0;\n}\n#endif\n`);
   }
 
   if (usesMath) prelude.splice(1, 0, '#include <math.h>\n');
   for (const f of cCallables) prelude.push(`${cCallableProto(f)};\n`);
+  // the event loop, when the runtime's C sets its hooks: porf_event_loop runs it after the
+  // program's top level (porf_start); porf_event_loop_step runs one turn of it, what a top-level
+  // await waits on once no promise job is left (__Porffor_promise_awaitSync): nonzero while
+  // something is still pending on it
+  prelude.push(split ? 'extern void (*porf_event_loop)(void);\nextern int (*porf_event_loop_step)(void);\n'
+    : 'static void (*porf_event_loop)(void);\nstatic int (*porf_event_loop_step)(void);\n');
   if (prefs.rawHead) prelude.push(resolveRawC(prefs.rawHead) + '\n');
 
   const globalTypes = Object.create(null);
@@ -2320,16 +2065,14 @@ int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_
   if (!split) {
     const text = prelude.concat(link);
     for (const u of unitOrder) if (unitParts[u]) text.push(unitText(u, unitParts[u]));
-    const c = text.join('');
-    if (!prefs.nativeFetch) return c;
-    return { c, nativeFetch: true };
+    return text.join('');
   }
 
   const rt = splitRuntime(prelude.join(''));
   const header = rt.header +
-    `extern const u8 porf_fnflags[];\n${usesSyncAsync ? 'extern const u8 porf_fnneeds_coro[];\n' : ''}extern const u16 porf_fnlen[];\nextern const u32 porf_fnname[];\nextern const u32 porf_fnrecs;\n` +
+    `extern const u8 porf_fnflags[];\n${usesSyncAsync ? 'extern const u8 porf_fnneeds_coro[];\n' : ''}${usesFnKind ? 'extern const u8 porf_fnkind[];\n' : ''}extern const u16 porf_fnlen[];\nextern const u32 porf_fnname[];\nextern const u32 porf_fnrecs;\n` +
     linkProtos.join('') +
-    (entry && !prefs.nativeFetch ? 'void porf_start(int argc, char** argv);\nvoid porf_run_jobs(void);\n' : '');
+    (entry ? 'void porf_start(int argc, char** argv);\nvoid porf_run_jobs(void);\n' : '');
   const unitName = u => {
     const name = units?.find(x => x.id === u)?.name;
     return name ? name.replace(/^[/]/, '').replace(/[^\w.-]/g, '_') + '.' + u + '.c' : `porf_${sanitize(u)}.c`;
@@ -2339,7 +2082,7 @@ int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_
     { name: 'porf_runtime.c', c: '#include "porf.h"\n' + runtimeRefs.map(proto).join('') + rt.impl }
   ];
   for (const u of unitOrder) if (unitParts[u]) files.push({ name: unitName(u), c: unitText(u, unitParts[u]) });
-  return { files, nativeFetch: !!prefs.nativeFetch };
+  return { files };
 };
 
 // split runtime C into header declarations and implementation
@@ -2507,7 +2250,6 @@ const PORF_GC_ALLOC = prefs => {
     }
     return best;
   });
-  const minorsEnabled = !prefs.nativeFetch;
 
   return `static u32 porf_heap_base = 0;
 static u32 porf_heap_top = 0;
@@ -2589,7 +2331,7 @@ static i64 porf_gc_promoted_since_full = 0;
 static int porf_gc_minor_mode = 0;
 static int porf_gc_scan_young_seen = 0;
 
-static const u64 porf_gc_allocation_debt_min = ${prefs.nativeFetch ? '64ull * 1024ull' : '1ull * 1024ull * 1024ull'};
+static const u64 porf_gc_allocation_debt_min = 1ull * 1024ull * 1024ull;
 static const u64 porf_gc_allocation_debt_max = 256ull * 1024ull * 1024ull;
 
 static u32* porf_gc_touched = NULL;
@@ -2987,7 +2729,7 @@ ${st}u32 porf_alloc_slow(u32 bytes, u32 typeId) {
     porf_arena_init();
     return porf_alloc_slow(bytes, typeId);
   }
-${minorsEnabled ? `  if (porf_gc_window_bytes >= (i64)PORF_GC_NURSERY_BYTES || porf_gc_span_bytes >= 8388608ll) {
+  if (porf_gc_window_bytes >= (i64)PORF_GC_NURSERY_BYTES || porf_gc_span_bytes >= 8388608ll) {
     porf_gc_window_bytes = 0;
     porf_gc_span_bytes = 0;
 #ifdef PORF_GC_DEFER
@@ -2996,7 +2738,6 @@ ${minorsEnabled ? `  if (porf_gc_window_bytes >= (i64)PORF_GC_NURSERY_BYTES || p
     porf_gc_minor();
 #endif
   }
-` : ''}\
   if (bytes > PORF_GC_MAX_SMALL) return porf_gc_span_alloc(bytes, typeId);
   const u32 ci = porf_gc_cls_lut[(bytes + 7u) >> 3];
   if (porf_gc_refill_window((i32)ci)) return porf_alloc(bytes, typeId);
@@ -3393,9 +3134,11 @@ static void porf_gc_scan_promise_reaction(u32 raw) {
     else if (kind != 12) porf_gc_mark_jsbits(*(jsbits*)(MEM + raw + PORF_REACTION_HANDLER));
   porf_gc_mark_jsbits(*(jsbits*)(MEM + raw + PORF_REACTION_OUT_PROMISE));
   porf_gc_mark_jsbits(*(jsbits*)(MEM + raw + PORF_REACTION_VALUE));
+  porf_gc_mark_jsbits(*(jsbits*)(MEM + raw + PORF_REACTION_CONTEXT));
 }
 
 static void porf_gc_mark_promise_jobs(void) {
+  porf_gc_mark_jsbits(porf_async_context);
   for (u32 i = 0; i < porf_promise_job_len; i++) {
     porf_gc_mark_promise_reaction(porf_promise_job_queue[(porf_promise_job_head + i) & (porf_promise_job_cap - 1u)]);
   }
@@ -4255,7 +3998,7 @@ static void porf_gc_discard_free_runs(void) {
 
 static void porf_gc_maybe_trim_memory(void) {
   const u32 trim_granule = 1u << 20;
-  const u32 keep_slack = ${prefs.nativeFetch ? '0u' : '16u * 1024u * 1024u'};
+  const u32 keep_slack = 16u * 1024u * 1024u;
 
   u64 wanted64 = ((u64)porf_heap_top + keep_slack + trim_granule - 1ull) & ~((u64)trim_granule - 1ull);
   const u64 min_committed = ((u64)porf_heap_base + 65536ull + trim_granule - 1ull) & ~((u64)trim_granule - 1ull);
@@ -4312,23 +4055,6 @@ ${st}void porf_gc_run_pending(void) {
   if (full) porf_gc_collect(0); else porf_gc_minor();
 }
 #endif
-${prefs.nativeFetch ? `
-// full under the debt policy, otherwise minor after enough page claims
-${st}int porf_gc_idle_minor_due(void) {
-  return porf_gc_window_bytes + porf_gc_span_bytes >= (1ll << 20);
-}
-${st}void porf_gc_collect_idle(void) {
-  if (porf_gc_should_collect_for(0)) {
-    porf_gc_collect(0);
-    return;
-  }
-  if (porf_gc_idle_minor_due()) {
-    porf_gc_window_bytes = 0;
-    porf_gc_span_bytes = 0;
-    porf_gc_minor();
-  }
-}
-` : ''}\
 
 ${st}void porf_gc_collect(int minor) {
 #ifdef PORF_GC_OFF
@@ -4531,21 +4257,13 @@ typedef double f64;
 typedef struct jsval { f64 val; i32 type; } jsval;
 typedef u64 jsbits;
 
-${prefs.nativeFetch ? `typedef struct NativeFetchResponseParts {
-  i32 status;
-  jsval body;
-  jsval headers;
-} NativeFetchResponseParts;
-
-static _Thread_local NativeFetchResponseParts* porf_native_fetch_response_parts_out = NULL;
-` : ''}
 
 // arena base: reserved once at init, NEVER moves. a fixed constant VA is
 // not reliably free on macOS (per-process dyld/malloc randomization), and
 // x86-64 has no [imm64+reg] addressing so a constant folds to a register
 // materialization anyway - a once-set global compiles to the same code.
 // 0x400000000 is used as a hint for deterministic debugging when free.
-${prefs.nativeFetch ? '' : st}u8* porf_mem;
+${st}u8* porf_mem;
 #define MEM porf_mem
 #define PORF_NOINLINE __attribute__((noinline))
 // run-once code (module init, top level): optimize for size whatever -O the unit gets
@@ -4657,9 +4375,17 @@ static int porf_gc_pending = 0; // 1 = minor requested, 2 = full requested
 #define PORF_REACTION_PAYLOAD 28
 #define PORF_REACTION_KIND 32
 #define PORF_REACTION_FLAGS 33
-#define PORF_REACTION_SIZE 40
+// the async context current when the reaction was made (AsyncLocalStorage's frame), current again
+// while it runs (__Porffor_promise_runJobs)
+#define PORF_REACTION_CONTEXT 40
+#define PORF_REACTION_SIZE 48
 
 #define PORF_GC_KIND_PROMISE_REACTION 248u
+
+// the current async context: AsyncLocalStorage's frame (runtime/node/async_hooks.mjs), or none:
+// 0, not undefined's bits, so it is zero-filled (an initialised global would be a data section of
+// its own, a page of binary on arm64 macOS)
+static jsbits porf_async_context = 0;
 
 static inline f64 porf_bits_to_f64_bits(u64 b) { f64 d; memcpy(&d, &b, 8); return d; }
 static inline u64 porf_f64_to_bits(f64 d) { u64 b; memcpy(&b, &d, 8); return b; }
@@ -4728,10 +4454,6 @@ static u32 porf_promise_job_len = 0;
 static u32 porf_promise_job_cap = 0;
 
 static void (*porf_promise_run_coro_reaction_impl)(u32) = NULL;
-static void (*porf_native_fetch_run_response_reaction_impl)(u32) = NULL;
-
-static u32 porf_native_fetch_set_timer(jsval callback, jsval args, jsval delay_value, i32 repeat);
-static void porf_native_fetch_clear_timer(jsval timer);
 
 static void porf_promise_enqueue_job(u32 reaction) {
   if (reaction == 0) return;
@@ -4764,11 +4486,6 @@ static u32 porf_promise_dequeue_job(void) {
 static void porf_promise_run_coro_reaction(u32 reaction) {
   if (!porf_promise_run_coro_reaction_impl) abort();
   porf_promise_run_coro_reaction_impl(reaction);
-}
-
-static void porf_native_fetch_run_response_reaction(u32 reaction) {
-  if (!porf_native_fetch_run_response_reaction_impl) abort();
-  porf_native_fetch_run_response_reaction_impl(reaction);
 }
 
 static inline i32 porf_jv_eq(jsval a, jsval b) {
@@ -6141,8 +5858,9 @@ ${dtoa !== 'libc' ? `  uint64_t bits;
   return k;
 }
 
-${st}jsval porf_num_to_str(f64 d) {
-  char buf[32];
+// a number's text (Number::toString) into buf (32 bytes): its length. No allocation, so printing
+// a number (console.log) needs no heap string, and no allocator in a program that only prints
+${st}int porf_num_to_buf(f64 d, char* buf) {
   int n;
   if (d != d) { memcpy(buf, "NaN", 3); n = 3; }
     else if (d == INFINITY) { memcpy(buf, "Infinity", 8); n = 8; }
@@ -6150,11 +5868,11 @@ ${st}jsval porf_num_to_str(f64 d) {
     // exact digits are the shortest round-tripping ones only up to 2^53; above it JS
     // prints the shortest digits padded with zeros (2^60 is "1152921504606847000")
     else if (d == trunc(d) && fabs(d) < 9007199254740992.0) {
-      char* p = buf + sizeof buf;
+      char* p = buf + 32;
       u64 v = (u64)fabs(d);
       do { *--p = (char)('0' + v % 10u); v /= 10u; } while (v);
       if (d < 0) *--p = '-';
-      n = (int)(buf + sizeof buf - p);
+      n = (int)(buf + 32 - p);
       memmove(buf, p, (size_t)n);
     } else {
       // the shortest round-tripping digits, then laid out by Number::toString's rules
@@ -6182,6 +5900,12 @@ ${st}jsval porf_num_to_str(f64 d) {
       }
       n = (int)(o - buf);
     }
+  return n;
+}
+
+${st}jsval porf_num_to_str(f64 d) {
+  char buf[32];
+  const int n = porf_num_to_buf(d, buf);
   const u32 s = porf_bstr_new((u32)n);
   memcpy(MEM + s + 4, buf, (size_t)n);
   return porf_box((f64)s, ${TYPES.bytestring});
@@ -7454,6 +7178,7 @@ static u32 porf_promise_new_coro_reaction(porf_coro_call* call, jsval out_promis
   *(u32*)(MEM + reaction + PORF_REACTION_PAYLOAD) = (u32)is_throw;
   *(u8*)(MEM + reaction + PORF_REACTION_KIND) = 11;
   *(u8*)(MEM + reaction + PORF_REACTION_FLAGS) = 0;
+  *(jsbits*)(MEM + reaction + PORF_REACTION_CONTEXT) = porf_async_context;
   porf_gc_barrier(reaction, PORF_GC_KIND_PROMISE_REACTION);
   return reaction;
 }

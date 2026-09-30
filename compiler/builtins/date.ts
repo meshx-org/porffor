@@ -317,7 +317,12 @@ export const __ecma262_TimeClip = (time: number): number => {
 // 21.4.3.1 Date.now ()
 // https://tc39.es/ecma262/multipage/numbers-and-dates.html#sec-date.now
 // This function returns the time value designating the UTC date and time of the occurrence of the call to it.
-export const __Date_now = (): number => Math.trunc(performance.timeOrigin + performance.now());
+export const __Date_now = (): number => {
+  // truncated as a number already (it is one, and positive): not Math.trunc, whose ToNumber
+  // reaches objects, errors and the allocator in a program that only asks the time
+  const t: number = performance.timeOrigin + performance.now();
+  return t - t % 1;
+};
 
 // 21.4.3.4 Date.UTC (year [, month [, date [, hours [, minutes [, seconds [, ms ]]]]]])
 // https://tc39.es/ecma262/multipage/numbers-and-dates.html#sec-date.utc

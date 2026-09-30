@@ -343,6 +343,28 @@ export const __Porffor_iter_builtinStep = (it: any): any => {
     if (it.__under.done) it.__done = true;
     return v;
   }
+  return __Porffor_iter_runHelper(it, kind);
+};
+
+// an iterator helper runs as a generator does: a step taken while its own step runs (its
+// function calling next) is a TypeError, and a step that throws completes it (done after)
+export const __Porffor_iter_runHelper = (it: any, kind: i32): any => {
+  if (it.__running) throw new TypeError('Iterator helper is already running');
+  it.__running = true;
+  let v: any = undefined;
+  let completed: boolean = false;
+  try {
+    v = __Porffor_iter_helperStep(it, kind);
+    completed = true;
+  } finally {
+    it.__running = false;
+    if (!completed) it.__done = true;
+  }
+  return v;
+};
+
+// one step of a helper (map, filter, take, drop, flatMap, zip)
+export const __Porffor_iter_helperStep = (it: any, kind: i32): any => {
   if (Porffor.comptime.flag`member.map`) if (kind == ITER_MAP) {
     const v: any = __Porffor_iter_step(it.__under);
     if (it.__under.done) {
@@ -869,12 +891,36 @@ export const __Porffor_iter_builtinMethod = (trueType: i32): any => {
   return undefined;
 };
 
+// [Symbol.iterator] and [Symbol.asyncIterator] found on a built-in prototype, which carries
+// no symbol keys, when a read of one missed: Array.prototype's (values), String.prototype's,
+// Map.prototype's and Set.prototype's, %IteratorPrototype%'s (returns this), for obj or
+// anything on its prototype chain. undefined for any other
+export const __Porffor_iter_protoMethod = (obj: any, key: any): any => {
+  const sync: boolean = key === Symbol.iterator;
+  if (!sync) return undefined;
+  let proto: any = obj;
+  for (let depth: i32 = 0; depth < 64; depth++) {
+    if (proto == null) return undefined;
+    if (proto === __Array_prototype) return __Array_prototype_values;
+    if (proto === __String_prototype) return __Porffor_string_iterator;
+    if (proto === __Iterator_prototype) return __Porffor_iter_self;
+    if (Porffor.comptime.flag`hasType.set`) if (proto === __Set_prototype) return __Set_prototype_values;
+    if (Porffor.comptime.flag`hasType.map`) if (proto === __Map_prototype) return __Map_prototype_entries;
+    if (!Porffor.object.isObject(proto)) return undefined;
+    proto = Porffor.object.getPrototypeWithHidden(proto, Porffor.type(proto));
+  }
+  return undefined;
+};
+
 export const __Porffor_iter_self = function (this: any): any {
   return this;
 };
 
 export const __Porffor_string_iterator = function (this: any): object {
-  return __Porffor_iter_new(this, ITER_STRING);
+  // RequireObjectCoercible, then ToString (reached off String.prototype, this is any value)
+  if (this == null) throw new TypeError('String.prototype[Symbol.iterator] called on null or undefined');
+  if ((Porffor.type(this) | 0b10000000) == Porffor.TYPES.bytestring) return __Porffor_iter_new(this, ITER_STRING);
+  return __Porffor_iter_new(ecma262.ToString(this), ITER_STRING);
 };
 
 export const __Porffor_typedArray_values = function (this: any): object {
