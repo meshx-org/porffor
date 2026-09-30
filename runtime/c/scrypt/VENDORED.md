@@ -15,10 +15,13 @@ Colin Percival's reference scrypt and the libcperciva pieces it includes, from
 Built without any `CPUSUPPORT_*` define, so SHA-256 is the portable C code. `warnp.h` is only
 included, never called, so `warnp.c` is not here.
 
-A guest gets this only when its code imports `@noble/hashes`' `scrypt.js`: `scripts/bundle.mjs`
-points that module at `runtime/scrypt.mjs` and writes `natives.json`, and `src/build.mjs` compiles
-these three `.c` files for that guest alone. Output matches Node's `crypto.scrypt` (RFC 7914's
-vectors and better-auth's parameters, N=16384 r=16 p=1).
+`runtime/host/scrypt.mjs` calls it, as `porffor:scrypt`, for `runtime/scrypt.mjs`, which imports
+of `@noble/hashes`' `scrypt.js` resolve to. A native build with the runtime (`--runtime`) links these
+three `.c` files (`sources.json`) as a cached archive (`compiler/deps.js`), so a program that never
+hashes carries none of it; its async hash runs on libuv's threadpool. A WASI guest gets them only
+when its code imports noble's scrypt: `wasi/scripts/bundle.mjs` writes `natives.json` and
+`wasi/src/build.mjs` compiles them for that guest alone. Output matches Node's `crypto.scrypt`
+(RFC 7914's vectors and better-auth's parameters, N=16384 r=16 p=1).
 
 To update: copy the same files from a newer Tarsnap/scrypt checkout, update the commit above, and
-build a guest that hashes a password.
+hash a password natively and in a guest.

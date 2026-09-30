@@ -6,100 +6,11 @@ const root = path.resolve(new URL('../', import.meta.url).pathname);
 const out = path.join(root, 'selfhosted/bundle.js');
 const noopPrecompiled = process.env.SELFHOST_NOOP_PRECOMPILED === '1';
 
+// Node's modules the compiler imports come from Porffor's JS runtime (runtime/node), as a
+// program's do; node:repl is the selfhosted REPL's own
+const NODE_MODULES = new Set([ 'fs', 'child_process', 'path', 'os' ]);
+
 const shims = new Map([
-  [ 'node:fs', `const fs = globalThis.__porfforNode.fs;
-export const readFileSync = fs.readFileSync;
-export const writeFileSync = fs.writeFileSync;
-export const statSync = fs.statSync;
-export const existsSync = fs.existsSync;
-export const mkdtempSync = fs.mkdtempSync;
-export const rmSync = fs.rmSync;
-export const mkdirSync = fs.mkdirSync;
-export const readdirSync = fs.readdirSync;
-export const renameSync = fs.renameSync;
-export const symlinkSync = fs.symlinkSync;
-export const cpSync = fs.cpSync;
-export default fs;` ],
-[ 'node:child_process', `export const execSync = globalThis.__porfforNode.child_process.execSync;
-export const execFileSync = globalThis.__porfforNode.child_process.execFileSync;` ],
-  [ 'node:path', `const normalizeParts = parts => {
-  const out = [];
-  for (let i = 0; i < parts.length; i++) {
-    const p = parts[i];
-    if (p === '' || p === '.') continue;
-    if (p === '..') {
-      if (out.length > 0 && out[out.length - 1] !== '..') out.pop();
-        else out.push(p);
-      continue;
-    }
-    out.push(p);
-  }
-  return out;
-};
-export const join = (...args) => {
-  let rooted = false;
-  const parts = [];
-  for (let i = 0; i < args.length; i++) {
-    const s = '' + args[i];
-    if (s === '') continue;
-    if (parts.length === 0 && s[0] === '/') rooted = true;
-    const spl = s.split('/');
-    for (let j = 0; j < spl.length; j++) parts.push(spl[j]);
-  }
-  const out = normalizeParts(parts).join('/');
-  if (rooted) return '/' + out;
-  return out === '' ? '.' : out;
-};
-export const resolve = (...args) => {
-  let acc = '';
-  for (let i = 0; i < args.length; i++) {
-    const s = '' + args[i];
-    if (s === '') continue;
-    if (s[0] === '/') acc = s;
-      else acc = acc === '' ? s : acc + '/' + s;
-  }
-  if (acc === '' || acc[0] !== '/') acc = process.cwd() + '/' + acc;
-  return '/' + normalizeParts(acc.split('/')).join('/');
-};
-export const dirname = p => {
-  let s = '' + p;
-  while (s.length > 1 && s[s.length - 1] === '/') s = s.slice(0, -1);
-  const i = s.lastIndexOf('/');
-  if (i === -1) return '.';
-  if (i === 0) return '/';
-  return s.slice(0, i);
-};
-export const basename = p => {
-  let s = '' + p;
-  while (s.length > 1 && s[s.length - 1] === '/') s = s.slice(0, -1);
-  const i = s.lastIndexOf('/');
-  return i === -1 ? s : s.slice(i + 1);
-};
-export const extname = p => {
-  const b = basename(p);
-  const i = b.lastIndexOf('.');
-  return i > 0 ? b.slice(i) : '';
-};
-export const relative = (from, to) => {
-  const a = resolve(from).split('/');
-  const b = resolve(to).split('/');
-  let common = 0;
-  while (common < a.length && common < b.length && a[common] === b[common]) common++;
-  const out = [];
-  for (let i = common; i < a.length; i++) if (a[i] !== '') out.push('..');
-  for (let i = common; i < b.length; i++) if (b[i] !== '') out.push(b[i]);
-  return out.join('/');
-};
-export const sep = '/';
-export default { join, resolve, dirname, basename, extname, relative, sep };` ],
-  [ 'node:os', `export const homedir = () => process.env.HOME ?? '/tmp';
-export const tmpdir = () => {
-  const t = process.env.TMPDIR;
-  if (t == null || t === '') return '/tmp';
-  return t[t.length - 1] === '/' ? t.slice(0, -1) : t;
-};
-export const platform = () => process.platform;
-export default { homedir, tmpdir, platform };` ],
   [ 'node:repl', `export function REPLServer(options = {}) {
   this.prompt = options.prompt ?? '> ';
   this.eval = options.eval;
@@ -224,7 +135,8 @@ const commentRanges = source => {
 };
 
 const resolveImport = (from, spec) => {
-  if (spec === 'node:fs' || spec === 'node:child_process' || spec === 'node:repl' || spec === 'node:path' || spec === 'node:os') return spec;
+  if (spec.startsWith('node:') && NODE_MODULES.has(spec.slice(5))) return path.join(root, 'runtime/node', spec.slice(5) + '.mjs');
+  if (spec === 'node:repl') return spec;
   if (!spec.startsWith('.') && !spec.startsWith('/')) return spec;
 
   let target = spec.startsWith('/') ? spec : path.resolve(path.dirname(from), spec);
@@ -241,6 +153,19 @@ const load = file => {
 
   if (file.endsWith('/compiler/index.js') || file.endsWith('/compiler/modules.js')) {
     source = source.replace(`const fs = (typeof process?.version !== 'undefined' ? (await import('node:fs')) : undefined);`, `const fs = globalThis.__porfforNode.fs;`);
+  }
+  if (file.endsWith('/compiler/modules.js')) {
+    // no import.meta selfhosted: the runtime's modules node:fs and the rest resolve to, embedded
+    const runtimeFiles = {};
+    for (const dir of [ 'node', 'host/native' ]) {
+      for (const name of fs.readdirSync(path.join(root, 'runtime', dir)).filter(x => x.endsWith('.mjs')).sort()) {
+        runtimeFiles[`${dir}/${name}`] = fs.readFileSync(path.join(root, 'runtime', dir, name), 'utf8');
+      }
+    }
+    const replaced = source.replace(`const RUNTIME_FILES = null, RUNTIME_DIR = fs ? import.meta.dirname + '/../runtime' : null;`,
+      `const RUNTIME_FILES = ${JSON.stringify(runtimeFiles)}, RUNTIME_DIR = null;`);
+    if (replaced === source) throw new Error('selfhost runtime files rewrite failed');
+    source = replaced;
   }
   if (file.endsWith('/compiler/index.js')) {
     source = source.replace(`const { execSync } = (typeof process?.version !== 'undefined' ? (await import('node:child_process')) : {});`, `const { execSync } = globalThis.__porfforNode.child_process;`);

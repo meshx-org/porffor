@@ -1,0 +1,5 @@
+{
+	"common": ["src/api.c", "src/http.c", "src/llhttp.c"],
+	"includes": ["include"],
+	"headers": "include"
+}

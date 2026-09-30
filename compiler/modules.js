@@ -12,7 +12,24 @@ const joinPath = (dir, rel) => {
   }
   return '/' + parts.join('/');
 };
-const isFile = p => { try { return fs.statSync(p).isFile(); } catch { return false; } };
+// Node's modules Porffor provides, from its JS runtime (runtime/node): node:fs (or fs) resolves
+// to a path under RUNTIME, which reads from runtime/ beside the compiler or, in the selfhosted
+// compiler (no import.meta), from the copies selfhosted/build.mjs puts in place of this line
+const NODE_MODULES = [ 'fs', 'child_process', 'path', 'os' ];
+const RUNTIME = '/$porffor/runtime';
+const RUNTIME_FILES = null, RUNTIME_DIR = fs ? import.meta.dirname + '/../runtime' : null;
+const runtimeFile = p => p.startsWith(RUNTIME + '/') ? p.slice(RUNTIME.length + 1) : null;
+
+const isFile = p => {
+  const rel = runtimeFile(p);
+  if (rel !== null && RUNTIME_FILES) return Object.hasOwn(RUNTIME_FILES, rel);
+  try { return fs.statSync(rel !== null ? RUNTIME_DIR + '/' + rel : p).isFile(); } catch { return false; }
+};
+const readSource = p => {
+  const rel = runtimeFile(p);
+  if (rel === null) return fs.readFileSync(p, 'utf8');
+  return RUNTIME_FILES ? RUNTIME_FILES[rel] : fs.readFileSync(RUNTIME_DIR + '/' + rel, 'utf8');
+};
 const readJson = p => JSON.parse(fs.readFileSync(p, 'utf8'));
 
 export const hashId = str => {
@@ -89,7 +106,11 @@ const nearestPackage = dir => {
 };
 
 const resolve = (spec, from, cjs) => {
-  if (spec.startsWith('node:')) throw new Error(`porffor: node builtin modules are not supported (${spec})`);
+  const nodeName = spec.startsWith('node:') ? spec.slice(5) : NODE_MODULES.includes(spec) ? spec : null;
+  if (nodeName !== null) {
+    if (!NODE_MODULES.includes(nodeName)) throw new Error(`porffor: node:${nodeName} is not provided (Porffor has ${NODE_MODULES.map(x => 'node:' + x).join(', ')})`);
+    return `${RUNTIME}/node/${nodeName}.mjs`;
+  }
   const conditions = [ 'porffor', 'worker', cjs ? 'require' : 'import', 'module', 'default', ...(Prefs.conditions ? String(Prefs.conditions).split(',') : []) ];
   let out = null;
   if (spec[0] === '.' || spec[0] === '/') out = resolveFile(joinPath(dirname(from), spec));
@@ -257,7 +278,7 @@ export default (entrySource, entryFile, opts = {}) => {
     let mod = modules.get(key);
     if (mod) return mod;
 
-    source ??= fs.readFileSync(file, 'utf8');
+    source ??= readSource(file);
     const rel = file.startsWith(entryDir + '/') ? file.slice(entryDir.length + 1) : file;
     mod = { file, rel, src: source, id: hashId(kind === 'text' ? rel + '\0text' : rel), entry, esm: true, exports: new Map(), stars: [], imports: [], deps: [], body: null, nsUsed: false };
     modules.set(key, mod);

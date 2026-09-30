@@ -4,6 +4,7 @@
 // gets its own rules later.
 import js from '@eslint/js';
 import globals from 'globals';
+import porfforRules from './eslint-rules/porffor.js';
 
 // what a program compiled by Porffor has without the runtime: the language, Porffor's own
 // intrinsics, and the Web APIs its compiler builds in (compiler/builtins)
@@ -38,6 +39,12 @@ export default [
 		]
 	},
 	js.configs.recommended,
+	{
+		// Porffor's own rules (eslint-rules/porffor.js)
+		files: ['runtime/**/*.mjs', 'wasi/**/*.mjs'],
+		plugins: { porffor: porfforRules },
+		rules: { 'porffor/c-uses': 'error' }
+	},
 	{
 		// the runtime: guest code, compiled by Porffor (its own Porffor.* intrinsics included)
 		files: ['runtime/**/*.mjs'],
