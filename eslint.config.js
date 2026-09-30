@@ -4,13 +4,18 @@
 // gets its own rules later.
 import js from '@eslint/js';
 import globals from 'globals';
-import porfforRules from './eslint-rules/porffor.js';
+import porfforLint from './eslint/index.js';
 
 // what a program compiled by Porffor has without the runtime: the language, Porffor's own
 // intrinsics, and the Web APIs its compiler builds in (compiler/builtins)
 const porffor = {
 	...globals.es2025,
 	Porffor: 'readonly',
+	// a builtin the runtime calls by name: the promise jobs, run after a host callback
+	__Porffor_promise_runJobs: 'readonly',
+	// the engine's async context (runtime/node/async_hooks.mjs)
+	__Porffor_asyncContext_get: 'readonly',
+	__Porffor_asyncContext_set: 'readonly',
 	console: 'readonly',
 	crypto: 'readonly',
 	performance: 'readonly',
@@ -40,18 +45,33 @@ export default [
 	},
 	js.configs.recommended,
 	{
-		// Porffor's own rules (eslint-rules/porffor.js)
-		files: ['runtime/**/*.mjs', 'wasi/**/*.mjs'],
-		plugins: { porffor: porfforRules },
-		rules: { 'porffor/c-uses': 'error' }
-	},
-	{
 		// the runtime: guest code, compiled by Porffor (its own Porffor.* intrinsics included)
 		files: ['runtime/**/*.mjs'],
 		languageOptions: {
 			ecmaVersion: 'latest',
 			sourceType: 'module',
 			globals: porffor
+		}
+	},
+	// the runtime keeps which of its modules a program reaches visible to the compiler
+	...porfforLint.configs.runtime.map((config) => ({ ...config, files: ['runtime/**/*.mjs'] })),
+	{
+		// the lint rules (eslint/): Node
+		files: ['eslint/**/*.js'],
+		languageOptions: {
+			ecmaVersion: 'latest',
+			sourceType: 'module',
+			globals: { ...globals.node, ...globals.es2025 }
+		}
+	},
+	{
+		// the native tests (Node) and their fixtures (Porffor programs with the runtime: Node's
+		// globals and the Web's, as a native build with the runtime has them)
+		files: ['native/**/*.mjs'],
+		languageOptions: {
+			ecmaVersion: 'latest',
+			sourceType: 'module',
+			globals: { ...globals.node, ...globals.browser, ...globals.es2025 }
 		}
 	},
 	{
