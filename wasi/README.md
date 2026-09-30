@@ -174,11 +174,16 @@ a lone `\r` is converted by `endings: 'native'`, and `lastModified` is truncated
 
 `Intl` (`DateTimeFormat`, `NumberFormat`, `PluralRules`, `ListFormat`, `Collator`, `Locale`,
 `getCanonicalLocales`, `supportedValuesOf`) is injected into guests whose world includes
-`meshx:intl/imports@0.1.0` (`wit/meshx-intl-0.1.0` at the repo root). The guest carries no locale
+`meshx:intl/imports@0.1.0` (`wasi/wit/meshx-intl-0.1.0`). The guest carries no locale
 data: `runtime/intl.mjs` reads and checks the options, and the host formats. A browser or Node host
 passes the calls through to its own `Intl`; `__test__/intl/host/` is that host, and
 `__test__/intl.test.mjs` checks that a guest's output matches Node's `Intl` exactly, down to the
-order of `resolvedOptions()`. A native host would answer from ICU4X. Not yet: `RelativeTimeFormat`,
+order of `resolvedOptions()`. For a host that answers nothing (`wasmtime serve`, CI), ICU4X built as
+a component (`runtime/intl`, a Cargo crate: `cargo build --target wasm32-unknown-unknown --release`,
+then `wasm-tools component new`) is composed into the guest with `wac plug`. The runtime reaches the
+interfaces as `porffor:intl/*` (`runtime/host/wasi/intl`, the world's imports); a native Porffor
+program links the same crate as a static library instead (`runtime/host/native/intl`, its C ABI:
+`runtime/intl/src/capi.rs`), built by cargo once and cached. Not yet: `RelativeTimeFormat`,
 `DisplayNames`, `Segmenter`, and the prototype methods (`toLocaleString`, `localeCompare`,
 `normalize`), which are Porffor builtins.
 

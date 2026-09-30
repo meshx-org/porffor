@@ -1,0 +1,9 @@
+package meshx:node-fs-test@0.1.0;
+
+/// A guest that uses node:fs, node:path and node:os (Porffor's runtime/node) in a preopened
+/// directory. No imports of its own: the file system comes through wasi-libc (wasi:filesystem).
+world node-fs {
+  /// root: the preopened directory the guest works in. Async: under WASI 0.3, wasi-libc's file
+  /// reads wait on streams, which only an async export may do
+  export run: async func(root: string) -> string;
+}

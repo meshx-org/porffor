@@ -1,5 +1,6 @@
 // The event loop of a WPT test compiled natively (Porffor to C, run by tcc): what a component
-// gets from its host, in the few calls runtime/timers.mjs makes of it. The runner's bundle maps
+// gets from its host, in the calls the runtime's platform layer (runtime/host/wasi/async.mjs,
+// clock.mjs) makes of it. The runner's bundle maps
 // both `wasi:clocks/monotonic-clock@0.3.0` and `rt-async` (the glue's async runtime) here, so
 // the guest runs the same timers shim a component does, over this queue instead of the host.
 //
@@ -72,3 +73,45 @@ export function runEventLoop(onError, finished) {
 		drainJobs(onError);
 	}
 }
+
+/** Operations waiting for rtSettle: token -> [resolve, reject, lift]. */
+const operations = new Map();
+
+/** A promise settled by rtSettle(token), with what lift makes. */
+export function rtAwait(token, lift) {
+	lastToken = token;
+
+	return new Promise((resolve, reject) => {
+		operations.set(token, [resolve, reject, lift]);
+	});
+}
+
+/** An operation's end: its promise settles with what its lift makes. */
+export function rtSettle(token) {
+	const operation = operations.get(token);
+
+	if (operation === undefined) return 0;
+	operations.delete(token);
+
+	try {
+		operation[0](operation[2]());
+	} catch (error) {
+		operation[1](error);
+	}
+
+	return 0;
+}
+
+/** An operation that finished at once. */
+export function rtNow(lift) {
+	lastToken = 0;
+
+	try {
+		return Promise.resolve(lift());
+	} catch (error) {
+		return Promise.reject(error);
+	}
+}
+
+/** A promise settled after the loop's next turn: a wait of nothing. */
+export const rtYield = () => waitFor(0);

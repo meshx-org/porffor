@@ -86,7 +86,7 @@ test.skipIf(unavailable !== null)(
 		const thrown = await fetch(base + '/throw');
 
 		expect(thrown.status).toBe(500);
-		expect(server.log()).toContain('fetch handler failed: boom');
+		expect(server.log()).toContain('fetch handler failed: Error: boom');
 
 		// a fetched body passed through; one left unread (the 502) must not stall the next
 		// request: each call's host work is waited on by its own thread

@@ -1,0 +1,9 @@
+package meshx:node-modules-test@0.1.0;
+
+/// A guest that uses Porffor's Node modules (runtime/node): events, buffer, util, url, crypto,
+/// stream, string_decoder, timers/promises, perf_hooks and process. The clock is imported for
+/// node:timers; randomness comes through wasi-libc (wasi:random).
+world node-modules {
+  import wasi:clocks/monotonic-clock@0.3.0;
+  export run: async func() -> string;
+}

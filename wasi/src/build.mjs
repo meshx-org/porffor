@@ -73,7 +73,7 @@ const run = promisify(execFile);
 
 /**
  * The C the guest's code needs beside Porffor's, as bundle.mjs decided (natives.json): Colin
- * Percival's scrypt when it imports @noble/hashes' (runtime/c/scrypt; runtime/scrypt.mjs calls it).
+ * Percival's scrypt when it imports @noble/hashes' (runtime/c/scrypt; porffor:scrypt calls it).
  * @param {string} work
  * @returns {{ nativeSources: string[], nativeFlags: string[] }}
  */
@@ -83,12 +83,12 @@ function nativeCode(work) {
 	if (!natives.scrypt) return { nativeSources: [], nativeFlags: [] };
 
 	const scryptDir = join(dirname(scripts), '..', 'runtime', 'c', 'scrypt');
+	// what a native build's archive is made of too (compiler/deps.js)
+	const sources = JSON.parse(readFileSync(join(scryptDir, 'sources.json'), 'utf8'));
 
 	return {
-		nativeSources: ['crypto_scrypt-ref.c', 'sha256.c', 'insecure_memzero.c'].map((name) =>
-			join(scryptDir, name)
-		),
-		nativeFlags: [`-I${scryptDir}`]
+		nativeSources: sources.common.map((name) => join(scryptDir, name)),
+		nativeFlags: sources.includes.map((dir) => `-I${join(scryptDir, dir)}`)
 	};
 }
 

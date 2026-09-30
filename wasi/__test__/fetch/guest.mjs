@@ -115,7 +115,7 @@ export async function run(base) {
 	});
 
 	streamed.uploaded = (
-		await (await fetch(base + '/echo', { method: 'POST', body: upload })).json()
+		await (await fetch(base + '/echo', { method: 'POST', body: upload, duplex: 'half' })).json()
 	).body;
 
 	// cancelling with a read in flight

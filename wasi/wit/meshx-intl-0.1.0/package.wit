@@ -318,7 +318,7 @@ interface text {
 }
 
 /// A provider of the whole interface: a host library compiled as a component (ICU4X's is
-/// crates/intl), composed into a guest where the host does not answer meshx:intl itself.
+/// runtime/intl), composed into a guest where the host does not answer meshx:intl itself.
 world provider {
     // exported too, so the provider imports nothing and a guest's types import is
     // filled from it when they are composed

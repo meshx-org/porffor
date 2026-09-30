@@ -84,10 +84,11 @@ export function buildFixture(name, world, target = 'p3') {
 }
 
 /**
- * Invokes an export (`run("…")`) in wasmtime with the given WASI options (P3 by default, '' for none); the
- * string it returned. Asynchronous, so a server in this process can answer meanwhile.
+ * Invokes an export (`run("…")`) in wasmtime with the given WASI options (P3 by default, '' for none) and
+ * any more of wasmtime's arguments (args); the string it returned. Asynchronous, so a server in this
+ * process can answer meanwhile.
  */
-export async function invoke(component, call, wasi = 'p3=y') {
+export async function invoke(component, call, wasi = 'p3=y', args = []) {
 	const { stdout } = await promisify(execFile)(
 		wasmtime,
 		[
@@ -95,6 +96,8 @@ export async function invoke(component, call, wasi = 'p3=y') {
 			'-W',
 			features(component),
 			...(wasi === '' ? [] : ['-S', wasi]),
+			// more of wasmtime's options: --dir host::guest, a preopened directory
+			...args,
 			'--invoke',
 			call,
 			component

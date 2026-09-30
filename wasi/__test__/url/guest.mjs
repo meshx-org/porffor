@@ -14,8 +14,9 @@ export function run() {
 			viaBrackets: new globalThis['URLSearchParams']('a=1&b=2').get('b'),
 			stream: typeof globalThis.ReadableStream,
 			enumerable: Object.keys(globalThis).includes('URL'),
-			// provided by runtime/, but never reached through globalThis: not installed
-			notReached: 'TransformStream' in globalThis
+			// provided by runtime/, but never reached through the global object (globalThis.X,
+			// 'X' in globalThis): not installed
+			notReached: Object.getOwnPropertyNames(globalThis).includes('TransformStream')
 		}
 	});
 }

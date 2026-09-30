@@ -269,6 +269,13 @@ var location = new URL(${JSON.stringify(`${ORIGIN}/${test.file.replace(/\.any\.j
 self.location = location;
 var GLOBAL = { isWindow: () => false, isWorker: () => true, isShadowRealm: () => false };
 self.GLOBAL = GLOBAL;
+// testharness.js looks the timers up on the global object (global_scope.setTimeout): without
+// them there its step_timeout spins promise jobs until the time is up (fake_set_timeout), and
+// no timer of the test's own fires meanwhile
+self.setTimeout = setTimeout;
+self.clearTimeout = clearTimeout;
+self.setInterval = setInterval;
+self.clearInterval = clearInterval;
 var META_TITLE = ${JSON.stringify(title)};
 // the expressions idlharness.js evaluates, made at build time (Porffor has no run-time eval)
 const WPT_EXPRESSIONS = { ${expressions.map((expr) => `${JSON.stringify(expr)}: () => (${expr})`).join(', ')} };
@@ -292,12 +299,12 @@ var fetch = (input, init) => {
 	}
 	if (request.signal.aborted) return Promise.reject(request.signal.reason);
 	const url = request.url;
-	if (url.startsWith('data:')) {
-		try {
-			return Promise.resolve(dataUrlResponse(url));
-		} catch (error) {
-			return Promise.reject(error);
-		}
+	// data: and blob: URLs, answered as the runtime's fetch answers them
+	try {
+		const local = localResponse(request);
+		if (local !== null) return Promise.resolve(local);
+	} catch (error) {
+		return Promise.reject(error);
 	}
 	if (!(url in WPT_RESOURCES))
 		return Promise.reject(new TypeError('wpt: ' + url + ' is not available offline'));
@@ -344,8 +351,8 @@ ${body}
 
 // --- the host's part: the event loop, then the result
 import { runEventLoop } from 'wpt-native-loop';
-// data: URLs the offline fetch answers as fetch does (runtime/data-url.mjs)
-import { dataUrlResponse } from ${JSON.stringify(join(import.meta.dirname, '../../runtime/data-url.mjs'))};
+// data: and blob: URLs the offline fetch answers as fetch does (runtime/local-response.mjs)
+import { localResponse } from ${JSON.stringify(join(import.meta.dirname, '../../runtime/local-response.mjs'))};
 let WPT_RESULT = null;
 const WPT_ERRORS = [];
 WPT_DONE.then((result) => { WPT_RESULT = result; });

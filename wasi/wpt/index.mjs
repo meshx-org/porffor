@@ -4,7 +4,7 @@
 // natively (Porffor to C, run by tcc -run, or cc without tcc), in parallel, and the results
 // compared with the last run's (wpt/results.json).
 //
-//   node wpt/index.mjs [dir or file] [--threads=N] [--files=list.json] [--log-errors]
+//   node wpt/index.mjs [dir or file] [--threads=N] [--files=list.json] [--log-errors] [--no-save]
 //
 // Each test is a program (wpt/guest.mjs): testharness.js, the META scripts, the test and an
 // event loop, bundled with runtime/'s shims as a component's guest is (scripts/bundle.mjs). A test
@@ -13,7 +13,7 @@
 
 import cluster from 'node:cluster';
 import { execFile, execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { guestSource } from './guest.mjs';
@@ -101,7 +101,7 @@ async function primary() {
 		};
 
 		for (let slot = 0; slot < Math.min(threads, tests.length); slot++) {
-			const child = cluster.fork({ WPT_SLOT: String(slot) });
+			const child = cluster.fork({ WPT_SLOT: String(slot), WPT_RUN: String(process.pid) });
 
 			child.on('message', (message) => {
 				if (message.ready) return give(child);
@@ -181,8 +181,16 @@ function report(tests, results, subtests, last, elapsed) {
 
 	if (diff.newFailures.length > 0)
 		print(`\nno longer passing:\n  ${diff.newFailures.join('\n  ')}`);
-	writeFileSync(resultsPath, JSON.stringify(whole));
-	writeFileSync(diffPath, JSON.stringify(diff, null, 2));
+	// --no-save: a look at part of the suite that leaves the recorded results alone (runs side
+	// by side would each write theirs over the others')
+	if (!argv.includes('--no-save')) {
+		writeFileSync(resultsPath, JSON.stringify(whole));
+		writeFileSync(diffPath, JSON.stringify(diff, null, 2));
+	}
+	// this run's work directories (another run's may be in use)
+	for (const dir of existsSync(join(here, '.work')) ? readdirSync(join(here, '.work')) : [])
+		if (dir.startsWith(`${process.pid}-`))
+			rmSync(join(here, '.work', dir), { recursive: true, force: true });
 }
 
 /** The compiling and running side: one test at a time, as the primary hands them out. */
@@ -196,7 +204,8 @@ async function worker() {
 	const render = (await import(join(compiler, 'render.js'))).default;
 
 	globalThis.pageSize = globalThis.Prefs.pageSize ?? 65536 / 4;
-	const work = join(here, '.work', `w${process.env.WPT_SLOT}`);
+	// (a run's own: runs side by side do not share a directory)
+	const work = join(here, '.work', `${process.env.WPT_RUN}-w${process.env.WPT_SLOT}`);
 	const tcc = findTcc();
 
 	rmSync(work, { recursive: true, force: true });
