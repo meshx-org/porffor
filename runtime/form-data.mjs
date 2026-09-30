@@ -2,13 +2,17 @@
 // each a name and a value that is a string or a File. A component has no forms, so the
 // constructor takes none.
 //
-// keys(), values() and entries() return arrays, as URLSearchParams' do: Porffor's for...of
-// takes arrays but not the iterator protocol.
+// Iteration follows the list as it changes (entries removed or added while iterating), as the
+// spec's iterator does.
 //
 // Injected into every guest (tree-shaken away unless used).
 
 import { Blob, File } from './file.mjs';
 import { toUSVString } from './url-encoding.mjs';
+import { defineInterface, pairIterator } from './webidl.mjs';
+
+/** A FormData's entries, as they are now. */
+const listPairs = (formData) => formData._list;
 
 // (see blob.mjs's TAG)
 const TAG = 'FormData';
@@ -122,33 +126,39 @@ export class FormData {
 	}
 
 	/** Calls callback(value, name, this) for each entry. */
-	forEach(callback, thisArg) {
+	forEach(callback, thisArg = undefined) {
 		if (typeof callback !== 'function')
 			throw new TypeError("Failed to execute 'forEach' on 'FormData': callback is not a function");
 
-		for (const [name, value] of this._list) callback.call(thisArg, value, name, this);
+		for (let index = 0; index < this._list.length; index++) {
+			const [name, value] = this._list[index];
+
+			callback.call(thisArg, value, name, this);
+		}
 	}
 
 	/** The names, in order. */
 	keys() {
-		return this._list.map((pair) => pair[0]);
+		return pairIterator('FormData', this, 'key', listPairs);
 	}
 
 	/** The values, in order. */
 	values() {
-		return this._list.map((pair) => pair[1]);
+		return pairIterator('FormData', this, 'value', listPairs);
 	}
 
 	/** The [name, value] pairs, in order. */
 	entries() {
-		return this._list.map((pair) => [pair[0], pair[1]]);
+		return pairIterator('FormData', this, 'pair', listPairs);
 	}
 
 	[Symbol.iterator]() {
-		return this.entries()[Symbol.iterator]();
+		return this.entries();
 	}
 
 	get [Symbol.toStringTag]() {
 		return TAG;
 	}
 }
+
+defineInterface(FormData, 'FormData', { iterable: true });

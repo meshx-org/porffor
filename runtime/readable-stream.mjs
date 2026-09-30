@@ -1,24 +1,41 @@
 // ReadableStream for a Porffor-compiled guest (Porffor has none): the Streams standard's
-// default stream, in plain JS. Underlying sources with start / pull / cancel, a
-// high-water mark counted in chunks, and a default reader. Not here: byte streams
-// (type: 'bytes') and BYOB readers, and `for await` over the
-// stream itself (Porffor's for await takes only its own iterables): read with
-// getReader(), or `for await (const chunk of stream.values())`.
+// default stream, in plain JS. Underlying sources with start / pull / cancel, a queuing
+// strategy (a high-water mark, counted in chunks or in what its size() gives), its
+// ReadableStreamDefaultController, and a default reader. Byte streams (type: 'bytes') and
+// BYOB readers are ./readable-byte-stream.mjs, compiled in only when a program names one of
+// its classes; without it a byte stream is a default one. Not here: `for await` over the
+// stream itself (Porffor's for await takes only its own iterables): read with getReader(),
+// or `for await (const chunk of stream.values())`.
 //
 // The build injects this module (esbuild `inject`) into every guest, like ./abort.mjs.
 
-import { pipe } from './pipe.mjs';
 import { ReadableStreamDefaultReader } from './readable-stream-reader.mjs';
-import { cancel, deferred, setUp } from './stream-internals.mjs';
+import {
+	ReadableStreamDefaultController,
+	byteStreams,
+	canCloseOrEnqueue,
+	cancel,
+	deferred,
+	enqueue,
+	error as errorStream,
+	readRequest,
+	requestClose,
+	setUp,
+	sourceAlgorithms
+} from './stream-internals.mjs';
+import { callback, isDictionary, isOptionalObject, react } from './stream-queue.mjs';
 import { structuredClone } from './structured-clone.mjs';
 
-export { ReadableStreamDefaultReader };
+export { ReadableStreamDefaultController, ReadableStreamDefaultReader };
 
-/** An outcome nobody needs to see (a pipeThrough's failure shows on its readable side). */
+/** An outcome nobody needs to see. */
 const ignore = () => undefined;
 
-/** Whether a branch can still take a chunk or be closed (neither closing nor ended). */
-const open = (stream) => stream._state === 'readable' && !stream._closeRequested;
+/** Async iteration (./readable-stream-iteration.mjs) is not in this program. */
+const iterationMissing = () =>
+	new TypeError(
+		'ReadableStream: async iteration and ReadableStream.from come with a program that iterates a stream (for await, values(), ReadableStream.from)'
+	);
 
 /**
  * ReadableStreamDefaultTee (https://streams.spec.whatwg.org/#readable-stream-default-tee): one
@@ -33,14 +50,17 @@ const open = (stream) => stream._state === 'readable' && !stream._closeRequested
  * @param {boolean} [cloneForBranch2]
  */
 export function tee(stream, cloneForBranch2 = false) {
-	const reader = stream.getReader();
-	const controllers = [];
+	const reader = new ReadableStreamDefaultReader(stream);
 	const canceled = [false, false];
 	const reasons = [undefined, undefined];
 	const cancelled = deferred();
+	const branches = [];
 	let reading = false;
 	let readAgain = false;
 
+	const enqueueBranch = (index, chunk) => {
+		if (!canceled[index] && canCloseOrEnqueue(branches[index])) enqueue(branches[index], chunk);
+	};
 	const pull = () => {
 		if (reading) {
 			readAgain = true;
@@ -48,68 +68,72 @@ export function tee(stream, cloneForBranch2 = false) {
 			return Promise.resolve();
 		}
 		reading = true;
-		reader.read().then(
-			({ value, done }) => {
+		readRequest(stream, {
+			resolve({ value, done }) {
 				if (done) {
 					reading = false;
 
 					for (let index = 0; index < 2; index++)
-						if (!canceled[index] && open(branches[index])) controllers[index].close();
+						if (!canceled[index] && canCloseOrEnqueue(branches[index]))
+							requestClose(branches[index]);
 
 					if (!canceled[0] || !canceled[1]) cancelled.resolve();
 
 					return;
 				}
-				readAgain = false;
-				const chunks = [value, value];
+				// a microtask later, so a read in a branch never runs inside the source's enqueue()
+				react(Promise.resolve(), () => {
+					readAgain = false;
+					let second = value;
 
-				if (cloneForBranch2 && !canceled[1]) {
-					try {
-						chunks[1] = structuredClone(value);
-					} catch (cloneError) {
-						for (const controller of controllers) controller.error(cloneError);
-						cancelled.resolve(cancel(stream, cloneError));
+					if (cloneForBranch2 && !canceled[1]) {
+						try {
+							second = structuredClone(value);
+						} catch (cloneError) {
+							errorStream(branches[0], cloneError);
+							errorStream(branches[1], cloneError);
+							cancelled.resolve(cancel(stream, cloneError));
 
-						return;
+							return;
+						}
 					}
-				}
+					enqueueBranch(0, value);
+					enqueueBranch(1, second);
+					reading = false;
 
-				for (let index = 0; index < 2; index++)
-					if (!canceled[index] && open(branches[index])) controllers[index].enqueue(chunks[index]);
-				reading = false;
-
-				if (readAgain) pull();
+					if (readAgain) pull();
+				});
 			},
-			() => {
-				// the error reaches the branches through closed, below
+			reject() {
 				reading = false;
 			}
-		);
+		});
 
 		return Promise.resolve();
 	};
-	// read by the algorithms below only once tee has returned (start runs first, and pull
-	// after start's promise settles)
-	let branches;
 	const branch = (index) =>
-		new ReadableStream({
-			start(controller) {
-				controllers[index] = controller;
+		createReadable(
+			{
+				source: undefined,
+				start: undefined,
+				pull,
+				cancel(reason) {
+					canceled[index] = true;
+					reasons[index] = reason;
+
+					if (canceled[1 - index]) cancelled.resolve(cancel(stream, [...reasons]));
+
+					return cancelled.promise;
+				}
 			},
-			pull,
-			cancel(reason) {
-				canceled[index] = true;
-				reasons[index] = reason;
+			1,
+			undefined
+		);
 
-				if (canceled[1 - index]) cancelled.resolve(cancel(stream, [...reasons]));
-
-				return cancelled.promise;
-			}
-		});
-	branches = [branch(0), branch(1)];
-
-	reader.closed.then(ignore, (reason) => {
-		for (const controller of controllers) controller.error(reason);
+	branches.push(branch(0), branch(1));
+	react(reader._closed.promise, ignore, (reason) => {
+		errorStream(branches[0], reason);
+		errorStream(branches[1], reason);
 
 		if (!canceled[0] || !canceled[1]) cancelled.resolve();
 	});
@@ -117,18 +141,76 @@ export function tee(stream, cloneForBranch2 = false) {
 	return branches;
 }
 
+/** What createReadable hands the constructor (a token no program has). */
+const creation = { algorithms: undefined, hwm: 0, size: undefined, bytes: false };
+
+/**
+ * CreateReadableStream: a default ReadableStream (a byte stream with `bytes`, as
+ * CreateReadableByteStream makes) run by `algorithms` ({ start, pull, cancel }, as
+ * sourceAlgorithms gives them) rather than an underlying source, as a TransformStream's
+ * readable side is.
+ */
+export function createReadable(algorithms, hwm, size, bytes = false) {
+	creation.bytes = bytes;
+	creation.algorithms = algorithms;
+	creation.hwm = hwm;
+	creation.size = size;
+
+	return new ReadableStream(creation);
+}
+
 /** A stream of chunks pulled from an underlying source. */
 export class ReadableStream {
 	/**
-	 * @param {{ start?, pull?, cancel? }} [source] called with the controller
-	 *   ({ enqueue, close, error, desiredSize }); pull when a read or the high-water mark
-	 *   wants a chunk, never twice at once
-	 * @param {{ highWaterMark?: number }} [strategy] how many chunks to queue ahead (1)
+	 * @param {{ start?, pull?, cancel?, type?, autoAllocateChunkSize? }} [source] called with
+	 *   the controller (a ReadableStreamDefaultController: enqueue, close, error,
+	 *   desiredSize); pull when a read or the high-water mark wants a chunk, never twice at
+	 *   once. type: 'bytes' makes a byte stream (a ReadableByteStreamController)
+	 * @param {{ highWaterMark?: number, size?: (chunk) => number }} [strategy] how much to
+	 *   queue ahead (1 chunk; 0 bytes for a byte stream), measured by size (1 per chunk)
 	 */
-	constructor(source, strategy) {
-		const hwm = strategy?.highWaterMark;
+	constructor(source = undefined, strategy = undefined) {
+		// CreateReadableStream's (below): a stream run by algorithms, not a source
+		if (source === creation) {
+			if (creation.bytes) byteStreams.setUp(this, creation.algorithms, creation.hwm);
+			else setUp(this, creation.algorithms, creation.hwm, creation.size);
 
-		setUp(this, source ?? {}, hwm === undefined ? 1 : Number(hwm));
+			return;
+		}
+
+		if (!isOptionalObject(source))
+			throw new TypeError('ReadableStream: the source must be an object');
+		// WebIDL converts the strategy argument before the constructor reads the source
+		if (!isDictionary(strategy))
+			throw new TypeError('ReadableStream: the strategy must be an object');
+		const rawHwm = strategy?.highWaterMark;
+		// unary +, not Number(): Porffor's Number(undefined) is 0, not NaN
+		const givenHwm = rawHwm === undefined ? undefined : +rawHwm;
+		const size = callback(strategy ?? {}, 'size', 'ReadableStream');
+		const algorithms = sourceAlgorithms(source);
+		const bytes = algorithms.type === 'bytes';
+
+		if (bytes && size !== undefined)
+			throw new RangeError('ReadableStream: a byte stream cannot have a size function');
+		const hwm = givenHwm === undefined ? (bytes ? 0 : 1) : givenHwm;
+
+		if (hwm !== hwm || hwm < 0) throw new RangeError('ReadableStream: invalid highWaterMark');
+
+		// a program that never names the byte stream's classes does not have them: its byte
+		// streams are default ones, which take the same chunks (and have no byobRequest)
+		if (bytes && byteStreams.setUp !== undefined) byteStreams.setUp(this, algorithms, hwm);
+		else setUp(this, algorithms, hwm, size);
+	}
+
+	/**
+	 * A stream of what an async iterable (or an iterable) gives: pulled one at a time, and
+	 * the iterator's return() called when the stream is cancelled.
+	 * @param {AsyncIterable | Iterable} asyncIterable
+	 */
+	static from(asyncIterable) {
+		if (byteStreams.from === undefined) throw iterationMissing();
+
+		return byteStreams.from(asyncIterable);
 	}
 
 	/** Whether a reader holds it. */
@@ -137,39 +219,38 @@ export class ReadableStream {
 	}
 
 	/** Locks it to a new reader. */
-	getReader(options) {
-		if (options?.mode !== undefined)
-			throw new TypeError('ReadableStream.getReader: only the default reader is supported');
+	getReader(options = undefined) {
+		if (!isDictionary(options))
+			throw new TypeError('ReadableStream.getReader: the options must be an object');
+		const mode = options?.mode;
 
-		return new ReadableStreamDefaultReader(this);
+		if (mode === undefined) return new ReadableStreamDefaultReader(this);
+
+		if (String(mode) !== 'byob')
+			throw new TypeError('ReadableStream.getReader: the mode must be byob or undefined');
+
+		if (byteStreams.reader === undefined)
+			throw new TypeError(
+				'ReadableStream.getReader: BYOB readers need the byte streams, which a program has when it names ReadableStreamBYOBReader or ReadableByteStreamController'
+			);
+
+		return byteStreams.reader(this);
 	}
 
 	/**
-	 * Its chunks as an async generator, for `for await (const chunk of stream.values())`:
-	 * Porffor's for await takes its own generators but not the async iterator protocol,
-	 * so `for await (const chunk of stream)` does not work. Leaving the loop early
-	 * cancels the stream.
+	 * Its chunks as an async iterator, for `for await (const chunk of stream.values())` (or
+	 * of the stream itself, whose @@asyncIterator ./readable-stream-iteration.mjs adds: a
+	 * symbol-keyed method costs every program with a stream some 16 KB): leaving the loop
+	 * early cancels the stream, unless preventCancel.
+	 * @param {{ preventCancel?: boolean }} [options]
 	 */
-	async *values() {
-		const reader = this.getReader();
-		let finished = false;
+	values(options = undefined) {
+		if (!isDictionary(options))
+			throw new TypeError('ReadableStream.values: the options must be an object');
 
-		try {
-			while (true) {
-				const { value, done } = await reader.read();
+		if (byteStreams.iterate === undefined) throw iterationMissing();
 
-				if (done) {
-					finished = true;
-
-					return;
-				}
-
-				yield value;
-			}
-		} finally {
-			if (!finished) await reader.cancel();
-			reader.releaseLock();
-		}
+		return byteStreams.iterate(this, Boolean(options?.preventCancel));
 	}
 
 	/**
@@ -178,18 +259,23 @@ export class ReadableStream {
 	 * @param {WritableStream} destination
 	 * @param {{ preventClose?, preventAbort?, preventCancel?, signal? }} [options]
 	 */
-	pipeTo(destination, options) {
-		return pipe(this, destination, options ?? {});
+	pipeTo(destination, options = undefined) {
+		// only a program with WritableStream has a destination to pipe to (and the pipe)
+		if (byteStreams.pipe === undefined)
+			return Promise.reject(new TypeError('ReadableStream.pipeTo: not a WritableStream'));
+
+		return byteStreams.pipe(this, destination, options, false);
 	}
 
 	/**
 	 * Pipes it through a transform ({ writable, readable }, a TransformStream or one of
 	 * its kind) and returns the transform's readable side.
 	 */
-	pipeThrough(transform, options) {
-		pipe(this, transform.writable, options ?? {}).then(ignore, ignore);
+	pipeThrough(transform, options = undefined) {
+		if (byteStreams.pipe === undefined)
+			throw new TypeError('ReadableStream.pipeThrough: the writable side is not a WritableStream');
 
-		return transform.readable;
+		return byteStreams.pipe(this, transform, options, true);
 	}
 
 	/**
@@ -198,11 +284,13 @@ export class ReadableStream {
 	 * @returns {[ReadableStream, ReadableStream]}
 	 */
 	tee() {
+		if (this._bytes !== undefined && byteStreams.tee !== undefined) return byteStreams.tee(this);
+
 		return tee(this);
 	}
 
 	/** Cancels it (when no reader holds it), telling its source why. */
-	cancel(reason) {
+	cancel(reason = undefined) {
 		if (this._reader !== undefined)
 			return Promise.reject(new TypeError('ReadableStream.cancel: the stream is locked'));
 

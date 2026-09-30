@@ -1,12 +1,14 @@
 // The Intl namespace (ECMA-402) over meshx:intl, the platform's locale interface: the host
 // has the locale data (a browser's or Node's own Intl, ICU4X natively), the guest carries
-// none. Injected into guests whose world includes meshx:intl/imports.
+// none. Injected into guests whose world includes meshx:intl/imports. Its interfaces are
+// porffor:intl/* (the world's imports on WASI, runtime/host/wasi/intl; natively ICU4X linked
+// into the program, runtime/host/native/intl over runtime/intl's C ABI).
 //
 // Not here yet: Intl.RelativeTimeFormat, DisplayNames, Segmenter, DurationFormat; and
 // the prototype methods that reach Intl (toLocaleString, localeCompare, normalize),
 // which are Porffor's builtins.
 
-import { canonicalize, supportedValues } from 'meshx:intl/locale@0.1.0';
+import { canonicalize, supportedValues } from 'porffor:intl/locale';
 import { Collator } from './intl-collator.mjs';
 import { DateTimeFormat } from './intl-date-time-format.mjs';
 import { ListFormat } from './intl-list-format.mjs';

@@ -4,6 +4,8 @@
 // URLSearchParams uses. Code points are numbers; strings are walked by index, never with
 // for...of (Porffor's for...of over a string yields UTF-16 units, not code points).
 
+import { utf8Decoder, utf8Encoder } from './utf8.mjs';
+
 /** An input string as code points: lone surrogates become U+FFFD (a USVString). */
 export function codePoints(input) {
 	const out = [];
@@ -37,7 +39,8 @@ export function fromCodePoints(points) {
 
 /** A string as a USVString: lone surrogates replaced by U+FFFD. */
 export function toUSVString(value) {
-	return fromCodePoints(codePoints(String(value)));
+	// (a template, not String(): a symbol throws, as WebIDL's conversion does)
+	return fromCodePoints(codePoints(`${value}`));
 }
 
 export const isAsciiDigit = (cp) => cp >= 0x30 && cp <= 0x39;
@@ -72,8 +75,10 @@ export const FORM = (cp) =>
 	COMPONENT(cp) || cp === 0x21 || (cp >= 0x27 && cp <= 0x29) || cp === 0x7e;
 
 const HEX = '0123456789ABCDEF';
-const encoder = /* @__PURE__ */ new TextEncoder();
-const decoder = /* @__PURE__ */ new TextDecoder();
+// (Porffor's own codecs: the globals may be the runtime's, not yet run when this module is)
+const encoder = /* @__PURE__ */ utf8Encoder();
+// UTF-8 decode without BOM: a leading U+FEFF is kept (a BOM in a query is data)
+const decoder = /* @__PURE__ */ utf8Decoder({ ignoreBOM: true });
 
 /** The code point, UTF-8 percent-encoded where `inSet` says. */
 export function percentEncode(cp, inSet, spaceAsPlus = false) {

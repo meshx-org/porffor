@@ -1,7 +1,7 @@
 // Intl.PluralRules over meshx:intl/plural.
 
-import { supportedLocales } from 'meshx:intl/locale@0.1.0';
-import { PluralRules as HostPluralRules } from 'meshx:intl/plural@0.1.0';
+import { supportedLocales } from 'porffor:intl/locale';
+import { PluralRules as HostPluralRules } from 'porffor:intl/plural';
 import {
 	LOCALE_MATCHERS,
 	ROUNDING_ENUMS,

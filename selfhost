@@ -600,6 +600,14 @@ const requireBuiltSelfhost = () => {
   }
 };
 
+// the selfhosted compiler's own node:fs and node:child_process run on libuv (runtime/host/native),
+// as a native build with the runtime does: the runtime's libraries' headers, and their archives
+// (built once) linked
+const runtimeDepArgs = async () => {
+  const { runtimeDeps } = await import('./compiler/deps.js');
+  return runtimeDeps();
+};
+
 const compileSelfhost = async opts => {
   const start = performance.now();
   const transient = !opts.verbose && process.stdout.isTTY;
@@ -616,12 +624,13 @@ const compileSelfhost = async opts => {
   }
   await runCompileStep('compiled selfhost bundle to C', nodePorf[0], [ ...nodePorf.slice(1), 'c', '--compress-data', ...hostPorfDebugArgs(opts), '--profile-compiler', bundle, '-o', stage1C ]);
   const compiler = compilerArgs(opts);
+  const deps = await runtimeDepArgs();
   const releaseCodegenArgs = opts.release ? [ '-mllvm', '-force-attribute=porf_strict_eq:noinline' ] : [];
   if (opts.release) {
     fs.rmSync(pgoRaw, { force: true });
     await runCompileStep('compiled PGO training binary', compiler[0], [
       ...compiler.slice(1),
-      stage1C, '-o', pgoCompiler, '-lm',
+      ...deps.include, stage1C, '-o', pgoCompiler, '-lm', ...deps.link,
       ...(process.platform === 'darwin' && !isTinyCC(compiler) ? [ '-Wl,-stack_size,0x4000000' ] : []),
       '-O0',
       `-fprofile-instr-generate=${pgoRaw}`
@@ -632,7 +641,7 @@ const compileSelfhost = async opts => {
   }
   await runCompileStep(opts.release ? 'compiled release binary' : 'compiled selfhost binary', compiler[0], [
     ...compiler.slice(1),
-    stage1C, '-o', porf, '-lm',
+    ...deps.include, stage1C, '-o', porf, '-lm', ...deps.link,
     ...(process.platform === 'darwin' && !isTinyCC(compiler) ? [ '-Wl,-stack_size,0x4000000' ] : []),
     ...releaseStripArgs(compiler, opts),
     ...releaseCodegenArgs,

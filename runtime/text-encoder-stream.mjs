@@ -1,7 +1,10 @@
-// TextEncoderStream for a Porffor-compiled guest: strings in, UTF-8 bytes out. A
-// surrogate pair split across two chunks is held back and encoded whole. Injected into
-// every guest.
+// TextEncoderStream (https://encoding.spec.whatwg.org/#interface-textencoderstream) for a
+// Porffor-compiled program: strings in, UTF-8 bytes out. A surrogate pair split across two
+// chunks is held back and encoded whole; a chunk that will not convert to a string errors the
+// stream.
 
+import { defineInterface } from './webidl.mjs';
+import { TextEncoder } from './text-encoder.mjs';
 import { TransformStream } from './transform-stream.mjs';
 
 /** Whether a UTF-16 unit is the first half of a surrogate pair. */
@@ -9,13 +12,15 @@ const isHighSurrogate = (unit) => unit >= 0xd800 && unit <= 0xdbff;
 
 /** Encodes a stream of strings into a stream of Uint8Arrays (UTF-8). */
 export class TextEncoderStream {
+	#stream;
+
 	constructor() {
 		const encoder = new TextEncoder();
 		let pending = '';
 
-		const stream = new TransformStream({
+		this.#stream = new TransformStream({
 			transform(chunk, controller) {
-				let text = pending + String(chunk);
+				let text = pending + `${chunk}`;
 
 				pending = '';
 
@@ -31,24 +36,22 @@ export class TextEncoderStream {
 				if (pending !== '') controller.enqueue(encoder.encode(pending));
 			}
 		});
-
-		this._encoding = 'utf-8';
-		this._readable = stream.readable;
-		this._writable = stream.writable;
 	}
 
 	/** Always 'utf-8'. */
 	get encoding() {
-		return this._encoding;
+		return this.#stream ? 'utf-8' : '';
 	}
 
 	/** The side bytes come out of. */
 	get readable() {
-		return this._readable;
+		return this.#stream.readable;
 	}
 
 	/** The side strings go into. */
 	get writable() {
-		return this._writable;
+		return this.#stream.writable;
 	}
 }
+
+defineInterface(TextEncoderStream, 'TextEncoderStream');

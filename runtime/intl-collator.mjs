@@ -1,7 +1,7 @@
 // Intl.Collator over meshx:intl/text.
 
-import { supportedLocales } from 'meshx:intl/locale@0.1.0';
-import { Collator as HostCollator } from 'meshx:intl/text@0.1.0';
+import { supportedLocales } from 'porffor:intl/locale';
+import { Collator as HostCollator } from 'porffor:intl/text';
 import {
 	LOCALE_MATCHERS,
 	boolOption,
@@ -59,15 +59,14 @@ export class Collator {
 
 	resolvedOptions() {
 		const resolved = this._host.resolvedOptions();
-		const out = resolvedFields({ locale: resolved.locale }, resolved.options, RESOLVED_ORDER, [
+		// the collation in its place among the options, as ECMA-402 orders them
+		const options = Object.assign({}, resolved.options, { collation: resolved.collation });
+
+		return resolvedFields({ locale: resolved.locale }, options, RESOLVED_ORDER, [
 			'usage',
 			'sensitivity',
 			'caseFirst'
 		]);
-
-		out.collation = resolved.collation;
-
-		return out;
 	}
 
 	static supportedLocalesOf(locales) {

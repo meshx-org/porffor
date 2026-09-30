@@ -12,7 +12,7 @@ export class Event {
 	 * @param {string} type
 	 * @param {{ bubbles?: boolean, cancelable?: boolean, composed?: boolean }} [init]
 	 */
-	constructor(type, init) {
+	constructor(type, init = undefined) {
 		if (type === undefined) throw new TypeError('Event: the type is required');
 		this._type = String(type);
 		this._bubbles = Boolean(init?.bubbles);
@@ -89,6 +89,18 @@ export class Event {
 	/** The targets the event passes through: its current target while it is dispatched. */
 	composedPath() {
 		return this._dispatching && this._phase === AT_TARGET ? [this._currentTarget] : [];
+	}
+
+	/** Legacy: re-initializes an event not being dispatched (a constructor's init, as arguments). */
+	initEvent(type, bubbles = false, cancelable = false) {
+		if (this._dispatching) return;
+		this._type = `${type}`;
+		this._bubbles = Boolean(bubbles);
+		this._cancelable = Boolean(cancelable);
+		this._target = null;
+		this._canceled = false;
+		this._stopped = false;
+		this._stoppedImmediately = false;
 	}
 
 	stopPropagation() {

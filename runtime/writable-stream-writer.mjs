@@ -1,11 +1,15 @@
 // WritableStreamDefaultWriter for a Porffor-compiled guest: the way to write into a
 // WritableStream, with ready for backpressure.
 
-import { deferred } from './stream-internals.mjs';
-import { abort, close, desiredSize, write } from './writable-internals.mjs';
-
-/** An outcome nobody needs to see. */
-const ignore = () => undefined;
+import {
+	abort,
+	close,
+	closeQueuedOrInFlight,
+	releaseWriter,
+	setUpWriter,
+	writerDesiredSize,
+	writerWrite
+} from './writable-internals.mjs';
 
 const released = () => new TypeError('WritableStreamDefaultWriter: the writer was released');
 
@@ -13,15 +17,9 @@ const released = () => new TypeError('WritableStreamDefaultWriter: the writer wa
 export class WritableStreamDefaultWriter {
 	/** @param {WritableStream} stream */
 	constructor(stream) {
-		if (stream._writer !== undefined)
-			throw new TypeError('WritableStreamDefaultWriter: the stream is locked to another writer');
-		this._stream = stream;
-		this._closed = deferred();
-		this._closed.promise.then(ignore, ignore);
-		stream._writer = this;
-
-		if (stream._state === 'closed') this._closed.resolve();
-		else if (stream._state === 'errored') this._closed.reject(stream._storedError);
+		if (stream === null || typeof stream !== 'object' || stream._controller === undefined)
+			throw new TypeError('WritableStreamDefaultWriter: not a WritableStream');
+		setUpWriter(this, stream);
 	}
 
 	/** Resolves when the stream closes; rejects when it errors or the writer is released. */
@@ -31,39 +29,40 @@ export class WritableStreamDefaultWriter {
 
 	/** Resolves when the stream wants more (backpressure has eased). */
 	get ready() {
-		return this._stream === undefined ? Promise.reject(released()) : this._stream._ready.promise;
+		return this._ready.promise;
 	}
 
 	/** How many more chunks the stream wants before backpressure; null once errored. */
 	get desiredSize() {
 		if (this._stream === undefined) throw released();
 
-		return desiredSize(this._stream);
+		return writerDesiredSize(this._stream);
 	}
 
 	/** Writes a chunk; resolves once the sink has taken it. */
-	write(chunk) {
-		return this._stream === undefined ? Promise.reject(released()) : write(this._stream, chunk);
+	write(chunk = undefined) {
+		return this._stream === undefined ? Promise.reject(released()) : writerWrite(this, chunk);
 	}
 
 	/** Closes after the queued writes; resolves once the sink has closed. */
 	close() {
-		return this._stream === undefined ? Promise.reject(released()) : close(this._stream);
+		const stream = this._stream;
+
+		if (stream === undefined) return Promise.reject(released());
+
+		if (closeQueuedOrInFlight(stream))
+			return Promise.reject(new TypeError('WritableStreamDefaultWriter: already closing'));
+
+		return close(stream);
 	}
 
 	/** Aborts the stream, dropping queued writes and telling the sink why. */
-	abort(reason) {
+	abort(reason = undefined) {
 		return this._stream === undefined ? Promise.reject(released()) : abort(this._stream, reason);
 	}
 
 	/** Unlocks the stream; another writer may take it. */
 	releaseLock() {
-		const stream = this._stream;
-
-		if (stream === undefined) return;
-
-		if (stream._state === 'writable') this._closed.reject(released());
-		stream._writer = undefined;
-		this._stream = undefined;
+		if (this._stream !== undefined) releaseWriter(this);
 	}
 }

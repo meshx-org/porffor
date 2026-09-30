@@ -1,13 +1,11 @@
-// scheduler.yield, setImmediate and requestIdleCallback for a Porffor-compiled guest,
-// over the glue's yields (rtYield): an async export's loop gives the host a turn
-// (the component model's thread.yield) before it settles them, so a long computation
-// that awaits scheduler.yield() now and then lets the host run meanwhile. In a sync
-// export the host cannot get a turn; a yield settles once the microtasks have run.
-//
-// The build injects this module (esbuild `inject`) into guests whose world has async
-// functions (the async runtime is what settles yields).
+// scheduler.yield and requestIdleCallback, over the platform's yields (porffor:async's
+// rtYield). In a WASI build an async export's loop gives the host a turn (the component model's
+// thread.yield) before it settles them, so a long computation that awaits scheduler.yield() now
+// and then lets the host run meanwhile; in a sync export the host cannot get a turn, and a yield
+// settles once the microtasks have run. Natively a yield settles in libuv's check phase, after
+// the loop's I/O.
 
-import { rtYield } from 'rt-async';
+import { rtYield } from 'porffor:async';
 
 /** How long an idle callback may run, in milliseconds, as browsers budget it. */
 const IDLE_BUDGET_MS = 50;
@@ -19,29 +17,9 @@ export const scheduler = {
 	}
 };
 
-/** Live immediates and idle callbacks: ids a clear has not removed. */
+/** Live idle callbacks: ids a cancel has not removed. */
 const live = /* @__PURE__ */ new Set();
 let nextId = 1;
-
-/**
- * Calls `callback(...args)` after the host has had a turn.
- * @returns {number} the id clearImmediate takes
- */
-export function setImmediate(callback, ...args) {
-	const id = nextId++;
-
-	live.add(id);
-	rtYield().then(() => {
-		if (live.delete(id)) callback(...args);
-	});
-
-	return id;
-}
-
-/** Cancels an immediate; an unknown id is ignored. */
-export function clearImmediate(id) {
-	live.delete(id);
-}
 
 /**
  * Calls `callback(deadline)` after the host has had a turn. There is no idle period to
@@ -65,4 +43,7 @@ export function requestIdleCallback(callback) {
 	return id;
 }
 
-export { clearImmediate as cancelIdleCallback };
+/** Cancels an idle callback; an unknown id is ignored. */
+export function cancelIdleCallback(id) {
+	live.delete(id);
+}

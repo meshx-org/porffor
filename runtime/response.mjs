@@ -1,15 +1,25 @@
 // Response (https://fetch.spec.whatwg.org/#response-class): constructed from a body
 // (string, bytes, URLSearchParams, a ReadableStream, or none) with status, statusText and
 // headers; Response.json / redirect / error; the body read once (./body.mjs), or cloned.
-// fetch() makes its responses over the host's (./http-body.mjs responseFromWasi).
+// fetch() makes its responses over the platform's (./fetch.mjs, porffor:http).
 //
 // Injected into every guest (tree-shaken away unless used).
 
 import { baseUrl } from './base-url.mjs';
 import { Blob } from './blob.mjs';
-import { bodyUsed, cloneBody, consumeBody, extractBody } from './body.mjs';
+import {
+	bodyUsed,
+	cloneBody,
+	consumeBody,
+	consumeFormData,
+	consumeTextStream,
+	extractBody,
+	keptBody,
+	listHas
+} from './body.mjs';
 import { Headers } from './headers.mjs';
 import { URL } from './url.mjs';
+import { defineInterface } from './webidl.mjs';
 
 /** Statuses a response may not have a body with. */
 const NULL_BODY = [101, 103, 204, 205, 304];
@@ -21,14 +31,18 @@ export class Response {
 	 * @param {string | ArrayBuffer | ArrayBufferView | URLSearchParams | ReadableStream | null} [body]
 	 * @param {{ status?: number, statusText?: string, headers?: object }} [init]
 	 */
-	constructor(body, init) {
+	constructor(body = null, init = undefined) {
 		const options = init ?? {};
 		const status = options.status === undefined ? 200 : Number(options.status);
 
 		if (!(status >= 200 && status <= 599) || !Number.isInteger(status))
 			throw new RangeError(`Response: status ${status} is outside 200 to 599`);
 		this._status = status;
-		this._statusText = options.statusText === undefined ? '' : String(options.statusText);
+		this._statusText = options.statusText === undefined ? '' : `${options.statusText}`;
+
+		// a reason-phrase: tabs, spaces and visible or obs-text bytes only
+		if (this._statusText !== '' && /[^\t\x20-\x7e\x80-\xff]/.test(this._statusText))
+			throw new TypeError(`Response: invalid statusText: ${this._statusText}`);
 		this._headers = new Headers(options.headers);
 		this._type = 'default';
 		this._url = '';
@@ -40,28 +54,31 @@ export class Response {
 				throw new TypeError(`Response: a ${status} response cannot have a body`);
 			const extracted = extractBody(body);
 
-			this._body = { stream: extracted.stream };
+			this._body = keptBody(extracted);
 
-			if (extracted.type !== null && !this.headers.has('content-type'))
-				this.headers.set('content-type', extracted.type);
+			// (the type is a valid value: added without Headers' checks)
+			if (extracted.type !== null && !listHas(this._headers._list, 'content-type'))
+				this._headers._list.push(['content-type', extracted.type]);
 		}
 	}
 
 	/** A JSON response: the data serialized, content-type application/json. */
-	static json(data, init) {
+	static json(data, init = undefined) {
 		const text = JSON.stringify(data);
 
 		if (text === undefined) throw new TypeError('Response.json: the data cannot be serialized');
 		const response = new Response(text, init);
 
-		if (!new Headers(init?.headers).has('content-type'))
-			response.headers.set('content-type', 'application/json');
+		// the type the text implied, unless init gave one
+		if (init?.headers === undefined || !new Headers(init.headers).has('content-type'))
+			for (const pair of response._headers._list)
+				if (pair[0] === 'content-type') pair[1] = 'application/json';
 
 		return response;
 	}
 
 	/** A redirect to the URL (a 302 unless a redirect status is given). */
-	static redirect(url, status) {
+	static redirect(url, status = undefined) {
 		const code = status === undefined ? 302 : Number(status);
 
 		if (!REDIRECTS.includes(code))
@@ -144,6 +161,16 @@ export class Response {
 		return JSON.parse(await this.text());
 	}
 
+	/** The body as a stream of the strings its UTF-8 decodes to. */
+	textStream() {
+		return consumeTextStream(this);
+	}
+
+	/** The body as a FormData (multipart/form-data or application/x-www-form-urlencoded). */
+	async formData() {
+		return consumeFormData(this);
+	}
+
 	/** A copy, with the body split between the two. */
 	clone() {
 		const copy = new Response(null, {
@@ -162,3 +189,7 @@ export class Response {
 		return copy;
 	}
 }
+
+defineInterface(Response, 'Response', {
+	promises: ['arrayBuffer', 'blob', 'bytes', 'formData', 'json', 'text']
+});

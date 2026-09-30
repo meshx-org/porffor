@@ -8,7 +8,6 @@ const noopPrecompiled = process.env.SELFHOST_NOOP_PRECOMPILED === '1';
 
 // Node's modules the compiler imports come from Porffor's JS runtime (runtime/node), as a
 // program's do; node:repl is the selfhosted REPL's own
-const NODE_MODULES = new Set([ 'fs', 'child_process', 'path', 'os' ]);
 
 const shims = new Map([
   [ 'node:repl', `export function REPLServer(options = {}) {
@@ -135,7 +134,10 @@ const commentRanges = source => {
 };
 
 const resolveImport = (from, spec) => {
-  if (spec.startsWith('node:') && NODE_MODULES.has(spec.slice(5))) return path.join(root, 'runtime/node', spec.slice(5) + '.mjs');
+  // Node's modules the runtime has (runtime/node), and the platform layer it is written against:
+  // the selfhosted compiler is native (libuv)
+  if (spec.startsWith('node:') && fs.existsSync(path.join(root, 'runtime/node', spec.slice(5) + '.mjs'))) return path.join(root, 'runtime/node', spec.slice(5) + '.mjs');
+  if (spec.startsWith('porffor:')) return path.join(root, 'runtime/host/native', spec.slice(8) + '.mjs');
   if (spec === 'node:repl') return spec;
   if (!spec.startsWith('.') && !spec.startsWith('/')) return spec;
 
@@ -155,55 +157,29 @@ const load = file => {
     source = source.replace(`const fs = (typeof process?.version !== 'undefined' ? (await import('node:fs')) : undefined);`, `const fs = globalThis.__porfforNode.fs;`);
   }
   if (file.endsWith('/compiler/modules.js')) {
-    // no import.meta selfhosted: the runtime's modules node:fs and the rest resolve to, embedded
+    // no import.meta selfhosted: the runtime's modules, embedded
     const runtimeFiles = {};
-    for (const dir of [ 'node', 'host/native' ]) {
-      for (const name of fs.readdirSync(path.join(root, 'runtime', dir)).filter(x => x.endsWith('.mjs')).sort()) {
-        runtimeFiles[`${dir}/${name}`] = fs.readFileSync(path.join(root, 'runtime', dir, name), 'utf8');
+    // every module of the runtime's but WASI's platform layer (runtime/host/wasi), and its globals'
+    // manifest; its C (runtime/c) and Rust (runtime/intl) stay on disk
+    const embed = dir => {
+      for (const entry of fs.readdirSync(path.join(root, 'runtime', dir), { withFileTypes: true }).sort((a, b) => a.name < b.name ? -1 : 1)) {
+        const rel = dir ? `${dir}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          if (rel !== 'c' && rel !== 'intl' && rel !== 'host/wasi') embed(rel);
+        } else if (entry.name.endsWith('.mjs') || rel === 'globals.json') runtimeFiles[rel] = fs.readFileSync(path.join(root, 'runtime', rel), 'utf8');
       }
-    }
+    };
+    embed('');
     const replaced = source.replace(`const RUNTIME_FILES = null, RUNTIME_DIR = fs ? import.meta.dirname + '/../runtime' : null;`,
-      `const RUNTIME_FILES = ${JSON.stringify(runtimeFiles)}, RUNTIME_DIR = null;`);
+      // its C is read from disk: runtime/ beside the binary (selfhosted/porf), or PORFFOR_RUNTIME.
+      // (A function, as for the other rewrites: in a replacement string, the files' $' and $& are patterns)
+      () => `const RUNTIME_FILES = ${JSON.stringify(runtimeFiles)}, RUNTIME_DIR = process.env.PORFFOR_RUNTIME ?? process.argv[0].slice(0, process.argv[0].lastIndexOf('/') + 1) + '../runtime';`);
     if (replaced === source) throw new Error('selfhost runtime files rewrite failed');
     source = replaced;
   }
   if (file.endsWith('/compiler/index.js')) {
     source = source.replace(`const { execSync } = (typeof process?.version !== 'undefined' ? (await import('node:child_process')) : {});`, `const { execSync } = globalThis.__porfforNode.child_process;`);
-    source = `import * as uwebsockets from './uwebsockets.js';\n` + source;
-    source = source.replace(`const uwebsockets = (typeof process?.version !== 'undefined' ? (await import('./uwebsockets.js')) : undefined);`, ``);
     source = source.replace(`outFile ??= file.split('/').at(-1).split('.')[0];`, `outFile ??= globalThis.file.split('/').at(-1).split('.')[0];`);
-  }
-
-  if (file.endsWith('/compiler/uwebsockets.js')) {
-    // no import.meta selfhosted: embed the patch files and materialize them into a
-    // content-keyed cache dir at runtime (same key as node-hosted patch hashing)
-    const patchDir = path.join(root, 'compiler/uwebsockets');
-    const patchData = {};
-    if (fs.existsSync(patchDir)) {
-      for (const f of fs.readdirSync(patchDir).filter(x => x.endsWith('.patch')).sort()) {
-        patchData[f] = fs.readFileSync(path.join(patchDir, f), 'latin1');
-      }
-    }
-    const replaced = source.replace(`const __dirname = import.meta.dirname;
-const UWS_PATCH_DIR = path.join(__dirname, 'uwebsockets');`, `const __porfforUwsPatchData = ${JSON.stringify(patchData)};
-const UWS_PATCH_DIR = (() => {
-  const dir = path.join(os.homedir(), '.cache', 'porffor', 'uws-patches');
-  fs.mkdirSync(dir, { recursive: true });
-  const names = Object.keys(__porfforUwsPatchData);
-  for (let i = 0; i < names.length; i++) {
-    fs.writeFileSync(path.join(dir, names[i]), __porfforUwsPatchData[names[i]]);
-  }
-  return dir;
-})();`);
-    if (replaced === source) throw new Error('selfhost uwebsockets patch-dir rewrite failed');
-    source = replaced;
-  }
-
-  if (file.endsWith('/cli/native-fetch.js')) {
-    const replaced = source.replace(`const FETCH_GLOBALS = fs.readFileSync(new URL('./fetch-globals.js', import.meta.url), 'utf8');`,
-      `const FETCH_GLOBALS = ${JSON.stringify(fs.readFileSync(path.join(root, 'cli/fetch-globals.js'), 'utf8'))};`);
-    if (replaced === source) throw new Error('selfhost native-fetch globals rewrite failed');
-    source = replaced;
   }
 
   if (file.endsWith('/cli/repl.js')) {
@@ -237,13 +213,6 @@ import __porfforCompile from '../compiler/index.js';
   process.exit();`);
     if (rewritten === source) throw new Error('selfhost runtime repl rewrite failed');
     source = rewritten;
-    source = `import __porfforNativeFetch from './native-fetch.js';\n` + source;
-    const nativeFetch = source.replace(
-      `(await import('./native-fetch.js')).default(inputFile);`,
-      `__porfforNativeFetch(inputFile);`
-    );
-    if (nativeFetch === source) throw new Error('selfhost native-fetch rewrite failed');
-    source = nativeFetch;
   }
 
   return source;

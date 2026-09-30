@@ -1,7 +1,7 @@
-// Bodies for fetch() over wasi:http 0.3: a response body's stream<u8> as a
-// ReadableStream, and a request body (bytes or a ReadableStream) written into one.
-// Every wait on the host is a promise the glue's event loop settles; given a signal,
-// that wait is cancelled when it aborts.
+// Bodies over wasi:http 0.3, for the client (./http.mjs, porffor:http) and the server
+// (./http-server.mjs): an incoming body's stream<u8> as a ReadableStream, and an outgoing
+// body (bytes or a ReadableStream) written into one. Every wait on the host is a promise
+// the glue's event loop settles; given a signal, that wait is cancelled when it aborts.
 
 import {
 	stream_u8_read,
@@ -14,11 +14,7 @@ import {
 	rtCancel,
 	rtLastToken
 } from 'rt-async';
-import { Response as WasiResponse } from 'wasi:http/types@0.3.0';
-import { future_result_void_error_code_new } from 'rt-async';
-import { Headers } from './headers.mjs';
-import { ReadableStream } from './readable-stream.mjs';
-import { Response } from './response.mjs';
+import { ReadableStream } from '../../readable-stream.mjs';
 
 /** How many bytes one read asks the host for. */
 const CHUNK = 16_384;
@@ -177,35 +173,4 @@ export async function writeBody(writer, body, signal) {
 	} finally {
 		stream_u8_drop_writable(writer);
 	}
-}
-
-/**
- * A Response over the host's: status and headers at once, the body a ReadableStream read
- * from the host as it is read (responseBody).
- * @param {object} wasi the wasi:http response
- * @param {string} url the request's URL
- * @param {AbortSignal} [signal] the request's: aborting it also cancels a body read
- */
-export function responseFromWasi(wasi, url, signal) {
-	const decoder = new TextDecoder();
-	const response = new Response(null);
-
-	response._status = wasi.getStatusCode();
-	response._url = url;
-	// a response from the network, whose headers are what came back
-	response._type = 'basic';
-	response._headers = new Headers(
-		wasi
-			.getHeaders()
-			.copyAll()
-			.map((entry) => [entry[0], decoder.decode(entry[1])])
-	);
-	response._headers._guard = 'immutable';
-	// consume-body takes a future the guest completes when it is done with the body
-	const [doneReader, doneWriter] = future_result_void_error_code_new();
-	const [stream, trailers] = WasiResponse.consumeBody(wasi, doneReader);
-
-	response._body = { stream: responseBody(stream, trailers, doneWriter, signal) };
-
-	return response;
 }

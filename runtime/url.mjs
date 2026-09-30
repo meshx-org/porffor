@@ -15,8 +15,24 @@ import {
 	serializeURL
 } from './url-parser.mjs';
 import { URLSearchParams } from './url-search-params.mjs';
+import { defineInterface } from './webidl.mjs';
 
 export { URLSearchParams };
+
+/**
+ * The blob URL store (https://w3c.github.io/FileAPI/#BlobURLStore), plugged in by ./blob-url.mjs
+ * (loaded only for a program that names createObjectURL or revokeObjectURL): create makes a URL
+ * for a Blob, revoke forgets one, resolve finds a URL's Blob (Request and fetch). Kept on this
+ * function, not in a module binding (see ./webidl.mjs's interfaceRegistry).
+ * @returns {{ create: ((blob: unknown) => string) | null, revoke: ((url: string) => void) | null,
+ *   resolve: ((url: string) => import('./blob.mjs').Blob | null) | null }}
+ */
+export function blobUrlStore() {
+	if (blobUrlStore.state === undefined)
+		blobUrlStore.state = { create: null, revoke: null, resolve: null };
+
+	return blobUrlStore.state;
+}
 
 /** A URL record from a string and an optional base string; null on failure. */
 function parseWithBase(url, base) {
@@ -37,7 +53,7 @@ export class URL {
 	 * @param {string} url absolute, or relative to base
 	 * @param {string} [base]
 	 */
-	constructor(url, base) {
+	constructor(url, base = undefined) {
 		const record = parseWithBase(url, base);
 
 		if (record === null) throw new TypeError(`Invalid URL: ${String(url)}`);
@@ -48,13 +64,30 @@ export class URL {
 	}
 
 	/** Whether the string parses (against the base). */
-	static canParse(url, base) {
+	static canParse(url, base = undefined) {
 		return parseWithBase(url, base) !== null;
 	}
 
 	/** The URL, or null when the string does not parse. */
-	static parse(url, base) {
+	static parse(url, base = undefined) {
 		return parseWithBase(url, base) === null ? null : new URL(url, base);
+	}
+
+	/** A new blob: URL for a Blob (./blob-url.mjs). */
+	static createObjectURL(obj) {
+		const { create } = blobUrlStore();
+
+		if (create === null)
+			throw new TypeError('URL.createObjectURL: blob URLs are not available here');
+
+		return create(obj);
+	}
+
+	/** Forgets a blob: URL made by createObjectURL. */
+	static revokeObjectURL(url) {
+		const { revoke } = blobUrlStore();
+
+		if (revoke !== null) revoke(`${url}`);
 	}
 
 	/** Replaces this URL's record, keeping searchParams bound to it. */
@@ -206,3 +239,5 @@ export class URL {
 		return this.href;
 	}
 }
+
+defineInterface(URL, 'URL');

@@ -1,7 +1,7 @@
 // Intl.ListFormat over meshx:intl/list.
 
-import { ListFormat as HostListFormat } from 'meshx:intl/list@0.1.0';
-import { supportedLocales } from 'meshx:intl/locale@0.1.0';
+import { ListFormat as HostListFormat } from 'porffor:intl/list';
+import { supportedLocales } from 'porffor:intl/locale';
 import {
 	LOCALE_MATCHERS,
 	enumOption,

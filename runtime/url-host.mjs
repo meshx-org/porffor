@@ -3,13 +3,16 @@
 // hosts for non-special schemes. A host is kept serialized (a string); failure is null.
 //
 // Domain to ASCII is a subset of UTS #46: lowercasing (full Unicode, the fork's
-// toLowerCase), the ideographic full stops as dots, and punycode for non-ASCII labels.
-// Not here: UTS #46's mapping table (fullwidth letters, ß-style deviations, NFC), and its
-// validity checks, which would need the Unicode data tables that make this large.
+// toLowerCase), the mappings that take no table (the ignored code points dropped, fullwidth
+// ASCII and the mathematical alphanumerics to ASCII, the ideographic full stops and spaces to
+// their ASCII forms), the noncharacters and U+FFFD refused, and punycode for non-ASCII labels.
+// Not here: the rest of UTS #46's mapping table (ß-style deviations, NFC), and its validity
+// checks, which would need the Unicode data tables that make this large.
 
 import {
 	C0_CONTROL,
 	codePoints,
+	fromCodePoints,
 	isAsciiDigit,
 	isAsciiHexDigit,
 	percentDecode,
@@ -113,12 +116,60 @@ function punycode(points) {
 	return out;
 }
 
+/** Whether UTS #46 ignores a code point (maps it to nothing): soft hyphen, joiners, selectors. */
+const ignored = (cp) =>
+	cp === 0xad ||
+	cp === 0x34f ||
+	(cp >= 0x180b && cp <= 0x180f) ||
+	cp === 0x200b ||
+	cp === 0x2060 ||
+	cp === 0x2064 ||
+	(cp >= 0xfe00 && cp <= 0xfe0f) ||
+	cp === 0xfeff ||
+	(cp >= 0x1bca0 && cp <= 0x1bca3) ||
+	(cp >= 0xe0100 && cp <= 0xe01ef);
+
+/** Whether UTS #46 disallows a code point outright: U+FFFD and the noncharacters. */
+const disallowed = (cp) =>
+	cp === 0xfffd || (cp >= 0xfdd0 && cp <= 0xfdef) || (cp & 0xfffe) === 0xfffe;
+
+/** A code point as UTS #46 maps it, where that takes no table (-1: ignored). */
+function mapPoint(cp) {
+	if (ignored(cp)) return -1;
+
+	// the fullwidth forms of ASCII
+	if (cp >= 0xff01 && cp <= 0xff5e) return cp - 0xfee0;
+
+	// the ideographic and halfwidth full stops, the no-break and ideographic spaces
+	if (cp === 0x3002 || cp === 0xff61) return 0x2e;
+
+	if (cp === 0xa0 || cp === 0x3000) return 0x20;
+
+	// the mathematical alphanumeric symbols: 13 alphabets of A-Z a-z, 5 of the digits
+	if (cp >= 0x1d400 && cp <= 0x1d6a3) {
+		const letter = (cp - 0x1d400) % 52;
+
+		return letter < 26 ? 0x61 + letter : 0x61 + letter - 26;
+	}
+
+	if (cp >= 0x1d7ce && cp <= 0x1d7ff) return 0x30 + ((cp - 0x1d7ce) % 10);
+
+	return cp;
+}
+
 /** Domain to ASCII (the UTS #46 subset above); null on failure. */
 function domainToASCII(domain) {
-	const lowered = domain.toLowerCase();
+	const mapped = [];
+
+	for (const cp of codePoints(domain)) {
+		if (disallowed(cp)) return null;
+		const to = mapPoint(cp);
+
+		if (to !== -1) mapped.push(to);
+	}
 	const labels = [];
 
-	for (const label of lowered.replace(/[。．｡]/g, '.').split('.')) {
+	for (const label of fromCodePoints(mapped).toLowerCase().split('.')) {
 		const points = codePoints(label);
 
 		labels.push(points.every((cp) => cp < 0x80) ? label : 'xn--' + punycode(points));

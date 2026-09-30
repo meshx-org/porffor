@@ -1,7 +1,7 @@
 // Intl.Locale over meshx:intl/locale. The host canonicalizes the tag (and applies the
 // options); the getters read the canonical tag, so they need no locale data.
 
-import { build, maximize, minimize, textDirection, weekInfo } from 'meshx:intl/locale@0.1.0';
+import { build, maximize, minimize, textDirection, weekInfo } from 'porffor:intl/locale';
 import { boolOption, hostCall, optionsObject, textOption } from './intl-options.mjs';
 
 /** The Unicode extension keys Intl.Locale has getters for, by key. */

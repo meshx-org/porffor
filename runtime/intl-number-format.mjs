@@ -1,7 +1,7 @@
 // Intl.NumberFormat over meshx:intl/number.
 
-import { supportedLocales } from 'meshx:intl/locale@0.1.0';
-import { NumberFormat as HostNumberFormat } from 'meshx:intl/number@0.1.0';
+import { supportedLocales } from 'porffor:intl/locale';
+import { NumberFormat as HostNumberFormat } from 'porffor:intl/number';
 import {
 	LOCALE_MATCHERS,
 	ROUNDING_ENUMS,

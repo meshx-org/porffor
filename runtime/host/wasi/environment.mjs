@@ -1,7 +1,6 @@
-// The process environment as an object (wasi:cli/environment), for a fetch handler's env.
-// Library modules reach it as 'wasi-porffor:environment'; the build points that here in a
-// world that imports wasi:cli/environment@0.3.0, and at ./no-environment.mjs otherwise.
-
+// WASI environment: porffor:environment, the process environment as an object, from the world's
+// wasi:cli/environment@0.3.0 import (./absent/environment.mjs in a world without it).
+// runtime/host/native/environment.mjs is the same over libuv.
 import { getEnvironment } from 'wasi:cli/environment@0.3.0';
 
 let cached;

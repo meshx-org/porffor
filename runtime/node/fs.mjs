@@ -1,29 +1,19 @@
 // node:fs: the synchronous calls Porffor's compiler makes (so it can compile itself), with Node's
 // signatures and errors (code, errno, syscall, path), over the host's (host/native/fs.mjs).
 // Not all of Node's fs: what a program needs beyond these is not here.
-import * as host from '../host/native/fs.mjs';
-import { decodeUtf8, errnoName } from '../host/native/c.mjs';
+import * as host from 'porffor:fs';
+import { writeTo } from 'porffor:process';
+import { decodeUtf8 } from '../host/c.mjs';
 import { dirname, join, resolve } from './path.mjs';
 
-// libuv's messages, which Node's errors carry
-const MESSAGES = {
-	EACCES: 'permission denied',
-	EEXIST: 'file already exists',
-	EISDIR: 'illegal operation on a directory',
-	ENOENT: 'no such file or directory',
-	ENOTDIR: 'not a directory',
-	ENOTEMPTY: 'directory not empty',
-	EPERM: 'operation not permitted',
-	EXDEV: 'cross-device link not permitted'
-};
-
 // Node's error for a failed call: ENOENT: no such file or directory, open 'a.txt'
+// (errno as Node has it, negative; its name and message the platform's: libuv's, natively)
 const systemError = (errno, syscall, path, dest) => {
-	const code = errnoName(errno);
-	let message = `${code}: ${MESSAGES[code] ?? 'unknown error'}, ${syscall} '${path}'`;
+	const code = host.errorName(errno);
+	let message = `${code}: ${host.errorMessage(errno)}, ${syscall} '${path}'`;
 	if (dest !== undefined) message += ` -> '${dest}'`;
 	const e = new Error(message);
-	e.errno = -errno;
+	e.errno = errno;
 	e.code = code;
 	e.syscall = syscall;
 	e.path = path;
@@ -69,7 +59,8 @@ export const statSync = (path, options) => {
 	path = toPath(path);
 	const fields = host.stat(path, true);
 	if (fields === undefined) {
-		if (options?.throwIfNoEntry === false && errnoName(host.error()) === 'ENOENT') return undefined;
+		if (options?.throwIfNoEntry === false && host.errorName(host.error()) === 'ENOENT')
+			return undefined;
 		throw systemError(host.error(), 'stat', path);
 	}
 	const mode = fields[2];
@@ -90,7 +81,7 @@ export const readFileSync = (path, options) => {
 	const bytes = host.readFile(path);
 	if (bytes === undefined) {
 		const errno = host.error();
-		throw systemError(errno, errnoName(errno) === 'EISDIR' ? 'read' : 'open', path);
+		throw systemError(errno, host.errorName(errno) === 'EISDIR' ? 'read' : 'open', path);
 	}
 	if (encoding === 'utf8' || encoding === 'utf-8') return decodeUtf8(bytes);
 	if (encoding === 'latin1' || encoding === 'binary') return bytes;
@@ -147,7 +138,7 @@ export const mkdirSync = (path, options) => {
 	}
 	let first;
 	for (let i = missing.length - 1; i >= 0; i--) {
-		if (host.pathCall(0, missing[i], mode) !== 0 && errnoName(host.error()) !== 'EEXIST')
+		if (host.pathCall(0, missing[i], mode) !== 0 && host.errorName(host.error()) !== 'EEXIST')
 			throw systemError(host.error(), 'mkdir', path);
 		first ??= missing[i];
 	}
@@ -173,7 +164,7 @@ export const rmSync = (path, options) => {
 	const { recursive = false, force = false } = optionsObject(options);
 	const fields = host.stat(path, false);
 	if (fields === undefined) {
-		if (force && errnoName(host.error()) === 'ENOENT') return;
+		if (force && host.errorName(host.error()) === 'ENOENT') return;
 		throw systemError(host.error(), 'lstat', path);
 	}
 	if (isDirectoryMode(fields[2]) && !recursive) {
@@ -229,7 +220,24 @@ export const cpSync = (src, dest, options) => {
 	copy(src, dest);
 };
 
+/**
+ * Writes data (a string, as UTF-8, or bytes) to a file descriptor: the bytes written. Standard
+ * output and error (1 and 2) only: what a program writes its output to (a file is writeFileSync's).
+ */
+export const writeSync = (fd, data) => {
+	if (fd !== 1 && fd !== 2) {
+		const e = new Error(`EBADF: bad file descriptor, write`);
+
+		e.code = 'EBADF';
+		throw e;
+	}
+	writeTo(fd, data);
+
+	return typeof data === 'string' ? data.length : data.byteLength;
+};
+
 export default {
+	writeSync,
 	existsSync,
 	statSync,
 	readFileSync,

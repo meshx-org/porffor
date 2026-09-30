@@ -1,15 +1,17 @@
-// @noble/hashes' scrypt (scrypt.js), in C: Colin Percival's reference code (runtime/c/scrypt),
-// which runs about a hundred times faster than noble's JavaScript does under Porffor
-// (N=16384 r=16: ~0.1 s against ~10 s). The build points `@noble/hashes/scrypt.js` here, and
-// compiles the C, only for a guest whose code imports it (scripts/bundle.mjs), so a library
-// that hashes passwords with noble (better-auth does) gets it without a change.
+// @noble/hashes' scrypt (scrypt.js), in C: Colin Percival's reference code (runtime/c/scrypt,
+// through porffor:scrypt), which runs about a hundred times faster than noble's JavaScript does
+// under Porffor (N=16384 r=16: ~0.1 s against ~10 s). Imports of noble's scrypt.js resolve here:
+// a native build's with the runtime (--runtime, compiler/modules.js), and a WASI guest's
+// (wasi/scripts/bundle.mjs), so a library that hashes passwords with noble (better-auth does)
+// gets it without a change.
 //
 // Same exports, options and checks as noble 2.2.0, so the output and the errors match. Two
-// differences: `asyncTick` is accepted and ignored, since the C runs in one go (scryptAsync
-// blocks the instance for the hash, ~0.1 s), and `onProgress` is called once, with 1, at
-// the end. The work buffer is the C's (malloc and free), outside Porffor's heap.
+// differences: `asyncTick` is accepted and ignored, since the C runs in one go (natively,
+// scryptAsync hashes on libuv's threadpool and the loop goes on; a WASI build has no threads and
+// blocks for the hash, ~0.1 s), and `onProgress` is called once, with 1, at the end. The work
+// buffer is the C's (malloc and free), outside Porffor's heap.
 
-import { nativeScrypt } from 'wasi-porffor:scrypt-native';
+import { hash, hashSync } from 'porffor:scrypt';
 
 // noble's defaults: dkLen 32, and maxmem 1 GiB + 1 KiB
 const DEFAULT_DK_LEN = 32;
@@ -111,14 +113,8 @@ function checkOpts(opts) {
 	return memUsed;
 }
 
-/**
- * scrypt (RFC 7914) of `password` with `salt`.
- * @param {string | Uint8Array} password
- * @param {string | Uint8Array} salt
- * @param {ScryptOpts} opts
- * @returns {Uint8Array}
- */
-export function scrypt(password, salt, opts) {
+// what the hash's options come to: noble's checks, and the bytes it will take
+function hashOpts(opts) {
 	const {
 		N,
 		r,
@@ -129,24 +125,15 @@ export function scrypt(password, salt, opts) {
 		onProgress
 	} = opts ?? {};
 	const memUsed = checkOpts({ N, r, p, dkLen, asyncTick, maxmem, onProgress });
+	return { N, r, p, dkLen, onProgress, memUsed };
+}
 
-	const out = new Uint8Array(dkLen);
-	const status = nativeScrypt(
-		inputBytes(password, 'password'),
-		inputBytes(salt, 'salt'),
-		N,
-		r,
-		p,
-		out
-	);
-
-	// crypto_scrypt returns -1 when it cannot allocate its work buffer or when r * p >= 2^30
-	// (noble lets that through); -2 is the bridge refusing an argument that is not a Uint8Array
+// the hash's output, or crypto_scrypt's failure (-1: it could not allocate its work buffer, or
+// r * p >= 2^30, which noble lets through) as an error
+function result(status, out, { memUsed, onProgress }) {
 	if (status !== 0)
 		throw new Error(
-			status === -1
-				? `scrypt: the native hash failed (a ${memUsed}-byte work buffer, or r * p >= 2^30)`
-				: `scrypt: the native hash failed (${status})`
+			`scrypt: the native hash failed (a ${memUsed}-byte work buffer, or r * p >= 2^30)`
 		);
 
 	if (onProgress !== undefined) onProgress(1);
@@ -155,12 +142,43 @@ export function scrypt(password, salt, opts) {
 }
 
 /**
- * scrypt, as a promise. The hash itself runs in one go (see the top of this file).
+ * scrypt (RFC 7914) of `password` with `salt`.
+ * @param {string | Uint8Array} password
+ * @param {string | Uint8Array} salt
+ * @param {ScryptOpts} opts
+ * @returns {Uint8Array}
+ */
+export function scrypt(password, salt, opts) {
+	const o = hashOpts(opts);
+	const out = new Uint8Array(o.dkLen);
+	const status = hashSync(
+		inputBytes(password, 'password'),
+		inputBytes(salt, 'salt'),
+		o.N,
+		o.r,
+		o.p,
+		out
+	);
+	return result(status, out, o);
+}
+
+/**
+ * scrypt, as a promise: natively on libuv's threadpool, the loop going on meanwhile.
  * @param {string | Uint8Array} password
  * @param {string | Uint8Array} salt
  * @param {ScryptOpts} opts
  * @returns {Promise<Uint8Array>}
  */
 export async function scryptAsync(password, salt, opts) {
-	return scrypt(password, salt, opts);
+	const o = hashOpts(opts);
+	const out = new Uint8Array(o.dkLen);
+	const status = await hash(
+		inputBytes(password, 'password'),
+		inputBytes(salt, 'salt'),
+		o.N,
+		o.r,
+		o.p,
+		out
+	);
+	return result(status, out, o);
 }

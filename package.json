@@ -8,6 +8,7 @@
 	"exports": {
 		"./wasi": "./wasi/src/build.mjs",
 		"./wasi/vite": "./wasi/src/vite.mjs",
+		"./eslint": "./eslint/index.js",
 		"./runtime/fetch": "./runtime/fetch.mjs",
 		"./runtime/timers": "./runtime/timers.mjs",
 		"./runtime/abort": "./runtime/abort.mjs",
@@ -27,21 +28,28 @@
 	"files": [
 		"cli",
 		"compiler",
+		"eslint",
 		"runtime",
+		"!runtime/intl/target",
 		"wasi/src",
-		"wasi/scripts"
+		"wasi/scripts",
+		"wasi/wit"
 	],
 	"scripts": {
-		"format": "prettier --write runtime wasi",
-		"lint": "prettier --check runtime wasi && eslint . --cache --cache-location node_modules/.cache/eslint/",
-		"test": "vitest run --root wasi",
+		"format": "prettier --write runtime wasi eslint native",
+		"lint": "prettier --check runtime wasi eslint native && eslint . --cache --cache-location node_modules/.cache/eslint/",
+		"test": "vitest run --root wasi && vitest run --root native",
+		"test:wasi": "vitest run --root wasi",
+		"test:native": "vitest run --root native",
 		"wpt": "node wasi/wpt/index.mjs",
 		"wpt:setup": "node wasi/wpt/setup.mjs",
-		"lint:fresh": "prettier --check runtime wasi && eslint ."
+		"lint:fresh": "prettier --check runtime wasi eslint native && eslint ."
 	},
 	"dependencies": {
+		"@noble/ciphers": "^2.4.0",
 		"@noble/curves": "^2.4.0",
 		"@noble/hashes": "^2.2.0",
+		"@noble/post-quantum": "^0.7.1",
 		"esbuild": "^0.28.2"
 	},
 	"devDependencies": {

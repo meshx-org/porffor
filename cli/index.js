@@ -80,7 +80,9 @@ if (process.argv.includes('--help') || process.argv.includes('-h')) {
   help();
 }
 
-const looksLikeModule = (filename, source) => MODULE_SYNTAX_PATTERN.test(source) || /\.(mjs|mts)$/i.test(filename ?? '');
+// (with the runtime a CommonJS program is linked too, its require()s resolved as Node's are)
+const looksLikeModule = (filename, source) => MODULE_SYNTAX_PATTERN.test(source) || /\.(mjs|mts)$/i.test(filename ?? '') ||
+  (!!Prefs.runtime && (/\.(cjs|cts)$/i.test(filename ?? '') || /\brequire\s*\(/.test(source)));
 
 entrypoint: {
   const args = process.argv.slice(2);
@@ -157,11 +159,10 @@ entrypoint: {
     else source = fs.readFileSync(inputFile, 'utf8');
 
   try {
-    if ((Prefs.target === 'c' || Prefs.target === 'native') && DEFAULT_EXPORT_PATTERN.test(source) && source.includes('fetch')) {
-      (await import('./native-fetch.js')).default(inputFile);
-    } else {
-      (await import('../compiler/index.js')).default(source, Prefs.module ?? looksLikeModule(inputFile, source));
-    }
+    // a server (export default { fetch }) is served by the runtime's porffor:http-server, which
+    // the linker adds after the entry: such a program is built with the runtime, asked for or not
+    if (Prefs.target === 'native' && DEFAULT_EXPORT_PATTERN.test(source) && /\bfetch\b/.test(source)) Prefs.runtime = true;
+    (await import('../compiler/index.js')).default(source, Prefs.module ?? looksLikeModule(inputFile, source));
 
     if (runAfterCompile) {
       try {

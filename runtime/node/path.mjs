@@ -1,5 +1,5 @@
 // node:path, POSIX: Node's algorithms (lib/path.js), paths as strings. win32 is not provided.
-import { cwd } from '../host/native/process.mjs';
+import { cwd } from 'porffor:process';
 
 const validateString = (value, name) => {
 	if (typeof value !== 'string') {

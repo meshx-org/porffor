@@ -180,12 +180,20 @@ export function jsCase(value) {
 	return out;
 }
 
-/** A meshx:intl error (a result's error, thrown by the glue) as JavaScript's own. */
+/**
+ * A meshx:intl error as JavaScript's own: what a result's err throws (the WASI glue, jco and
+ * native Intl throw an Error with the error value on `payload`), or the value itself.
+ */
 export function hostError(error) {
-	if (error !== null && typeof error === 'object') {
-		if (error.tag === 'range') return new RangeError(error.val);
+	const payload =
+		error !== null && typeof error === 'object' && error.payload !== undefined
+			? error.payload
+			: error;
 
-		if (error.tag === 'invalid') return new TypeError(error.val);
+	if (payload !== null && typeof payload === 'object') {
+		if (payload.tag === 'range') return new RangeError(payload.val);
+
+		if (payload.tag === 'invalid') return new TypeError(payload.val);
 	}
 
 	return error;

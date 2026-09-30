@@ -397,9 +397,15 @@ export default (input, entry = null, evalContext = null) => {
   const file = entry?.file ?? globalThis.file;
   const linking = entry && file && !globalThis.precompile;
   const path = linking && (file[0] === '/' ? file : process.cwd() + '/' + file);
-  let ast = linking && Prefs.module ? link(input, path, { ts: types, scripts: entry.scripts }) : parse(input, { module: !!Prefs.module, ts: types, evalContext });
-  // a script's import() calls load modules too
-  if (linking && !Prefs.module && /\bimport\b/.test(input) && usesImportCall(ast)) ast = link(input, path, { ts: types, script: ast });
+  // a native build with the runtime (--runtime): its globals set before the program runs (the
+  // timers, over libuv's loop)
+  const scripts = entry?.scripts ?? [];
+  // the runtime's globals (runtime/globals.json), for a native build with it; so is serving an
+  // entry's default export { fetch } (porffor:http-server)
+  const globals = linking && Prefs.runtime && Prefs.target === 'native';
+  let ast = linking && Prefs.module ? link(input, path, { ts: types, scripts, globals, serve: globals }) : parse(input, { module: !!Prefs.module, ts: types, evalContext });
+  // a script's import() calls load modules too, and the runtime's globals go before it
+  if (linking && !Prefs.module && (globals || (/\bimport\b/.test(input) && usesImportCall(ast)))) ast = link(input, path, { ts: types, script: ast, scripts, globals });
   if (ast._ts) globalThis.typedInput = Prefs.optTypes;
   bindHomeObjects(ast);
   bindOwnNames(ast);

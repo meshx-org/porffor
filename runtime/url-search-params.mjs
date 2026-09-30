@@ -1,15 +1,16 @@
 // URLSearchParams for a Porffor-compiled guest (https://url.spec.whatwg.org/#interface-urlsearchparams):
 // a list of name-value pairs, parsed from and serialized to
 // application/x-www-form-urlencoded. One that belongs to a URL (url.searchParams) writes
-// every change back to that URL's query.
-//
-// keys(), values() and entries() return arrays, not iterator objects: Porffor's for...of
-// takes arrays but not the iterator protocol, so `for (const [name, value] of
-// params.entries())` works there; `for (... of params)` itself does not.
+// every change back to that URL's query. Iteration follows the list as it changes, as the
+// spec's iterator does.
 //
 // Injected into every guest (tree-shaken away unless used), like ./url.mjs.
 
 import { parseForm, serializeForm, toUSVString } from './url-encoding.mjs';
+import { defineInterface, initPairs, isObject, pairIterator } from './webidl.mjs';
+
+/** A URLSearchParams' pairs, as they are now. */
+const listPairs = (params) => params._list;
 
 /** A query string's name-value pairs, as URLs and forms carry them. */
 export class URLSearchParams {
@@ -17,28 +18,22 @@ export class URLSearchParams {
 	 * @param {string | [string, string][] | Record<string, string> | URLSearchParams} [init]
 	 *   a query string (a leading ? is dropped), pairs, or a record of names to values
 	 */
-	constructor(init) {
+	constructor(init = undefined) {
 		this._list = [];
 		this._url = null; // the URL record this belongs to, if any
 
 		if (init === undefined || init === null) return;
 
-		if (init instanceof URLSearchParams) {
-			this._list = init._list.map((pair) => [pair[0], pair[1]]);
+		if (isObject(init)) {
+			const sequence = init[Symbol.iterator] !== undefined && init[Symbol.iterator] !== null;
 
-			return;
-		}
+			for (const pair of initPairs(init, 'URLSearchParams', toUSVString)) {
+				// a record's key met twice once converted (lone surrogates) keeps its first place
+				const at = sequence ? -1 : this._list.findIndex((entry) => entry[0] === pair[0]);
 
-		if (typeof init === 'object') {
-			if (Array.isArray(init)) {
-				for (const pair of init) {
-					if (pair.length !== 2)
-						throw new TypeError('URLSearchParams: each pair must have exactly two items');
-					this._list.push([toUSVString(pair[0]), toUSVString(pair[1])]);
-				}
-			} else
-				for (const name of Object.keys(init))
-					this._list.push([toUSVString(name), toUSVString(init[name])]);
+				if (at === -1) this._list.push(pair);
+				else this._list[at][1] = pair[1];
+			}
 
 			return;
 		}
@@ -67,7 +62,7 @@ export class URLSearchParams {
 	}
 
 	/** Removes every pair with the name (and, given one, the value). */
-	delete(name, value) {
+	delete(name, value = undefined) {
 		const key = toUSVString(name);
 		const only = value === undefined ? undefined : toUSVString(value);
 
@@ -93,7 +88,7 @@ export class URLSearchParams {
 	}
 
 	/** Whether a pair has the name (and, given one, the value). */
-	has(name, value) {
+	has(name, value = undefined) {
 		const key = toUSVString(name);
 		const only = value === undefined ? undefined : toUSVString(value);
 
@@ -130,27 +125,34 @@ export class URLSearchParams {
 	}
 
 	/** Calls callback(value, name, this) for each pair. */
-	forEach(callback, thisArg) {
-		for (const [name, value] of this._list) callback.call(thisArg, value, name, this);
+	forEach(callback, thisArg = undefined) {
+		if (typeof callback !== 'function')
+			throw new TypeError('URLSearchParams.forEach: callback is not a function');
+
+		for (let index = 0; index < this._list.length; index++) {
+			const [name, value] = this._list[index];
+
+			callback.call(thisArg, value, name, this);
+		}
 	}
 
 	/** The names, in order. */
 	keys() {
-		return this._list.map((pair) => pair[0]);
+		return pairIterator('URLSearchParams', this, 'key', listPairs);
 	}
 
 	/** The values, in order. */
 	values() {
-		return this._list.map((pair) => pair[1]);
+		return pairIterator('URLSearchParams', this, 'value', listPairs);
 	}
 
 	/** The [name, value] pairs, in order. */
 	entries() {
-		return this._list.map((pair) => [pair[0], pair[1]]);
+		return pairIterator('URLSearchParams', this, 'pair', listPairs);
 	}
 
 	[Symbol.iterator]() {
-		return this.entries()[Symbol.iterator]();
+		return this.entries();
 	}
 
 	/** The pairs as application/x-www-form-urlencoded. */
@@ -158,3 +160,5 @@ export class URLSearchParams {
 		return serializeForm(this._list);
 	}
 }
+
+defineInterface(URLSearchParams, 'URLSearchParams', { iterable: true });

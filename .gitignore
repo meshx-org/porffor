@@ -17,6 +17,8 @@ selfhosted/*.c
 node_modules/
 build/
 .wasi-porffor/
+# cargo run in the ICU4X crate itself (Porffor builds it in ~/.cache/porffor/deps)
+runtime/intl/target/
 # the web-platform-tests checkout, the programs its runner generates, and its results
 wasi/wpt/wpt/
 wasi/wpt/.work/

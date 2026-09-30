@@ -4,6 +4,7 @@
 
 import { AbortSignal, abortSignal } from './abort-signal.mjs';
 import { DOMException } from './dom-exception.mjs';
+import { defineInterface } from './webidl.mjs';
 
 export { AbortSignal, DOMException };
 
@@ -14,7 +15,9 @@ export class AbortController {
 	}
 
 	/** Aborts the signal with `reason` (an AbortError DOMException when undefined). */
-	abort(reason) {
+	abort(reason = undefined) {
 		abortSignal(this.signal, reason);
 	}
 }
+
+defineInterface(AbortController, 'AbortController');

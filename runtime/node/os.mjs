@@ -1,23 +1,61 @@
-// node:os: what Porffor's compiler asks of it (so it can compile itself), with Node's signatures.
-import * as host from '../host/native/process.mjs';
+// node:os: the machine and the user, with Node's signatures, over the platform's
+// (porffor:process: libuv's natively; WASI tells little: one processor, no memory totals).
+import * as host from 'porffor:process';
 
 export const EOL = '\n';
+export const devNull = '/dev/null';
 
 export const platform = () => host.platform();
+export const homedir = () => host.homedir();
+export const tmpdir = () => host.tmpdir();
+export const hostname = () => host.hostname();
 
-export const homedir = () => {
-	const home = host.getenv('HOME');
-	return home === undefined || home === '' ? '/' : home;
+// uname(2): the system's name (Darwin, Linux), its release and version, the machine
+export const type = () => host.systemInfo(0);
+export const release = () => host.systemInfo(1);
+export const machine = () => host.systemInfo(2);
+export const version = () => host.systemInfo(3);
+
+// the architecture as Node names it (x64, arm64), from the machine uname gives
+export const arch = () => {
+	const m = host.systemInfo(2);
+	if (m === 'x86_64' || m === 'amd64') return 'x64';
+	if (m === 'aarch64' || m === 'arm64') return 'arm64';
+	if (m === 'i386' || m === 'i686') return 'ia32';
+	if (m.startsWith('arm')) return 'arm';
+	return m;
 };
 
-// TMPDIR (else TMP, TEMP) without a trailing slash, else /tmp
-export const tmpdir = () => {
-	let dir = host.getenv('TMPDIR');
-	if (dir === undefined || dir === '') dir = host.getenv('TMP');
-	if (dir === undefined || dir === '') dir = host.getenv('TEMP');
-	if (dir === undefined || dir === '') return '/tmp';
-	if (dir.length > 1 && dir[dir.length - 1] === '/') return dir.slice(0, -1);
-	return dir;
+export const endianness = () => 'LE';
+export const availableParallelism = () => host.cpuCount();
+export const totalmem = () => host.totalMemory();
+export const freemem = () => host.freeMemory();
+export const uptime = () => host.uptime();
+
+export const cpus = () => {
+	const out = [];
+	for (const [model, speed, user, nice, sys, idle, irq] of host.cpus()) {
+		out.push({ model, speed, times: { user, nice, sys, idle, irq } });
+	}
+	return out;
 };
 
-export default { EOL, platform, homedir, tmpdir };
+export default {
+	EOL,
+	devNull,
+	platform,
+	homedir,
+	tmpdir,
+	hostname,
+	type,
+	release,
+	machine,
+	version,
+	arch,
+	endianness,
+	availableParallelism,
+	totalmem,
+	freemem,
+	uptime,
+	cpus
+};

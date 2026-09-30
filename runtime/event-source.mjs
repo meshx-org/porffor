@@ -2,17 +2,16 @@
 // streaming body: the HTML standard's event stream parsing (data / event / id / retry
 // fields, comments, CR / LF / CRLF lines, a leading BOM), open / message / error events
 // and named events, and reconnection with Last-Event-ID after the retry delay.
-// Reconnecting waits on setTimeout, so it needs a world that imports
-// wasi:clocks/monotonic-clock too; without one, reconnecting fails (./no-timers.mjs).
+// Reconnecting waits on setTimeout, so it needs a clock (porffor:clock): in a WASI world
+// without wasi:clocks/monotonic-clock, reconnecting fails.
 //
 // Library modules import the globals they use (injection does not reach into injected
-// files): timers come from 'wasi-porffor:timers', which the build points at ./timers.mjs
-// or ./no-timers.mjs.
+// files), so the timers come from ./timers.mjs.
 //
 // The build injects this module (esbuild `inject`) into guests whose world imports
 // wasi:http/client@0.3.0.
 
-import { setTimeout } from 'wasi-porffor:timers';
+import { setTimeout } from './timers.mjs';
 import { AbortController } from './abort.mjs';
 import { Event } from './event.mjs';
 import { EventTarget } from './event-target.mjs';

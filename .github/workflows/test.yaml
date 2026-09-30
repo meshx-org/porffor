@@ -29,12 +29,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - name: bundle selfhost compiler
-        run: node selfhosted/build.mjs
-      - name: compile bundle to c
-        run: node cli/index.js c --compress-data selfhosted/bundle.js -o selfhosted/stage1.c
+      # bundled, compiled to C and built by ./selfhost, which links libuv (the selfhosted
+      # compiler's node:fs runs on it, runtime/host/native)
       - name: build selfhost compiler
-        run: clang -O2 -fno-sanitize=undefined -w selfhosted/stage1.c -o selfhosted/porf -lm
+        env:
+          SELFHOST_CC: clang
+          CC_OPTS: -O2 -fno-sanitize=undefined -w
+        run: ./selfhost compile
       # a selfhost compiler compiles regex literals ahead of time, so its C for a program
       # with them (and for the compiler itself: stage2) differs from the host's by design
       - name: verify selfhost compiler

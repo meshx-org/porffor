@@ -1,95 +1,94 @@
 // HMAC for the Web Crypto shim (https://w3c.github.io/webcrypto/#hmac), over @noble/hashes:
-// generateKey, importKey and exportKey ('raw', 'jwk'), sign and verify.
+// generateKey, importKey and exportKey ('raw', 'raw-secret', 'jwk'), sign and verify. Loaded
+// (runtime/globals.json) only into a program that names 'HMAC'; it registers itself with
+// SubtleCrypto.
 
 import { hmac } from '@noble/hashes/hmac.js';
-import { sha1 } from '@noble/hashes/legacy.js';
-import { sha256, sha384, sha512 } from '@noble/hashes/sha2.js';
-import { CryptoKey, KEY_TOKEN } from './crypto-key.mjs';
+import { makeKey } from './crypto-key.mjs';
 import {
-	algorithmName,
 	base64url,
+	checkJwk,
 	checkUsages,
 	constantTimeEqual,
 	dataError,
 	fromBase64url,
+	jwkCommon,
 	notSupported,
-	syntaxError,
-	toBuffer,
-	toBytes
+	operationError
 } from './crypto-util.mjs';
-
-/** The hash functions, by name. */
-export const HASHES = { 'SHA-1': sha1, 'SHA-256': sha256, 'SHA-384': sha384, 'SHA-512': sha512 };
+import { hashFunction, registerAlgorithm } from './subtle-crypto.mjs';
 
 /** A JWK's `alg` for an HMAC key, by hash. */
 const JWK_ALG = { 'SHA-1': 'HS1', 'SHA-256': 'HS256', 'SHA-384': 'HS384', 'SHA-512': 'HS512' };
 
 const USAGES = ['sign', 'verify'];
 
-/** The hash an HMAC algorithm names: 'SHA-1' to 'SHA-512'. */
-function hashName(algorithm) {
-	if (algorithm?.hash === undefined) throw new TypeError('HmacKeyGenParams: hash is missing');
-	const name = algorithmName(algorithm.hash);
+/** The length in bits of a key for the hash when none is given: its block size. */
+const blockBits = (hash) => hashFunction(hash).blockLen * 8;
 
-	if (!name || !(name in HASHES)) throw notSupported('HMAC: unsupported hash');
-
-	return name;
-}
-
-/** A secret HMAC key over the given bytes. */
-function makeKey(hash, material, extractable, usages) {
-	return new CryptoKey(KEY_TOKEN, {
-		type: 'secret',
+/** A secret HMAC key over the given bytes (length in bits). */
+const hmacKey = (hash, length, material, extractable, usages) =>
+	makeKey(
+		'secret',
 		extractable,
-		algorithm: { name: 'HMAC', length: material.length * 8, hash: { name: hash } },
+		{ name: 'HMAC', length, hash: { name: hash.name } },
 		usages,
 		material
-	});
+	);
+
+/** generateKey: random bits, as many as the hash's block unless `length` says. */
+function generateKey(algorithm, extractable, usages) {
+	checkUsages(usages, USAGES);
+	let length = blockBits(algorithm.hash);
+
+	if (algorithm.length !== undefined) {
+		if (algorithm.length === 0) throw operationError('HMAC: the length cannot be 0');
+		length = algorithm.length;
+	}
+
+	const material = crypto.getRandomValues(new Uint8Array(Math.ceil(length / 8)));
+
+	return hmacKey(algorithm.hash, length, material, extractable, usages);
 }
 
-/** generateKey: random bytes, as many as the hash's block unless `length` (bits) says. */
-export function generateHmacKey(algorithm, extractable, usages) {
-	const hash = hashName(algorithm);
-	const allowed = checkUsages(usages, USAGES);
-
-	if (allowed.length === 0) throw syntaxError('Usages cannot be empty');
-	const bits =
-		algorithm.length === undefined ? HASHES[hash].blockLen * 8 : Number(algorithm.length);
-
-	if (!(bits > 0) || bits % 8 !== 0) throw notSupported('HMAC: the length must be whole bytes');
-
-	return makeKey(hash, crypto.getRandomValues(new Uint8Array(bits / 8)), extractable, allowed);
-}
-
-/** importKey 'raw' or 'jwk' (kty oct). */
-export function importHmacKey(format, keyData, algorithm, extractable, usages) {
-	const hash = hashName(algorithm);
-	const allowed = checkUsages(usages, USAGES);
+/** importKey 'raw', 'raw-secret' or 'jwk' (kty oct). */
+function importKey(format, keyData, algorithm, extractable, usages) {
+	checkUsages(usages, USAGES);
 	let material;
 
-	if (format === 'raw') material = toBytes(keyData);
+	if (format === 'raw' || format === 'raw-secret') material = keyData;
 	else if (format === 'jwk') {
-		if (keyData?.kty !== 'oct') throw dataError("JWK: kty must be 'oct'");
+		if (keyData.kty !== 'oct') throw dataError("JWK: kty must be 'oct'");
 
-		if (keyData.alg !== undefined && keyData.alg !== JWK_ALG[hash])
-			throw dataError('JWK: alg does not match the hash');
+		if (keyData.k === undefined) throw dataError('JWK: k is missing');
 		material = fromBase64url(keyData.k);
+
+		if (keyData.alg !== undefined && keyData.alg !== JWK_ALG[algorithm.hash.name])
+			throw dataError('JWK: alg does not match the hash');
+		checkJwk(keyData, { kty: 'oct', use: 'sig', usages, extractable });
 	} else throw notSupported(`HMAC: unsupported key format '${format}'`);
 
-	if (material.length === 0) throw dataError('HMAC: the key is empty');
+	let length = material.length * 8;
 
-	return makeKey(hash, material, extractable, allowed);
+	if (length === 0) throw dataError('HMAC: the key is empty');
+
+	if (algorithm.length !== undefined) {
+		if (algorithm.length > length || algorithm.length <= length - 8)
+			throw dataError('HMAC: the length does not match the key');
+		length = algorithm.length;
+	}
+
+	return hmacKey(algorithm.hash, length, material, extractable, usages);
 }
 
-/** exportKey 'raw' or 'jwk'. */
-export function exportHmacKey(format, key) {
-	if (format === 'raw') return toBuffer(key._material);
+/** exportKey 'raw', 'raw-secret' or 'jwk'. */
+function exportKey(format, key) {
+	if (format === 'raw' || format === 'raw-secret') return key._material.slice().buffer;
 
 	if (format === 'jwk')
 		return {
-			key_ops: key.usages,
-			ext: key.extractable,
-			alg: JWK_ALG[key.algorithm.hash.name],
+			...jwkCommon(key),
+			alg: JWK_ALG[key._algorithm.hash.name],
 			kty: 'oct',
 			k: base64url(key._material)
 		};
@@ -98,9 +97,44 @@ export function exportHmacKey(format, key) {
 }
 
 /** The MAC of data under the key. */
-export const hmacSign = (key, data) =>
-	toBuffer(hmac(HASHES[key.algorithm.hash.name], key._material, toBytes(data)));
+const sign = (algorithm, key, data) => hmac(hashFunction(key._algorithm.hash), key._material, data);
 
-/** Whether signature is data's MAC under the key (compared in constant time). */
-export const hmacVerify = (key, signature, data) =>
-	constantTimeEqual(new Uint8Array(hmacSign(key, data)), toBytes(signature));
+/** deriveKey's length for an HMAC key: `length`, else the hash's block size. */
+function getKeyLength(algorithm) {
+	if (algorithm.length === undefined) return blockBits(algorithm.hash);
+
+	if (algorithm.length === 0) throw new TypeError('HMAC: the length cannot be 0');
+
+	return algorithm.length;
+}
+
+const KEY_PARAMS = { hash: 'hash!', length: 'ulong' };
+
+registerAlgorithm({
+	name: 'HMAC',
+	params: {
+		generateKey: KEY_PARAMS,
+		importKey: KEY_PARAMS,
+		getKeyLength: KEY_PARAMS,
+		sign: {},
+		verify: {}
+	},
+	generateKey,
+	importKey,
+	exportKey,
+	sign,
+	verify: (algorithm, key, signature, data) =>
+		constantTimeEqual(sign(algorithm, key, data), signature),
+	getKeyLength,
+	checkGenerateKey(algorithm) {
+		if (algorithm.length === 0) throw operationError('HMAC: the length cannot be 0');
+	},
+	checkImport(algorithm) {
+		if (algorithm.length === 0) throw dataError('HMAC: the length cannot be 0');
+	},
+	// a shared key of `bits` bits (encapsulateKey): the length, if given, must be it
+	checkSecret(algorithm, bits) {
+		if (algorithm.length !== undefined && algorithm.length !== bits)
+			throw dataError('HMAC: the length does not match the key');
+	}
+});

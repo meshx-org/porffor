@@ -8,6 +8,7 @@
 
 import { DOMException } from './dom-exception.mjs';
 import { Event } from './event.mjs';
+import { defineInterface } from './webidl.mjs';
 
 const NONE = 0;
 const AT_TARGET = 2;
@@ -46,11 +47,17 @@ export class EventTarget {
 	 * @param {Function | { handleEvent(event: Event): void } | null} callback
 	 * @param {boolean | { capture?: boolean, once?: boolean, passive?: boolean, signal?: AbortSignal }} [options]
 	 */
-	addEventListener(type, callback, options) {
-		if (callback === null || callback === undefined) return;
+	addEventListener(type, callback, options = undefined) {
 		const capture = captureOption(options);
 		const flags = typeof options === 'object' && options !== null ? options : {};
+		// the options dictionary's members, read in order before anything else
+		const once = Boolean(flags.once);
+		const passive = Boolean(flags.passive);
 		const signal = flags.signal;
+
+		if (signal === null) throw new TypeError('addEventListener: signal cannot be null');
+
+		if (callback === null || callback === undefined) return;
 
 		if (signal?.aborted) return;
 		const key = String(type);
@@ -65,8 +72,8 @@ export class EventTarget {
 		list.push({
 			callback,
 			capture,
-			once: Boolean(flags.once),
-			passive: Boolean(flags.passive),
+			once,
+			passive,
 			removed: false
 		});
 
@@ -75,7 +82,7 @@ export class EventTarget {
 	}
 
 	/** Removes the listener added with this type, callback and capture. */
-	removeEventListener(type, callback, options) {
+	removeEventListener(type, callback, options = undefined) {
 		const list = this._listeners.get(String(type));
 
 		if (list === undefined) return;
@@ -133,3 +140,5 @@ export class EventTarget {
 		return null;
 	}
 }
+
+defineInterface(EventTarget, 'EventTarget');

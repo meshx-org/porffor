@@ -1,0 +1,40 @@
+[package]
+name = "meshx-intl"
+version = "0.1.0"
+edition = "2021"
+description = "meshx:intl answered by ICU4X: a component for guests whose host does not answer it, and Porffor's native Intl"
+publish = false
+
+# Two builds of one implementation:
+# - the component (feature `component`, the default): `cargo build --target wasm32-unknown-unknown
+#   --release`, then `wasm-tools component new`; composed into guests with `wac plug`
+# - native (feature `capi`): `cargo rustc --release --no-default-features --features capi
+#   --crate-type staticlib`, the archive a native Porffor program with Intl links
+#   (compiler/deps.js builds and caches it)
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["component"]
+component = []
+capi = ["dep:serde_json", "jiff/tz-system"]
+
+[dependencies]
+wit-bindgen = "0.62"
+icu = "2.3"
+# formatToParts: ICU4X's formatters are Writeables whose parts this collects
+writeable = "0.6"
+# the decimals ICU4X formats and plural rules select on, rounded as ECMA-402 asks
+fixed_decimal = "0.7"
+# IANA time zones: ICU4X has no time zone database of its own, jiff bundles one
+jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
+# the C ABI's requests and replies
+serde_json = { version = "1", optional = true }
+
+# Small over fast, and no unwinding: a panic here is a bug either way.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

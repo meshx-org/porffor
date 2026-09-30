@@ -11,13 +11,11 @@
 //
 // Injected into every guest (tree-shaken away unless used).
 
+import { defineInterface, initPairs, isObject, pairIterator } from './webidl.mjs';
+
 const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 // (see blob.mjs's TAG)
 const TAG = 'Headers';
-
-/** Whether a value is an object (WebIDL's Type(V) is Object). */
-const isObject = (value) =>
-	(typeof value === 'object' && value !== null) || typeof value === 'function';
 
 /** A ByteString: every code unit below 256, else a TypeError. */
 function byteString(value) {
@@ -46,56 +44,21 @@ function headerValue(value) {
 	return text;
 }
 
-/** The pairs a HeadersInit sequence holds (each an iterable of two items). */
-function sequencePairs(init, method) {
-	const out = [];
-
-	for (const pair of { [Symbol.iterator]: () => method.call(init) }) {
-		if (!isObject(pair)) throw new TypeError('Headers: each pair must be a sequence');
-		const items = [...pair];
-
-		if (items.length !== 2) throw new TypeError('Headers: each pair must have two items');
-		out.push(items);
-	}
-
-	return out;
-}
-
-/** The pairs a HeadersInit record holds: its own enumerable keys, in order (WebIDL records). */
-function recordPairs(init) {
-	const out = [];
-
-	for (const key of Reflect.ownKeys(init)) {
-		const descriptor = Reflect.getOwnPropertyDescriptor(init, key);
-
-		if (descriptor !== undefined && descriptor.enumerable) out.push([`${key}`, init[key]]);
-	}
-
-	return out;
-}
+/** A Headers' pairs as iteration shows them (see _sorted). */
+const sortedPairs = (headers) => headers._sorted();
 
 /** A header list: name-value pairs, names lowercased. */
 export class Headers {
 	/** @param {Headers | Iterable<[string, string]> | Record<string, string>} [init] */
-	constructor(init) {
+	constructor(init = undefined) {
 		this._list = [];
 		this._guard = 'none';
 
 		if (init === undefined) return;
 
-		if (init instanceof Headers) {
-			for (const [name, value] of init._list) this._list.push([name, value]);
-
-			return;
-		}
-
 		if (!isObject(init))
 			throw new TypeError('Headers: init must be a sequence of pairs or a record');
-		const method = init[Symbol.iterator];
-
-		if (method !== undefined && method !== null && typeof method !== 'function')
-			throw new TypeError('Headers: init is not iterable');
-		const pairs = method == null ? recordPairs(init) : sequencePairs(init, method);
+		const pairs = initPairs(init, 'Headers', byteString);
 
 		for (const [name, value] of pairs) this.append(name, value);
 	}
@@ -169,42 +132,32 @@ export class Headers {
 		return out;
 	}
 
-	/** Iterates the sorted pairs, sorting again at each step: a change while iterating shows. */
-	*_iterate(kind) {
-		for (let index = 0; ; index++) {
-			const pairs = this._sorted();
-
-			if (index >= pairs.length) return;
-			const [name, value] = pairs[index];
-
-			yield kind === 'key' ? name : kind === 'value' ? value : [name, value];
-		}
-	}
-
 	entries() {
-		return this._iterate('pair');
+		return pairIterator('Headers', this, 'pair', sortedPairs);
 	}
 
 	keys() {
-		return this._iterate('key');
+		return pairIterator('Headers', this, 'key', sortedPairs);
 	}
 
 	values() {
-		return this._iterate('value');
+		return pairIterator('Headers', this, 'value', sortedPairs);
 	}
 
-	forEach(callback, thisArg) {
+	forEach(callback, thisArg = undefined) {
 		if (typeof callback !== 'function')
 			throw new TypeError('Headers.forEach: callback is not a function');
 
-		for (const [name, value] of this._iterate('pair')) callback.call(thisArg, value, name, this);
+		for (const [name, value] of this.entries()) callback.call(thisArg, value, name, this);
 	}
 
 	[Symbol.iterator]() {
-		return this._iterate('pair');
+		return this.entries();
 	}
 
 	get [Symbol.toStringTag]() {
 		return TAG;
 	}
 }
+
+defineInterface(Headers, 'Headers', { iterable: true });

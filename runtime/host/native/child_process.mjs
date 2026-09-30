@@ -1,76 +1,97 @@
-// Native (POSIX libc) host: child processes, as Node's child_process (execSync, execFileSync).
-import './c.mjs';
+// Native host: child processes over libuv (uv_spawn), synchronously: a private loop runs until
+// the child has exited and its pipes are drained, as Node's spawnSync does. node/child_process.mjs
+// makes Node's calls of it. runtime/host/wasi/child_process.mjs is the same for WASI, which has no
+// processes.
+import { takeCString } from '../c.mjs';
 
-export const execSync = (cmd, options = {}) => {
-	const cmdType = Porffor.type(cmd);
-	const input = options.input;
-	const inputType = Porffor.type(input);
-	let status = 0;
-	if (input === undefined) {
-		Porffor.c`
-char *cmd_owned;
-char *cmd_ptr = __porffor_node_cstr(MEM, cmd, (i32)cmdType.val, &cmd_owned);
-status = system(cmd_ptr);
-if (cmd_owned) free(cmd_owned);
-`;
-	} else {
-		Porffor.c`
-char *cmd_owned;
-char *cmd_ptr = __porffor_node_cstr(MEM, cmd, (i32)cmdType.val, &cmd_owned);
-FILE *pipe = popen(cmd_ptr, "w");
-if (!pipe) {
-  status = 1;
-} else {
-  u32 input_ptr = input.val < 0 ? (u32)(i32)input.val : (u32)input.val;
-  if ((i32)inputType.val == 195) {
-    i32 len = *((i32*)(MEM + input_ptr));
-    fwrite(MEM + input_ptr + 4, 1, (size_t)len, pipe);
-  } else if ((i32)inputType.val == 67) {
-    i32 len = *((i32*)(MEM + input_ptr));
-    for (i32 i = 0; i < len; i++) fputc((char)(*((u16*)(MEM + input_ptr + 4 + i * 2)) & 0xff), pipe);
+Porffor.c`
+#include <uv.h>
+
+// a pipe the child writes (its stdout or stderr), read into a growing buffer
+typedef struct {
+  uv_pipe_t pipe;
+  char *buf;
+  size_t len, cap;
+} porf_cp_out;
+
+// the child and what became of it
+typedef struct {
+  uv_process_t process;
+  int64_t status;
+  int signal;
+} porf_cp_child;
+
+static void porf_cp_alloc(uv_handle_t *handle, size_t suggested, uv_buf_t *buf) {
+  porf_cp_out *out = (porf_cp_out *)handle;
+  if (out->cap - out->len < suggested) {
+    size_t cap = out->cap * 2 + suggested;
+    char *next = realloc(out->buf, cap);
+    if (!next) { *buf = uv_buf_init(NULL, 0); return; }
+    out->buf = next;
+    out->cap = cap;
   }
-  status = pclose(pipe);
+  *buf = uv_buf_init(out->buf + out->len, (unsigned int)(out->cap - out->len));
 }
-if (cmd_owned) free(cmd_owned);
+
+static void porf_cp_read(uv_stream_t *stream, ssize_t n, const uv_buf_t *buf) {
+  porf_cp_out *out = (porf_cp_out *)stream;
+  if (n > 0) out->len += (size_t)n;
+  else if (n < 0) uv_close((uv_handle_t *)stream, NULL);
+}
+
+static void porf_cp_exit(uv_process_t *process, int64_t status, int signal) {
+  porf_cp_child *child = (porf_cp_child *)process;
+  child->status = status;
+  child->signal = signal;
+  uv_close((uv_handle_t *)process, NULL);
+}
+
+static void porf_cp_stdin_closed(uv_handle_t *handle) {
+  (void)handle;
+}
+
+static void porf_cp_written(uv_write_t *req, int status) {
+  (void)status;
+  uv_close((uv_handle_t *)req->handle, porf_cp_stdin_closed);
+  free(req);
+}
 `;
-	}
 
-	if (status !== 0) throw new Error('execSync failed');
-};
-
-const __porffor_execFile = (cmd, args, envArr, cwd, input, mode) => {
-	const cmdType = Porffor.type(cmd);
-	const envType = Porffor.type(envArr);
+// runs file with args (an array of strings, argv[0] being file), env (an array of "KEY=value",
+// or undefined for this process's) in cwd (or here), stdin its input when stdio[0] is a pipe.
+// stdio: 0 a pipe (captured), 1 inherited, 2 ignored, for each of stdin, stdout, stderr.
+// [ status, signal, stdout, stderr, spawn error (libuv's code, 0 when it ran) ]
+export const spawnSync = (file, args, env, cwd, input, stdin, stdout, stderr) => {
+	const fileType = Porffor.type(file);
+	const envType = Porffor.type(env);
 	const cwdType = Porffor.type(cwd);
 	const inputType = Porffor.type(input);
 	let status = 0;
+	let signal = 0;
+	let spawnError = 0;
 	let outLen = 0,
 		outBuf = 0,
 		errLen = 0,
 		errBuf = 0;
-
 	Porffor.c`
 {
-  signal(SIGPIPE, SIG_IGN);
-  char *cmd_owned;
-  char *cmd_ptr = __porffor_node_cstr(MEM, cmd, (i32)cmdType.val, &cmd_owned);
+  char *file_owned;
+  char *file_ptr = __porffor_node_cstr(MEM, ${file}, (i32)${fileType}.val, &file_owned);
 
-  const u32 arr = args.val < 0 ? (u32)(i32)args.val : (u32)args.val;
+  const u32 arr = ${args}.val < 0 ? (u32)(i32)${args}.val : (u32)${args}.val;
   const i32 argn = *((i32*)(MEM + arr));
   const u32 ent = *((u32*)(MEM + arr + 4));
-  char **cargv = calloc((size_t)argn + 2, sizeof(char*));
-  char **argown = calloc((size_t)argn + 2, sizeof(char*));
-  cargv[0] = cmd_ptr;
+  char **cargv = calloc((size_t)argn + 1, sizeof(char*));
+  char **argown = calloc((size_t)argn + 1, sizeof(char*));
   for (i32 i = 0; i < argn; i++) {
     const jsval av = porf_unpack(*(jsbits*)(MEM + ent + (u64)i * 8));
-    cargv[i + 1] = __porffor_node_cstr(MEM, av, porf_jv_type(av), &argown[i + 1]);
+    cargv[i] = __porffor_node_cstr(MEM, av, porf_jv_type(av), &argown[i]);
   }
 
-  char **cenv = NULL;
-  char **envown = NULL;
+  char **cenv = NULL, **envown = NULL;
   i32 envn = 0;
-  if ((i32)envType.val == 72) {
-    const u32 earr = envArr.val < 0 ? (u32)(i32)envArr.val : (u32)envArr.val;
+  if ((i32)${envType}.val == 72 /* array */) {
+    const u32 earr = ${env}.val < 0 ? (u32)(i32)${env}.val : (u32)${env}.val;
     envn = *((i32*)(MEM + earr));
     const u32 eent = *((u32*)(MEM + earr + 4));
     cenv = calloc((size_t)envn + 1, sizeof(char*));
@@ -81,161 +102,123 @@ const __porffor_execFile = (cmd, args, envArr, cwd, input, mode) => {
     }
   }
 
-  char *cwd_owned = NULL;
-  char *cwd_ptr = NULL;
-  if ((i32)cwdType.val != 0) cwd_ptr = __porffor_node_cstr(MEM, cwd, (i32)cwdType.val, &cwd_owned);
+  char *cwd_owned = NULL, *cwd_ptr = NULL;
+  if ((i32)${cwdType}.val != 0 /* undefined */) cwd_ptr = __porffor_node_cstr(MEM, ${cwd}, (i32)${cwdType}.val, &cwd_owned);
 
-  // stdout/stderr go via temp files (no pipe deadlock); stdin via a pipe
-  const int capture = (i32)mode.val == 0;
-  char outtmp[] = "/tmp/porffor-exec-out-XXXXXX";
-  char errtmp[] = "/tmp/porffor-exec-err-XXXXXX";
-  int outfd = -1, errfd = -1;
-  if (capture) {
-    outfd = mkstemp(outtmp);
-    errfd = mkstemp(errtmp);
+  uv_loop_t loop;
+  uv_loop_init(&loop);
+  porf_cp_child child = { 0 };
+  uv_pipe_t in_pipe;
+  porf_cp_out out = { 0 }, err = { 0 };
+  const int modes[3] = { (int)PORF_NUM(${stdin}), (int)PORF_NUM(${stdout}), (int)PORF_NUM(${stderr}) };
+
+  uv_stdio_container_t stdio[3];
+  for (int i = 0; i < 3; i++) {
+    if (modes[i] == 1) { stdio[i].flags = UV_INHERIT_FD; stdio[i].data.fd = i; }
+    else if (modes[i] == 2) stdio[i].flags = UV_IGNORE;
+    else {
+      uv_pipe_t *pipe = i == 0 ? &in_pipe : i == 1 ? &out.pipe : &err.pipe;
+      uv_pipe_init(&loop, pipe, 0);
+      stdio[i].flags = UV_CREATE_PIPE | (i == 0 ? UV_READABLE_PIPE : UV_WRITABLE_PIPE);
+      stdio[i].data.stream = (uv_stream_t *)pipe;
+    }
   }
-  int inpipe[2];
-  if (pipe(inpipe) != 0) {
-    status = -1;
+
+  uv_process_options_t options = { 0 };
+  options.exit_cb = porf_cp_exit;
+  options.file = file_ptr;
+  options.args = cargv;
+  options.env = cenv;
+  options.cwd = cwd_ptr;
+  options.stdio_count = 3;
+  options.stdio = stdio;
+
+  const int rc = uv_spawn(&loop, &child.process, &options);
+  if (rc < 0) {
+    ${spawnError} = rc;
+    for (int i = 0; i < 3; i++) if (modes[i] == 0) uv_close((uv_handle_t *)stdio[i].data.stream, NULL);
   } else {
-    const pid_t pid = fork();
-    if (pid == 0) {
-      if (cwd_ptr && chdir(cwd_ptr) != 0) _exit(127);
-      dup2(inpipe[0], 0);
-      close(inpipe[0]);
-      close(inpipe[1]);
-      if (capture) {
-        dup2(outfd, 1);
-        dup2(errfd, 2);
-      } else if ((i32)mode.val == 2) {
-        freopen("/dev/null", "w", stdout);
-        freopen("/dev/null", "w", stderr);
+    // the output read as it comes, while the input is written (a child that writes before it
+    // has read all its input would block on a full pipe otherwise)
+    if (modes[1] == 0) uv_read_start((uv_stream_t *)&out.pipe, porf_cp_alloc, porf_cp_read);
+    if (modes[2] == 0) uv_read_start((uv_stream_t *)&err.pipe, porf_cp_alloc, porf_cp_read);
+    char *bytes = NULL;
+    if (modes[0] == 0) {
+      // the input (a string as UTF-8, a typed array's bytes), then the child's stdin closed
+      size_t len = 0;
+      if ((i32)${inputType}.val != 0 /* undefined */) bytes = __porffor_bytes(MEM, ${input}, (i32)${inputType}.val, &len);
+      if (len > 0) {
+        uv_write_t *write = malloc(sizeof(uv_write_t));
+        uv_buf_t chunk = uv_buf_init(bytes, (unsigned int)len);
+        uv_write(write, (uv_stream_t *)&in_pipe, &chunk, 1, porf_cp_written);
+      } else {
+        uv_close((uv_handle_t *)&in_pipe, NULL);
       }
-      if (cenv) {
-        extern char **environ;
-        environ = cenv;
-      }
-      execvp(cmd_ptr, cargv);
-      _exit(127);
     }
-    close(inpipe[0]);
-    if (pid < 0) {
-      close(inpipe[1]);
-      status = -1;
-    } else {
-      if ((i32)inputType.val != 0) {
-        FILE *inf = fdopen(inpipe[1], "w");
-        if (inf) {
-          const u32 input_ptr = input.val < 0 ? (u32)(i32)input.val : (u32)input.val;
-          if ((i32)inputType.val == 195) fwrite(MEM + input_ptr + 4, 1, (size_t)*((i32*)(MEM + input_ptr)), inf);
-            else if ((i32)inputType.val == 67) __porffor_write_utf8(inf, MEM, input_ptr);
-          fclose(inf);
-        } else close(inpipe[1]);
-      } else close(inpipe[1]);
-
-      int child_status = 0;
-      if (waitpid(pid, &child_status, 0) < 0) status = -1;
-        else if (WIFEXITED(child_status)) status = WEXITSTATUS(child_status);
-        else status = 128 + (WIFSIGNALED(child_status) ? WTERMSIG(child_status) : 0);
-    }
+    uv_run(&loop, UV_RUN_DEFAULT);
+    free(bytes);
+    ${status} = (f64)child.status;
+    ${signal} = (f64)child.signal;
   }
+  uv_run(&loop, UV_RUN_DEFAULT);
+  uv_loop_close(&loop);
 
-  if (capture) {
-    for (int which = 0; which < 2; which++) {
-      const int fd = which == 0 ? outfd : errfd;
-      if (fd < 0) continue;
-      const off_t sz = lseek(fd, 0, SEEK_END);
-      lseek(fd, 0, SEEK_SET);
-      char *tmp = malloc(sz > 0 ? (size_t)sz : 1);
-      i32 got = 0;
-      if (tmp && sz > 0) {
-        ssize_t n;
-        while (got < (i32)sz && (n = read(fd, tmp + got, (size_t)sz - (size_t)got)) > 0) got += (i32)n;
-      }
-      if (which == 0) { outBuf = (f64)(u64)tmp; outLen = got; }
-        else { errBuf = (f64)(u64)tmp; errLen = got; }
-      close(fd);
-    }
-    unlink(outtmp);
-    unlink(errtmp);
-  }
+  ${outLen} = (f64)out.len; ${outBuf} = (f64)(u64)out.buf;
+  ${errLen} = (f64)err.len; ${errBuf} = (f64)(u64)err.buf;
 
-  for (i32 i = 0; i < argn + 2; i++) if (argown && argown[i]) free(argown[i]);
+  for (i32 i = 0; i < argn; i++) if (argown[i]) free(argown[i]);
   if (envown) for (i32 i = 0; i < envn; i++) if (envown[i]) free(envown[i]);
   free(cargv);
   free(argown);
   if (cenv) free(cenv);
   if (envown) free(envown);
   if (cwd_owned) free(cwd_owned);
-  if (cmd_owned) free(cmd_owned);
+  if (file_owned) free(file_owned);
 }
 `;
-
-	const takeBuf = (len, buf) => {
-		const out = Porffor.malloc(len + 6);
-		Porffor.c`
-u32 out_ptr = out.val < 0 ? (u32)(i32)out.val : (u32)out.val;
-*((i32*)(MEM + out_ptr)) = (i32)len.val;
-if ((i32)len.val > 0) memcpy(MEM + out_ptr + 4, (void*)(u64)buf.val, (size_t)len.val);
-if (buf.val != 0) free((void*)(u64)buf.val);
-*(MEM + out_ptr + 4 + (i32)len.val) = 0;
-`;
-		return Porffor.as(out, Porffor.TYPES.bytestring);
-	};
-
-	return { status, stdout: takeBuf(outLen, outBuf), stderr: takeBuf(errLen, errBuf) };
+	return [status, signal, takeBytes(outLen, outBuf), takeBytes(errLen, errBuf), spawnError];
 };
 
-const __porffor_utf8OrBytes = (data) => {
-	let units = 0;
-	Porffor.c`units = __porffor_utf8_units(MEM, data, 195);`;
-	if (units < 0) return data;
-
-	const str = Porffor.malloc(units * 2 + 6);
+// a buffer the C allocated, as a bytestring of its bytes, freed
+const takeBytes = (len, buf) => {
+	const out = Porffor.malloc(len + 6);
 	Porffor.c`
-u32 str_ptr = str.val < 0 ? (u32)(i32)str.val : (u32)str.val;
-*((i32*)(MEM + str_ptr)) = (i32)units;
-__porffor_utf8_decode(MEM, data, 195, str);
+u32 out_ptr = ${out}.val < 0 ? (u32)(i32)${out}.val : (u32)${out}.val;
+*((i32*)(MEM + out_ptr)) = (i32)PORF_NUM(${len});
+if ((i32)PORF_NUM(${len}) > 0) memcpy(MEM + out_ptr + 4, (void*)(u64)PORF_NUM(${buf}), (size_t)PORF_NUM(${len}));
+if (PORF_NUM(${buf}) != 0) free((void*)(u64)PORF_NUM(${buf}));
+*(MEM + out_ptr + 4 + (i32)PORF_NUM(${len})) = 0;
 `;
-	return Porffor.as(str, Porffor.TYPES.string);
+	return Porffor.as(out, Porffor.TYPES.bytestring);
 };
 
-export const execFileSync = (cmd, args = [], options = {}) => {
-	let mode = 0; // 0 capture, 1 inherit, 2 ignore
-	const stdio = options.stdio;
-	if (stdio === 'inherit') mode = 1;
-	else if (stdio === 'ignore') mode = 2;
-	else if (Porffor.type(stdio) == Porffor.TYPES.array) {
-		if (stdio[1] === 'inherit') mode = 1;
-		else if (stdio[1] === 'ignore') mode = 2;
-	}
+// bytes (a bytestring) to this process's stderr, as they are
+export const writeStderr = (bytes) => {
+	Porffor.c`
+u32 bytes_ptr = ${bytes}.val < 0 ? (u32)(i32)${bytes}.val : (u32)${bytes}.val;
+fwrite(MEM + bytes_ptr + 4, 1, (size_t)*((i32*)(MEM + bytes_ptr)), stderr);
+fflush(stderr);
+`;
+};
 
-	let envArr = undefined;
-	if (options.env != null) {
-		envArr = [];
-		const keys = Object.keys(options.env);
-		for (let i = 0; i < keys.length; i++) {
-			envArr.push(keys[i] + '=' + options.env[keys[i]]);
-		}
-	}
+export const errorName = (code) => {
+	let len = 0;
+	let buf = 0;
+	Porffor.c`
+const char *name = uv_err_name((int)PORF_NUM(${code}));
+${len} = strlen(name);
+${buf} = (f64)(u64)strdup(name);
+`;
+	return takeCString(len, buf);
+};
 
-	const res = __porffor_execFile(cmd, args, envArr, options.cwd, options.input, mode);
-
-	let stdout = res.stdout;
-	let stderr = res.stderr;
-	if (options.encoding !== undefined) {
-		stdout = __porffor_utf8OrBytes(stdout);
-		stderr = __porffor_utf8OrBytes(stderr);
-	}
-
-	if (res.status != 0) {
-		const e = new Error('Command failed: ' + cmd + ' (status ' + res.status + ')');
-		e.status = res.status;
-		e.stdout = stdout;
-		e.stderr = stderr;
-		if (res.status == 127) e.code = 'ENOENT';
-		throw e;
-	}
-
-	return stdout;
+export const errorMessage = (code) => {
+	let len = 0;
+	let buf = 0;
+	Porffor.c`
+const char *message = uv_strerror((int)PORF_NUM(${code}));
+${len} = strlen(message);
+${buf} = (f64)(u64)strdup(message);
+`;
+	return takeCString(len, buf);
 };

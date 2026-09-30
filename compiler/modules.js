@@ -1,5 +1,6 @@
 import './prefs.js';
 import parse from './parser/index.js';
+import { analyzeSelectors, selectedFiles } from './selectors.js';
 
 const fs = (typeof process?.version !== 'undefined' ? (await import('node:fs')) : undefined);
 
@@ -12,13 +13,21 @@ const joinPath = (dir, rel) => {
   }
   return '/' + parts.join('/');
 };
-// Node's modules Porffor provides, from its JS runtime (runtime/node): node:fs (or fs) resolves
-// to a path under RUNTIME, which reads from runtime/ beside the compiler or, in the selfhosted
-// compiler (no import.meta), from the copies selfhosted/build.mjs puts in place of this line
-const NODE_MODULES = [ 'fs', 'child_process', 'path', 'os' ];
+// The runtime's modules resolve to paths under RUNTIME, which read from runtime/ beside the
+// compiler or, in the selfhosted compiler (no import.meta), from the copies selfhosted/build.mjs
+// puts in place of the line below. Node's modules are its files in runtime/node (node:fs or fs is
+// node/fs.mjs, node:timers/promises node/timers/promises.mjs), the platform layer its files in
+// runtime/host/native (porffor:fs is host/native/fs.mjs)
+// @noble/hashes' scrypt.js, which the runtime replaces with scrypt's C (runtime/scrypt.mjs)
+const NOBLE_SCRYPT = /[\\/]@noble[\\/]hashes[\\/](?:esm[\\/])?scrypt\.js$/;
 const RUNTIME = '/$porffor/runtime';
 const RUNTIME_FILES = null, RUNTIME_DIR = fs ? import.meta.dirname + '/../runtime' : null;
 const runtimeFile = p => p.startsWith(RUNTIME + '/') ? p.slice(RUNTIME.length + 1) : null;
+
+// the runtime's directory on disk, for what is not embedded (its C, runtime/c)
+export const runtimeDir = () => RUNTIME_DIR;
+// one of the runtime's files (a path under runtime/), as the linker reads and resolves it
+export const runtimeSource = rel => readSource(`${RUNTIME}/${rel}`);
 
 const isFile = p => {
   const rel = runtimeFile(p);
@@ -105,17 +114,36 @@ const nearestPackage = dir => {
   }
 };
 
+// the directory packages are looked up from: a runtime module's (whose path is virtual) is the
+// runtime's on disk, so its own dependencies (@noble) resolve from Porffor's node_modules
+const diskDir = from => {
+  const rel = runtimeFile(from);
+  return rel === null ? dirname(from) : dirname(RUNTIME_DIR + '/' + rel);
+};
+
 const resolve = (spec, from, cjs) => {
-  const nodeName = spec.startsWith('node:') ? spec.slice(5) : NODE_MODULES.includes(spec) ? spec : null;
-  if (nodeName !== null) {
-    if (!NODE_MODULES.includes(nodeName)) throw new Error(`porffor: node:${nodeName} is not provided (Porffor has ${NODE_MODULES.map(x => 'node:' + x).join(', ')})`);
-    return `${RUNTIME}/node/${nodeName}.mjs`;
+  // the platform layer the runtime is written against (porffor:async, clock, fs, ...): libuv's,
+  // natively (a WASI build points these at its host's, runtime/host/wasi: wasi/scripts/bundle.mjs)
+  if (spec.startsWith('porffor:')) {
+    if (!Prefs.runtime) throw new Error(`porffor: ${spec} needs the runtime (--runtime)`);
+    const file = `${RUNTIME}/host/native/${spec.slice(8)}.mjs`;
+    if (!isFile(file)) throw new Error(`porffor: ${spec} is not a platform module`);
+    return file;
   }
+  // Node's modules are the runtime's: a program built without it (--runtime) has none, and a bare
+  // name is Node's module only with the runtime (without it, a package's), as Node's win in Node
+  if (spec.startsWith('node:')) {
+    if (!Prefs.runtime) throw new Error(`porffor: ${spec} needs the runtime (--runtime)`);
+    const file = `${RUNTIME}/node/${spec.slice(5)}.mjs`;
+    if (!isFile(file)) throw new Error(`porffor: ${spec} is not provided`);
+    return file;
+  }
+  if (Prefs.runtime && /^[a-z_]+(\/[a-z_]+)?$/.test(spec) && isFile(`${RUNTIME}/node/${spec}.mjs`)) return `${RUNTIME}/node/${spec}.mjs`;
   const conditions = [ 'porffor', 'worker', cjs ? 'require' : 'import', 'module', 'default', ...(Prefs.conditions ? String(Prefs.conditions).split(',') : []) ];
   let out = null;
   if (spec[0] === '.' || spec[0] === '/') out = resolveFile(joinPath(dirname(from), spec));
   else if (spec[0] === '#') {
-    const pkgDir = nearestPackage(dirname(from));
+    const pkgDir = nearestPackage(diskDir(from));
     const target = pkgDir && resolveMap(readJson(pkgDir + '/package.json').imports ?? {}, spec, conditions);
     out = target ? resolveFile(joinPath(pkgDir, target)) : null;
   } else {
@@ -123,7 +151,7 @@ const resolve = (spec, from, cjs) => {
     const nameEnd = spec.indexOf('/', scoped ? spec.indexOf('/') + 1 : 0);
     const name = nameEnd === -1 ? spec : spec.slice(0, nameEnd);
     const subpath = nameEnd === -1 ? '.' : '.' + spec.slice(nameEnd);
-    const pkgDir = findPackage(dirname(from), name);
+    const pkgDir = findPackage(diskDir(from), name);
     if (pkgDir) {
       const pkg = readJson(pkgDir + '/package.json');
       if (pkg.exports != null) {
@@ -134,8 +162,81 @@ const resolve = (spec, from, cjs) => {
     }
   }
   if (!out) throw new Error(`porffor: cannot resolve '${spec}' from ${from}`);
+  // @noble/hashes' scrypt, however it is imported: the runtime's, over scrypt's C
+  if (Prefs.runtime && NOBLE_SCRYPT.test(out)) return `${RUNTIME}/scrypt.mjs`;
   return out;
 };
+
+// The globals a browser and WinterCG runtimes have, and Node's (runtime/globals.json), that the
+// program names: a module installing them on globalThis (as the platform's own are: writable,
+// configurable, not enumerable), and each global's provider file, whose export the program's own
+// references are bound to (as esbuild's inject binds them in a WASI build: a bare `crypto` is
+// the runtime's, not Porffor's builtin one). Null for none. A native build with the runtime can
+// back every provider. What names a global is the program's code and Node's modules it imports
+// (written as Node code, which assumes Node's globals); the runtime's other modules import what
+// they use. A local that only looks like a global costs its provider's code; a property does not
+const namesGlobals = mod => {
+  const rel = runtimeFile(mod.file);
+  return rel === null || rel.startsWith('node/');
+};
+// the names code may read as globals: every identifier but a property's name (obj.x, a key in an
+// object literal, a method's or class field's: a server's `{ fetch(request) {} }` is no use of
+// fetch), a globalThis property's (globalThis.fetch), and the words of every string
+// (globalThis['fetch'], a source eval runs)
+const GLOBAL_OBJECTS = [ 'globalThis', 'self', 'window', 'global' ];
+const nameRefs = programs => {
+  const out = new Set();
+  const words = text => { for (const w of text.match(/[A-Za-z_$][\w$]*/g) ?? []) out.add(w); };
+  const walk = node => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { for (const x of node) walk(x); return; }
+    switch (node.type) {
+      case 'Identifier': out.add(node.name); return;
+      case 'Literal': if (typeof node.value === 'string') words(node.value); return;
+      case 'TemplateElement': words(node.value.raw); return;
+      case 'MemberExpression':
+        walk(node.object);
+        if (node.computed || (node.object.type === 'Identifier' && GLOBAL_OBJECTS.includes(node.object.name))) walk(node.property);
+        return;
+      case 'Property': case 'MethodDefinition': case 'PropertyDefinition': case 'AccessorProperty':
+        if (node.computed) walk(node.key);
+        walk(node.value);
+        return;
+    }
+    for (const key in node) if (key !== 'start' && key !== 'end') walk(node[key]);
+  };
+  for (const program of programs) walk(program.body);
+  return out;
+};
+
+const globalsPrelude = (mods, extraPrograms = []) => {
+  const own = [ ...new Set(mods) ].filter(namesGlobals);
+  const text = own.map(m => m.src).join('\n');
+  const programs = [ ...own.filter(m => m.body).map(m => ({ type: 'Program', body: m.body })), ...extraPrograms ];
+  const refs = nameRefs(programs);
+  const manifest = JSON.parse(readSource(`${RUNTIME}/globals.json`));
+  // the variants the program's selector values choose (a compression format, a Web Crypto
+  // algorithm, an encoding label), every one of a selector passed a value it cannot see
+  const selected = selectedFiles(manifest, analyzeSelectors(programs, manifest));
+  const imports = [], defines = [], bindings = [];
+  for (const provider of manifest.providers) {
+    if (provider.trigger && !provider.trigger.some(word => new RegExp(`\\b${word}\\b`).test(text))) continue;
+    if (selected.has(provider.file)) imports.push(`import './${provider.file}';`);
+    // loaded for what it does on loading (byte streams plugging into ReadableStream)
+    if (provider.load && new RegExp(provider.load).test(text)) imports.push(`import './${provider.file}';`);
+    for (const name of provider.names) {
+      if (!refs.has(name)) continue;
+      imports.push(`import { ${name} as ${name}$ } from './${provider.file}';`);
+      defines.push(`Object.defineProperty(globalThis, '${name}', { value: ${name}$, writable: true, configurable: true, enumerable: false });`);
+      bindings.push({ name, file: `${RUNTIME}/${provider.file}` });
+    }
+  }
+  return imports.length === 0 ? null : { source: imports.join('\n') + '\n' + defines.join('\n') + '\n', bindings };
+};
+
+// an entry that is CommonJS: a .cjs file, or a script (no module syntax, not a module by its
+// package) that requires or exports
+const isCommonJsEntry = (file, src) => !isEsmSource(file, src) && (/\.c[jt]s$/.test(file) || /\brequire\s*\(|\bmodule\.exports\b|\bexports\.\w/.test(src));
 
 const isEsmSource = (file, src) => {
   if (/\.m[jt]s$/.test(file)) return true;
@@ -191,12 +292,10 @@ const patternNames = (node, out) => {
 };
 
 const isFunc = node => node.type === 'FunctionDeclaration' || node.type === 'FunctionExpression' || node.type === 'ArrowFunctionExpression';
-const isHostHook = name => /^__porffor_/i.test(name);
 
 // names declared directly in a statement list (let/const/class/function)
 const lexicalNames = (body, out) => {
-  for (let x of body) {
-    if (x.type === 'ExportNamedDeclaration') x = x.declaration;
+  for (const x of body) {
     if (x.type === 'VariableDeclaration' && x.kind !== 'var') for (const d of x.declarations) patternNames(d.id, out);
     else if (x.type === 'FunctionDeclaration' || x.type === 'ClassDeclaration' || x.type === 'TSEnumDeclaration') { if (x.id) out.push(x.id.name); }
   }
@@ -291,7 +390,8 @@ export default (entrySource, entryFile, opts = {}) => {
 
     const ts = /\.[cm]?tsx?$/.test(file) || !!(entry ? opts.ts : Prefs.parseTypes || Prefs.t);
     anyTs ||= ts;
-    mod.esm = entry || isEsmSource(file, source);
+    // the entry is a module, but with the runtime a CommonJS one runs as Node runs it
+    mod.esm = entry ? !(Prefs.runtime && isCommonJsEntry(file, source)) : isEsmSource(file, source);
     if (mod.esm) mod.body = parse(source, { module: true, ts }).body;
       else try {
         mod.body = parse(source, { module: false, ts }).body;
@@ -428,8 +528,7 @@ export default (entrySource, entryFile, opts = {}) => {
           if (node.exportKind === 'type') break;
           if (node.declaration) {
             const decl = node.declaration;
-            // entry __porffor_ names are host hooks the runtime looks up by name (native fetch): kept as exports
-            body.push(mod.entry && decl.id && isHostHook(decl.id.name) ? node : decl);
+            body.push(decl);
             if (decl.type.startsWith('TS') && decl.type !== 'TSEnumDeclaration') break;
             if (decl.type === 'VariableDeclaration') {
               for (const d of decl.declarations) for (const name of patternNames(d.id, [])) mod.exports.set(name, { local: name });
@@ -660,9 +759,15 @@ export default (entrySource, entryFile, opts = {}) => {
     const shadowed = name => scopes.some(s => s.includes(name));
     const firstRef = new Map();
     const requireTarget = node => {
-      if (node.callee.type !== 'Identifier' || node.callee.name !== 'require' || shadowed('require') || node.arguments.length !== 1 || typeof node.arguments[0].value !== 'string') return null;
+      // (a module's own top-level require, createRequire's, is its to call)
+      if (node.callee.type !== 'Identifier' || node.callee.name !== 'require' || shadowed('require') || map.has('require') || node.arguments.length !== 1 || typeof node.arguments[0].value !== 'string') return null;
       const d = dep(mod, { source: node.arguments[0] }, true);
-      return d.error ? throwExpr(d.error) : d.esm ? ident(nsName(d)) : exportsOf(d);
+      if (d.error) return throwExpr(d.error);
+      if (!d.esm) return exportsOf(d);
+      // Node's modules (the runtime's, ES modules) are what Node's require gives: their default
+      const rel = runtimeFile(d.file);
+      if (rel !== null && rel.startsWith('node/') && d.exports.has('default')) return member(ident(nsName(d)), 'default');
+      return ident(nsName(d));
     };
     const scoped = (names, fn) => { scopes.push(names); fn(); scopes.pop(); };
     const walkKeys = node => {
@@ -815,13 +920,37 @@ export default (entrySource, entryFile, opts = {}) => {
     };
     script = walk(opts.script.body);
   } else entryMod = load(entryFile, entrySource, null, true);
+  // a program whose entry exports default { fetch } is a server, as in Bun (and as a WASI build
+  // makes it the wasi:http handler export): a module after the entry serves it
+  // (porffor:http-server, runtime/serve.mjs). Only such an entry brings the server in
+  let root = entryMod;
+  if (opts.serve && entryMod.esm && entryMod.exports.has('default') && /\bfetch\b/.test(entrySource)) {
+    root = load(`${RUNTIME}/serve.gen.mjs`, `import app from ${JSON.stringify(entryFile)};\nimport { serve } from 'porffor:http-server';\n\nif (typeof app?.fetch === 'function') serve(app);\n`);
+  }
+  // the runtime's globals the program names, installed before it runs
+  let globalBindings = [];
+  if (opts.globals) {
+    const prelude = globalsPrelude([ entryMod, ...modules.values() ], script ? [ { type: 'Program', body: script } ] : []);
+    if (prelude !== null) {
+      entryMod.deps.unshift(load(`${RUNTIME}/globals.gen.mjs`, prelude.source));
+      globalBindings = prelude.bindings.map(x => ({ ...x, pattern: new RegExp(`\\b${x.name}\\b`), dep: modules.get(x.file) }));
+    }
+  }
 
-  // evaluation order: dependencies first
+  // evaluation order: dependencies first. A dependency still being visited is a cycle: every
+  // module on the path back to it is in one (cyclic)
   const order = [];
+  const visiting = [];
   const visitPost = mod => {
-    if (mod.ordered) return;
+    if (mod.ordered) {
+      const at = visiting.indexOf(mod);
+      if (at !== -1) for (let i = at; i < visiting.length; i++) visiting[i].cyclic = true;
+      return;
+    }
     mod.ordered = true;
+    visiting.push(mod);
     for (const d of mod.deps) visitPost(d);
+    visiting.pop();
     order.push(mod);
   };
 
@@ -832,12 +961,20 @@ export default (entrySource, entryFile, opts = {}) => {
     for (const mod of pending) {
       mod.renamed = true;
       const map = new Map();
-      for (const name of lexicalNames(mod.body, varNames(mod.body, []))) {
-        if (!(mod.entry && isHostHook(name))) map.set(name, globalName(mod, name));
+      for (const name of lexicalNames(mod.body, varNames(mod.body, []))) map.set(name, globalName(mod, name));
+      // a CommonJS module's file and directory, and (as Bun has them) an ES module's that does not
+      // declare its own
+      if (!mod.esm || (opts.globals && namesGlobals(mod))) {
+        if (!map.has('__filename')) map.set('__filename', literal(mod.file));
+        if (!map.has('__dirname')) map.set('__dirname', literal(dirname(mod.file)));
       }
-      if (!mod.esm) {
-        map.set('__filename', literal(mod.file));
-        map.set('__dirname', literal(dirname(mod.file)));
+      // the runtime's globals it names, bound to their providers' exports (unless it declares them)
+      if (!mod.script && namesGlobals(mod)) {
+        for (const g of globalBindings) {
+          if (map.has(g.name) || !g.pattern.test(mod.src)) continue;
+          const r = resolveExport(g.dep, g.name);
+          if (r?.global) map.set(g.name, r.global);
+        }
       }
       const snapshots = [];
       const imported = Object.create(null);
@@ -862,7 +999,9 @@ export default (entrySource, entryFile, opts = {}) => {
     }
   }
 
-  if (!script) visitPost(entryMod);
+  // (a script entry is not a module: what it depends on is only the runtime's prelude)
+  if (!script) visitPost(root);
+  else for (const d of entryMod.deps) visitPost(d);
   for (const mod of order) if (mod.linkError) throw mod.linkError;
 
   // modules only import() reaches run on the first import that does, their static imports first
@@ -927,12 +1066,23 @@ export default (entrySource, entryFile, opts = {}) => {
   for (const { lets } of lazyBodies) body.push(...lets);
   body.push(...loaders);
   for (const { out } of lazyBodies) body.push(...out);
+  // the function declarations of modules in a cycle exist before any of them runs (linking
+  // instantiates them): one that runs first can call another's (a unit only sees the functions
+  // of units before it), so they go first, in no unit
+  for (const mod of order) {
+    if (!mod.cyclic || !mod.esm) continue;
+    for (const x of mod.body) if (x.type === 'FunctionDeclaration') { x.strict = true; body.push(x); }
+  }
   for (const mod of order) {
     if (mod.nsExpr) {
       const at = mod.body.findLastIndex(x => x.type === 'ClassDeclaration') + 1;
       mod.body.splice(at, 0, { type: 'ExpressionStatement', expression: { type: 'AssignmentExpression', operator: '=', left: ident(nsName(mod)), right: mod.nsExpr } });
     }
-    for (const x of mod.body) { x._unit = mod.id; body.push(x); }
+    for (const x of mod.body) {
+      if (mod.cyclic && mod.esm && x.type === 'FunctionDeclaration') continue;
+      x._unit = mod.id;
+      body.push(x);
+    }
   }
   if (script) body.push(...script);
 

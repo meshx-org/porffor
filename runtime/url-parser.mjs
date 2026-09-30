@@ -43,6 +43,7 @@ const SLASH = 0x2f;
 const BACKSLASH = 0x5c;
 const QUESTION = 0x3f;
 const HASH = 0x23;
+const SPACE = 0x20;
 const COLON = 0x3a;
 const AT = 0x40;
 
@@ -537,6 +538,12 @@ const STATES = {
 		} else if (cp === HASH) {
 			url.fragment = '';
 			ctx.state = 'fragment';
+		} else if (cp === SPACE) {
+			// a space before a query or fragment is encoded, so that removing those later
+			// cannot leave the path ending in a space
+			const next = ctx.points[ctx.pointer + 1];
+
+			url.path += next === QUESTION || next === HASH ? '%20' : ' ';
 		} else if (cp !== EOF) url.path += percentEncode(cp, C0_CONTROL);
 	},
 

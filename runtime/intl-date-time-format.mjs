@@ -1,8 +1,8 @@
 // Intl.DateTimeFormat over meshx:intl/date-time: the options read and checked here, the
 // formatting (patterns, names, time zones) done by the host.
 
-import { DateTimeFormat as HostDateTimeFormat } from 'meshx:intl/date-time@0.1.0';
-import { supportedLocales } from 'meshx:intl/locale@0.1.0';
+import { DateTimeFormat as HostDateTimeFormat } from 'porffor:intl/date-time';
+import { supportedLocales } from 'porffor:intl/locale';
 import {
 	LOCALE_MATCHERS,
 	boolOption,
