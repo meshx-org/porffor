@@ -1034,55 +1034,94 @@ const generateYield = (scope, decl) => {
 
   if (decl.delegate) {
     const known = knownType(scope, getNodeType(scope, arg));
-    if (known === TYPES.__porffor_generator) {
-      const delegate = reuse(scope, generate(scope, arg));
-      const sent = tmp(scope, T.jsval, valUndefined());
-      const result = tmp(scope, T.jsval, valUndefined());
-      // 2 once return() reached this yield: passed on to the delegate, whose own finally
-      // blocks run (and may yield on), and when it is done this generator returns too
-      const mode = tmp(scope, T.i32, Const(T.i32, 0));
-      const L = fresh(scope);
-      stmt(scope, Loop(null, null, collect(scope, () => {
-        const done = reuse(scope, Call('__Porffor_coroutine_resume', [ delegate, sent, mode ], T.i32));
-        emitIf(scope, done, () => {
-          emitIf(scope, mode, () => generatorReturn(scope, Call('__Porffor_coroutine_value', [ delegate ])));
-          assign(scope, result, Call('__Porffor_coroutine_value', [ delegate ]));
-          stmt(scope, Break(L));
-        });
-        assign(scope, sent, Yield(Call('__Porffor_coroutine_value', [ delegate ])));
-        assign(scope, mode, Bin('*', T.i32, Call('__Porffor_coroutine_returning', [], T.i32), Const(T.i32, 2)));
-      }), L));
-      return result;
-    }
+    const gen = known === TYPES.__porffor_generator;
+    // any iterator, once the program can make its own; a built-in iterable known here (an
+    // array, a string) is stepped by the for...of
+    if (gen || (!scope.async && usesIterProtocol && !globalThis.precompile && !FAST_ITERABLES.has(known)))
+      return yieldDelegate(scope, generate(scope, arg), gen);
+    if (scope.async || known != null) return yieldForOf(scope, arg);
 
-    // in an async generator, yield* takes async iterables: a for await over them
-    const valueName = '#yieldstar' + uniqId(scope);
-    generateForOf(scope, {
-      type: 'ForOfStatement',
-      await: scope.async === true,
-      left: {
-        type: 'VariableDeclaration',
-        kind: 'const',
-        declarations: [ {
-          type: 'VariableDeclarator',
-          id: { type: 'Identifier', name: valueName },
-          init: null
-        } ]
-      },
-      right: arg,
-      body: {
-        type: 'ExpressionStatement',
-        expression: {
-          type: 'YieldExpression',
-          argument: { type: 'Identifier', name: valueName },
-          delegate: false
-        }
-      }
-    });
-    return valUndefined();
+    // only built-in iterables and generators: a generator is delegated to, the rest stepped
+    const source = '#yieldstar_source' + uniqId(scope);
+    allocVar(scope, source);
+    assign(scope, Local(source, T.jsval), coerceValue(generate(scope, arg), T.jsval));
+    const result = tmp(scope, T.jsval, valUndefined());
+    emitIf(scope, Bin('==', T.i32, JvType(Local(source, T.jsval)), Const(T.i32, TYPES.__porffor_generator)),
+      () => assign(scope, result, yieldDelegate(scope, Local(source, T.jsval), true)),
+      () => exprStmt(scope, yieldForOf(scope, identNode(source))));
+    return result;
   }
 
   return yieldPoint(scope, generate(scope, arg));
+};
+
+// yield*, the delegate resumed the way this generator was: mode 0 next, 1 throw (caught at the
+// yield), 2 return() reached this yield, passed on so the delegate's own finally blocks run
+// (and may yield on), and when it is done this generator returns too. gen: a generator,
+// resumed directly; otherwise any iterable, through its iterator record
+const yieldDelegate = (scope, source, gen) => {
+  const delegate = reuse(scope, gen ? source : builtinCall(scope, '__Porffor_iter_open', [ source ]));
+  const sent = tmp(scope, T.jsval, valUndefined());
+  const result = tmp(scope, T.jsval, valUndefined());
+  const mode = tmp(scope, T.i32, Const(T.i32, 0));
+  const value = tmp(scope, T.jsval);
+  const caught = '#yield_star_caught' + uniqId(scope);
+  allocVar(scope, caught);
+  const L = fresh(scope);
+  stmt(scope, Loop(null, null, collect(scope, () => {
+    let done;
+    if (gen) {
+      done = reuse(scope, Call('__Porffor_coroutine_resume', [ delegate, sent, mode ], T.i32));
+      assign(scope, value, Call('__Porffor_coroutine_value', [ delegate ]));
+    } else {
+      const step = reuse(scope, builtinCall(scope, '__Porffor_iter_delegate', [ delegate, sent, mode ]));
+      done = truthy(scope, generate(scope, memberNode(identNode(step[N_A]), identNode('done'))));
+      assign(scope, value, generate(scope, memberNode(identNode(step[N_A]), identNode('value'))));
+    }
+    emitIf(scope, done, () => {
+      emitIf(scope, Bin('==', T.i32, mode, Const(T.i32, 2)), () => generatorReturn(scope, value));
+      assign(scope, result, value);
+      stmt(scope, Break(L));
+    });
+    stmt(scope, Try(collect(scope, () => {
+      assign(scope, sent, Yield(value));
+      assign(scope, mode, Bin('*', T.i32, Call('__Porffor_coroutine_returning', [], T.i32), Const(T.i32, 2)));
+    }), caught, collect(scope, () => {
+      // the return signal closing this generator goes on out
+      emitIf(scope, Bin('==', T.jsval, Local(caught, T.jsval), coroReturnSignal()), () => stmt(scope, Throw(Local(caught, T.jsval))));
+      assign(scope, sent, Local(caught, T.jsval));
+      assign(scope, mode, Const(T.i32, 1));
+    })));
+  }), L));
+  return result;
+};
+
+// yield* as a for...of yielding each value (a for await in an async generator, over async iterables)
+const yieldForOf = (scope, source) => {
+  const valueName = '#yieldstar' + uniqId(scope);
+  generateForOf(scope, {
+    type: 'ForOfStatement',
+    await: scope.async === true,
+    left: {
+      type: 'VariableDeclaration',
+      kind: 'const',
+      declarations: [ {
+        type: 'VariableDeclarator',
+        id: { type: 'Identifier', name: valueName },
+        init: null
+      } ]
+    },
+    right: source,
+    body: {
+      type: 'ExpressionStatement',
+      expression: {
+        type: 'YieldExpression',
+        argument: { type: 'Identifier', name: valueName },
+        delegate: false
+      }
+    }
+  });
+  return valUndefined();
 };
 
 // a yield, and after it what return() asks for: the generator returns the value sent

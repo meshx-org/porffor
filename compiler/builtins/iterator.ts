@@ -20,6 +20,10 @@ export const __Porffor_iter_isGenerator = (it: any): boolean => {
 // GetIterator(obj, sync)
 export const __Porffor_iter_open = (obj: any): object => {
   if (obj == null) throw new TypeError('Cannot iterate over undefined or null');
+  // a generator is its own iterator
+  if (Porffor.comptime.flag`hasType.__porffor_generator`) {
+    if (Porffor.type(obj) == Porffor.TYPES.__porffor_generator) return __Porffor_iter_generatorRecord(obj);
+  }
   const method: any = obj[Symbol.iterator];
   if (typeof method !== 'function') throw new TypeError('Object is not iterable');
   const it: any = Porffor.callThis(method, obj);
@@ -151,6 +155,49 @@ export const __Porffor_iter_close = (rec: any): void => {
   if (ret == null) return;
   const result: any = Porffor.callThis(ret, rec.it);
   if (!Porffor.object.isObject(result)) throw new TypeError('Iterator return result is not an object');
+};
+
+// yield*'s step of the iterator it delegates to: what the generator was resumed with passed
+// on, mode 0 next(value), 1 throw(value), 2 return(value). The inner result { value, done }:
+// with no throw method the iterator is closed and yield* throws; with no return method, the
+// return completes at once
+export const __Porffor_iter_delegate = (rec: any, value: any, mode: i32): object => {
+  const it: any = rec.it;
+  let result: any = undefined;
+  if (rec.builtin) {
+    if (mode == 0) {
+      result = {};
+      result.value = __Porffor_iter_builtinStep(it);
+      result.done = it.__done;
+      return result;
+    }
+  } else if (Porffor.comptime.flag`hasType.__porffor_generator`) {
+    if (Porffor.type(it) == Porffor.TYPES.__porffor_generator) return __Porffor_Generator_step(it, value, mode);
+  }
+
+  if (mode == 0) {
+    const next: any = rec.next;
+    result = Porffor.callThis(next, it, value);
+  } else if (mode == 1) {
+    const throwMethod: any = rec.builtin ? undefined : it.throw;
+    if (throwMethod == null) {
+      __Porffor_iter_close(rec);
+      throw new TypeError('The iterator does not provide a throw method');
+    }
+    result = Porffor.callThis(throwMethod, it, value);
+  } else {
+    const returnMethod: any = rec.builtin ? undefined : it.return;
+    if (returnMethod == null) {
+      if (rec.builtin) it.__done = true;
+      result = {};
+      result.value = value;
+      result.done = true;
+      return result;
+    }
+    result = Porffor.callThis(returnMethod, it, value);
+  }
+  if (!Porffor.object.isObject(result)) throw new TypeError('Iterator result is not an object');
+  return result;
 };
 
 export const __Porffor_iter_closeAsync = async (rec: any): void => {
