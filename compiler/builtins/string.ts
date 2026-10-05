@@ -1487,11 +1487,19 @@ export const __ByteString_prototype_split = function (this: bytestring, separato
 };
 
 
-// todo: unicode normalization
+// todo: unicode normalization (the form is checked, the string comes back as it is)
+export const __Porffor_string_normalizeForm = (form: any): void => {
+  if (form === undefined) return;
+  const name: any = ecma262.ToString(form);
+  if (name != 'NFC' && name != 'NFD' && name != 'NFKC' && name != 'NFKD')
+    throw new RangeError('The normalization form should be one of NFC, NFD, NFKC, NFKD');
+};
 export const __String_prototype_normalize = function (this: string, form: any = undefined) {
+  __Porffor_string_normalizeForm(form);
   return this;
 };
 export const __ByteString_prototype_normalize = function (this: bytestring, form: any = undefined) {
+  __Porffor_string_normalizeForm(form);
   return this;
 };
 
