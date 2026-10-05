@@ -448,7 +448,7 @@ export const BuiltinVars = ({ builtinFuncs }) => {
       writable: true,
       enumerable: true,
       configurable: true
-    }, autoFuncKeys(x).slice(0, 12)));
+    }, autoFuncKeys(x)));
   }
 
   for (const x of [ 'Array', 'ArrayBuffer', 'Atomics', 'Date', 'Error', 'JSON', 'Object', 'Promise', 'Reflect', 'String', 'Symbol', 'Uint8Array', 'Int8Array', 'Uint8ClampedArray', 'Uint16Array', 'Int16Array', 'Uint32Array', 'Int32Array', 'Float16Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array', 'SharedArrayBuffer', 'BigInt', 'Boolean', 'DataView', 'AggregateError', 'TypeError', 'ReferenceError', 'SyntaxError', 'RangeError', 'EvalError', 'URIError', 'SuppressedError', 'DisposableStack', 'AsyncDisposableStack', 'Function', 'Map', 'RegExp', 'Set', 'WeakMap', 'WeakRef', 'WeakSet', 'TextEncoder', 'TextDecoder', 'Iterator' ]) {
