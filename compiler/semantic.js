@@ -13,11 +13,11 @@ const isFunctionScope = node =>
   node?.type === 'FunctionExpression' ||
   node?.type === 'ArrowFunctionExpression';
 
-const findLexicalThisOwner = currentFunc => {
-  if (currentFunc?.type !== 'ArrowFunctionExpression') return null;
+const findLexicalThisOwner = (currentFunc, boundary) => {
+  if (currentFunc?.type !== 'ArrowFunctionExpression' || currentFunc === boundary) return null;
 
   let owner = currentFunc._parentFunc;
-  while (owner) {
+  while (owner && owner !== boundary) {
     if (owner.type !== 'ArrowFunctionExpression') return owner;
     owner = owner._parentFunc;
   }
@@ -764,7 +764,7 @@ const annotateNode = (node, parent, key) => {
     case 'ThisExpression':
     case 'Super': {
       const currentFunc = scopes[scopes.lastFuncs.at(-1)];
-      const owner = findLexicalThisOwner(currentFunc);
+      const owner = findLexicalThisOwner(currentFunc, classFieldInitializerFunc);
       if (owner) {
         node._closureThisFunc = owner;
         currentFunc._capturesThis = owner;
