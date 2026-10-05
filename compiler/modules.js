@@ -383,6 +383,7 @@ export default (entrySource, entryFile, opts = {}) => {
     modules.set(key, mod);
 
     if (kind === 'json' || kind === 'text') {
+      mod.json = kind === 'json';
       mod.body = [ varDecl('const', 'default', kind === 'json' ? jsonToAst(JSON.parse(source)) : literal(source)) ];
       mod.exports.set('default', { local: 'default' });
       return mod;
@@ -763,6 +764,7 @@ export default (entrySource, entryFile, opts = {}) => {
       if (node.callee.type !== 'Identifier' || node.callee.name !== 'require' || shadowed('require') || map.has('require') || node.arguments.length !== 1 || typeof node.arguments[0].value !== 'string') return null;
       const d = dep(mod, { source: node.arguments[0] }, true);
       if (d.error) return throwExpr(d.error);
+      if (d.json) return ident(globalName(d, 'default'));
       if (!d.esm) return exportsOf(d);
       // Node's modules (the runtime's, ES modules) are what Node's require gives: their default
       const rel = runtimeFile(d.file);
