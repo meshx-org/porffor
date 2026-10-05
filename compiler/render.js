@@ -3478,9 +3478,16 @@ static void porf_gc_mark_js(f64 value, i32 type) {
 ${Prefs.ropes ? `  // a rope (--ropes) is a string value whose block holds its halves
   if ((type == ${TYPES.bytestring} || type == ${TYPES.string}) && porf_gc_kinds[porf_gc_gran(body)] == PORF_GC_KIND_ROPE) type = PORF_GC_KIND_ROPE;
 ` : ''}  if (porf_gc_is_block_start(body)) {
+    // an old block in a minor collection, or one already marked as this type: done, without
+    // reading its header (the shape checks)
+    const u32 g = porf_gc_gran(body);
+    if (porf_gc_minor_mode && porf_gc_bit(PORF_GC_B_YOUNG, g) == 0u) return;
+    if (porf_gc_bit(PORF_GC_B_MARK, g) != 0u && porf_gc_kinds[g] == (u8)type) {
+      porf_gc_scan_young_seen |= porf_gc_minor_mode;
+      return;
+    }
     if (type == ${TYPES.object} && !porf_gc_object_shape_valid(body)) return;
     if (!porf_gc_mark_body(body)) {
-      if (porf_gc_minor_mode && porf_gc_bit(PORF_GC_B_YOUNG, porf_gc_gran(body)) == 0u) return;
       if (porf_gc_should_rescan_marked_body(body, type)) {
         porf_gc_set_marked_type(body, type);
         porf_gc_enqueue_mark(body, type);
