@@ -616,6 +616,7 @@ const annotateNode = (node, parent, key) => {
 
     case 'ForInStatement':
     case 'ForOfStatement':
+      markWrite(node.left);
       recordStorageWrite(node.left.type === 'VariableDeclaration' ? node.left.declarations[0]?.id : node.left, null);
       break;
 
