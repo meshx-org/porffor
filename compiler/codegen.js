@@ -1034,20 +1034,27 @@ const generateYield = (scope, decl) => {
 
   if (decl.delegate) {
     const known = knownType(scope, getNodeType(scope, arg));
-    const gen = known === TYPES.__porffor_generator;
+    // how it is stepped: 'generator' resumed directly, 'iterator' through its record, 'async'
+    // (in an async generator) through its async record, awaited
+    const kind = scope.async ? 'async' : 'generator';
+    const coroutine = known === TYPES.__porffor_generator || (scope.async && known === TYPES.__porffor_asyncgenerator);
+    if (coroutine) return yieldDelegate(scope, generate(scope, arg), kind);
     // any iterator, once the program can make its own; a built-in iterable known here (an
     // array, a string) is stepped by the for...of
-    if (gen || (!scope.async && usesIterProtocol && !globalThis.precompile && !FAST_ITERABLES.has(known)))
-      return yieldDelegate(scope, generate(scope, arg), gen);
-    if (scope.async || known != null) return yieldForOf(scope, arg);
+    if (usesIterProtocol && !globalThis.precompile && !FAST_ITERABLES.has(known))
+      return yieldDelegate(scope, generate(scope, arg), scope.async ? 'async' : 'iterator');
+    if (known != null) return yieldForOf(scope, arg);
 
     // only built-in iterables and generators: a generator is delegated to, the rest stepped
     const source = '#yieldstar_source' + uniqId(scope);
     allocVar(scope, source);
     assign(scope, Local(source, T.jsval), coerceValue(generate(scope, arg), T.jsval));
     const result = tmp(scope, T.jsval, valUndefined());
-    emitIf(scope, Bin('==', T.i32, JvType(Local(source, T.jsval)), Const(T.i32, TYPES.__porffor_generator)),
-      () => assign(scope, result, yieldDelegate(scope, Local(source, T.jsval), true)),
+    const type = reuse(scope, JvType(Local(source, T.jsval)));
+    let isCoroutine = Bin('==', T.i32, type, Const(T.i32, TYPES.__porffor_generator));
+    if (scope.async) isCoroutine = Bin('|', T.i32, isCoroutine, Bin('==', T.i32, type, Const(T.i32, TYPES.__porffor_asyncgenerator)));
+    emitIf(scope, isCoroutine,
+      () => assign(scope, result, yieldDelegate(scope, Local(source, T.jsval), kind)),
       () => exprStmt(scope, yieldForOf(scope, identNode(source))));
     return result;
   }
@@ -1057,10 +1064,12 @@ const generateYield = (scope, decl) => {
 
 // yield*, the delegate resumed the way this generator was: mode 0 next, 1 throw (caught at the
 // yield), 2 return() reached this yield, passed on so the delegate's own finally blocks run
-// (and may yield on), and when it is done this generator returns too. gen: a generator,
-// resumed directly; otherwise any iterable, through its iterator record
-const yieldDelegate = (scope, source, gen) => {
-  const delegate = reuse(scope, gen ? source : builtinCall(scope, '__Porffor_iter_open', [ source ]));
+// (and may yield on), and when it is done this generator returns too. kind: 'generator' a
+// generator, resumed directly; 'iterator' any iterable, through its iterator record; 'async'
+// any async iterable (or sync, its values awaited), the step awaited
+const yieldDelegate = (scope, source, kind) => {
+  const gen = kind === 'generator';
+  const delegate = reuse(scope, gen ? source : builtinCall(scope, kind === 'async' ? '__Porffor_iter_openAsync' : '__Porffor_iter_open', [ source ]));
   const sent = tmp(scope, T.jsval, valUndefined());
   const result = tmp(scope, T.jsval, valUndefined());
   const mode = tmp(scope, T.i32, Const(T.i32, 0));
@@ -1074,7 +1083,9 @@ const yieldDelegate = (scope, source, gen) => {
       done = reuse(scope, Call('__Porffor_coroutine_resume', [ delegate, sent, mode ], T.i32));
       assign(scope, value, Call('__Porffor_coroutine_value', [ delegate ]));
     } else {
-      const step = reuse(scope, builtinCall(scope, '__Porffor_iter_delegate', [ delegate, sent, mode ]));
+      const step = reuse(scope, kind === 'async'
+        ? awaitValue(scope, builtinCall(scope, '__Porffor_iter_delegateAsync', [ delegate, sent, mode ]))
+        : builtinCall(scope, '__Porffor_iter_delegate', [ delegate, sent, mode ]));
       done = truthy(scope, generate(scope, memberNode(identNode(step[N_A]), identNode('done'))));
       assign(scope, value, generate(scope, memberNode(identNode(step[N_A]), identNode('value'))));
     }

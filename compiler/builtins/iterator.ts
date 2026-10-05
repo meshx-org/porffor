@@ -42,6 +42,10 @@ export const __Porffor_iter_open = (obj: any): object => {
 // GetIterator(obj, async): [Symbol.asyncIterator], else [Symbol.iterator] with its values awaited
 export const __Porffor_iter_openAsync = (obj: any): object => {
   if (obj == null) throw new TypeError('Cannot iterate over undefined or null');
+  // an async generator is its own async iterator
+  if (Porffor.comptime.flag`hasType.__porffor_asyncgenerator`) {
+    if (Porffor.type(obj) == Porffor.TYPES.__porffor_asyncgenerator) return __Porffor_iter_generatorRecord(obj);
+  }
   const method: any = obj[Symbol.asyncIterator];
   if (method == null) {
     const rec: object = __Porffor_iter_open(obj);
@@ -195,6 +199,46 @@ export const __Porffor_iter_delegate = (rec: any, value: any, mode: i32): object
       return result;
     }
     result = Porffor.callThis(returnMethod, it, value);
+  }
+  if (!Porffor.object.isObject(result)) throw new TypeError('Iterator result is not an object');
+  return result;
+};
+
+// the same for yield* in an async generator, awaited: the inner result, and from a sync
+// iterator its value too (AsyncFromSyncIterator)
+export const __Porffor_iter_delegateAsync = async (rec: any, value: any, mode: i32): object => {
+  const it: any = rec.it;
+  let result: any = undefined;
+  if (Porffor.comptime.flag`hasType.__porffor_asyncgenerator`) {
+    if (Porffor.type(it) == Porffor.TYPES.__porffor_asyncgenerator) return await __Porffor_AsyncGenerator_step(it, value, mode);
+  }
+  if (rec.sync) {
+    const step: any = __Porffor_iter_delegate(rec, value, mode);
+    result = {};
+    result.value = await step.value;
+    result.done = step.done;
+    return result;
+  }
+
+  if (mode == 0) {
+    const next: any = rec.next;
+    result = await Porffor.callThis(next, it, value);
+  } else if (mode == 1) {
+    const throwMethod: any = it.throw;
+    if (throwMethod == null) {
+      await __Porffor_iter_closeAsync(rec);
+      throw new TypeError('The iterator does not provide a throw method');
+    }
+    result = await Porffor.callThis(throwMethod, it, value);
+  } else {
+    const returnMethod: any = it.return;
+    if (returnMethod == null) {
+      result = {};
+      result.value = await value;
+      result.done = true;
+      return result;
+    }
+    result = await Porffor.callThis(returnMethod, it, value);
   }
   if (!Porffor.object.isObject(result)) throw new TypeError('Iterator result is not an object');
   return result;
