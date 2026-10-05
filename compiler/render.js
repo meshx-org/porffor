@@ -1235,6 +1235,18 @@ export default ({ funcs, data = [], dataUnits = [], dataRelocs = [], globals = [
     }
   };
 
+  // locals assigned in a try's body: PORF_TRY_VOLATILE, read again after a throw
+  const tryWrittenLocals = (node, out, inTry = false) => {
+    if (!Array.isArray(node)) return out;
+    if (isNode(node)) {
+      if (node[N_KIND] === K.Assign && inTry && node[N_A][N_KIND] === K.Local) out.add(node[N_A][N_A]);
+      tryWrittenLocals(node[N_A], out, inTry || node[N_KIND] === K.Try);
+      tryWrittenLocals(node[N_B], out, inTry);
+      tryWrittenLocals(node[N_C], out, inTry);
+    } else for (const x of node) tryWrittenLocals(x, out, inTry);
+    return out;
+  };
+
   // catch parameters in a body: C locals of their catch blocks, frame fields when stackless
   const catchNames = (node, out) => {
     if (!Array.isArray(node)) return out;
@@ -1339,7 +1351,9 @@ export default ({ funcs, data = [], dataUnits = [], dataRelocs = [], globals = [
       return;
     }
     const ret = CT[f.retType];
-    const params = f.params.map(p => `${CT[p.type]} ${sanitize(p.name)}`).join(', ');
+    const tryWritten = tryWrittenLocals(f.body, new Set());
+    const qual = name => tryWritten.has(name) ? 'PORF_TRY_VOLATILE ' : '';
+    const params = f.params.map(p => `${qual(p.name)}${CT[p.type]} ${sanitize(p.name)}`).join(', ');
     emit(`${needsCoro(f) ? 'PORF_CORO_BODY ' : f.ast?._module ? 'PORF_ONCE ' : coldBuiltin(f.name) ? 'PORF_COLD ' : NEVER_INLINE.has(f.name) ? 'PORF_NOINLINE ' : ''}${ret} ${fnSym(f)}(${params || 'void'}) {\n`);
     depth = 1;
     activeTryDepth = 0;
@@ -1350,7 +1364,7 @@ export default ({ funcs, data = [], dataUnits = [], dataRelocs = [], globals = [
     for (const name in f.locals) {
       if (paramNames.has(name)) continue;
       const t = f.locals[name].type;
-      emit(`  ${CT[t]} ${sanitize(name)}${t === T.jsval ? ' = JV_UNDEFINED' : ' = 0'};\n`);
+      emit(`  ${qual(name)}${CT[t]} ${sanitize(name)}${t === T.jsval ? ' = JV_UNDEFINED' : ' = 0'};\n`);
     }
     // a no-op unless the program runs coroutines on wasm (see PORF_STACK_CHECK)
     emit(`  PORF_STACK_CHECK();\n`);
@@ -4183,8 +4197,12 @@ typedef unsigned long long jmp_buf[1];
 #define _setjmp(b) ((void)(b), 0)
 #define setjmp(b) ((void)(b), 0)
 #define _longjmp(b, v) (fputs("porffor: exception thrown inside try; built with PORF_NO_EH\\n", stderr), abort())
+#define PORF_TRY_VOLATILE
 #else
 #include <setjmp.h>
+// a local a try's body assigns: after the longjmp back to its setjmp, a register copy of it
+// is indeterminate (C11 7.13.2.1), so it lives in memory
+#define PORF_TRY_VOLATILE volatile
 #endif
 #include <math.h>
 
