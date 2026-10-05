@@ -7041,7 +7041,8 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
       if (hasClosureOwnEnv(func) && func.closureOwnThis) mirrorToClosureEnv(func, '#this', { type: 'ThisExpression' });
       if (hasClosureOwnEnv(func) && func.closureOwnNewTarget) mirrorToClosureEnv(func, '#newtarget', { type: 'MetaProperty', meta: { type: 'Identifier', name: 'new' }, property: { type: 'Identifier', name: 'target' } });
       if (hasClosureOwnEnv(func) && func.closureOwnCallee) mirrorToClosureEnv(func, '#callee', { type: 'Identifier', name: '#callee' });
-      if (func.closureOwnLocals?.arguments) mirrorToClosureEnv(func, 'arguments');
+      // an arrow in it reads its arguments object through the env (not an arrow's own binding named arguments)
+      if (func.usesArguments && decl.type !== 'ArrowFunctionExpression' && func.closureOwnLocals?.arguments) mirrorToClosureEnv(func, 'arguments');
 
       // a program's arguments object: marked, for its Object.prototype and non-array identity
       if (func.usesArguments && !globalThis.precompile)
